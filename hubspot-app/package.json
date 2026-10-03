@@ -1,0 +1,12 @@
+{
+  "name": "@changecatch/hubspot-app",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "validate": "hs project validate",
+    "upload": "hs project upload"
+  },
+  "devDependencies": {
+    "@hubspot/cli": "^8.18.0"
+  }
+}

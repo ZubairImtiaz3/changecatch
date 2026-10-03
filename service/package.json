@@ -1,0 +1,32 @@
+{
+  "name": "@changecatch/service",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "exports": {
+    "./core/*": "./src/core/*",
+    "./hubspot/*": "./src/hubspot/*",
+    "./install/*": "./src/install/*",
+    "./lib/*": "./src/lib/*",
+    "./obs/*": "./src/obs/*",
+    "./store/*": "./src/store/*",
+    "./worker/*": "./src/worker/*"
+  },
+  "scripts": {
+    "start:api": "tsx src/api/main.ts",
+    "start:worker": "tsx src/worker/main.ts",
+    "dev": "tsx src/cli/dev.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
+  },
+  "dependencies": {
+    "tsx": "^4.23.15"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}

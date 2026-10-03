@@ -1,0 +1,9 @@
+packages:
+  - service
+  - hubspot-app
+  - tools
+
+# pnpm 11 blocks dependency build scripts unless allowed here.
+# esbuild (via tsx) needs its postinstall to fetch the platform binary.
+allowBuilds:
+  esbuild: true
