@@ -1,0 +1,46 @@
+{
+  "uid": "changecatch_app",
+  "type": "app",
+  "config": {
+    "name": "ChangeCatch",
+    "description": "ChangeCatch notices association changes (records linked, unlinked, or relabeled) and stamps them onto the affected record as ChangeCatch properties, so workflows can trigger on them.",
+    "distribution": "marketplace",
+    "auth": {
+      "type": "oauth",
+      "redirectUrls": [
+        "http://localhost:3001/oauth/callback",
+        "https://REPLACE-WITH-PUBLIC-BASE-URL/oauth/callback"
+      ],
+      "requiredScopes": [
+        "oauth",
+        "crm.objects.contacts.read",
+        "crm.objects.contacts.write",
+        "crm.objects.companies.read",
+        "crm.objects.companies.write",
+        "crm.objects.deals.read",
+        "crm.objects.deals.write",
+        "crm.schemas.contacts.write",
+        "crm.schemas.companies.write",
+        "crm.schemas.deals.write"
+      ],
+      "optionalScopes": [
+        "crm.objects.custom.read",
+        "crm.schemas.custom.read"
+      ],
+      "conditionallyRequiredScopes": [
+        "crm.objects.custom.write",
+        "crm.schemas.custom.write"
+      ]
+    },
+    "permittedUrls": {
+      "fetch": [
+        "https://REPLACE-WITH-PUBLIC-BASE-URL/api/"
+      ],
+      "iframe": [],
+      "img": []
+    },
+    "support": {
+      "supportEmail": "support@changecatch.example"
+    }
+  }
+}
