@@ -1,0 +1,7 @@
+{
+  "uid": "changecatch_settings",
+  "type": "settings",
+  "config": {
+    "entrypoint": "/app/settings/ChangeCatchSettings.tsx"
+  }
+}
