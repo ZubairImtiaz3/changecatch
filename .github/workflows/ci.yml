@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Typecheck, test, validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Optional. `hs project validate` needs a HubSpot account config (it fails
+      # with "Config file not found" without one). Add these repo secrets to enable it.
+      HUBSPOT_ACCOUNT_ID: ${{ secrets.HUBSPOT_ACCOUNT_ID }}
+      HUBSPOT_PERSONAL_ACCESS_KEY: ${{ secrets.HUBSPOT_PERSONAL_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads the pnpm version from "packageManager" in package.json.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm -r --if-present typecheck
+
+      - name: Unit tests
+        run: pnpm -r --if-present test
+
+      - name: Validate HubSpot project
+        if: ${{ env.HUBSPOT_PERSONAL_ACCESS_KEY != '' && env.HUBSPOT_ACCOUNT_ID != '' }}
+        working-directory: hubspot-app
+        run: pnpm exec hs project validate --use-env
+
+      - name: Skip note for HubSpot validate
+        if: ${{ env.HUBSPOT_PERSONAL_ACCESS_KEY == '' || env.HUBSPOT_ACCOUNT_ID == '' }}
+        run: echo "::notice::Skipped 'hs project validate' (needs HUBSPOT_ACCOUNT_ID + HUBSPOT_PERSONAL_ACCESS_KEY secrets)."
+
+      - name: pnpm audit (non-blocking)
+        continue-on-error: true
+        run: pnpm audit --audit-level high
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
