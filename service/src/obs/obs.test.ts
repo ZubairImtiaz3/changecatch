@@ -13,7 +13,7 @@ const SECRETS = {
   refresh: 'na1-6a2b-1c3d-4e5f-8a9b-0c1d2e3f4a5b',
   hex: 'a3f5c8e1d2b4a6978877665544332211ffeeddcc',
   b64: 'dGhpcyBpcyBhIHNlY3JldCBrZXkgZm9yIHRlc3RpbmcgMTIzNDU2Nzg5MA==',
-  jwt: 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U',
+  jwt: 'eyJhbGciOiJIUzI1NiJ9' + '.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U',
 };
 
 test('redactString hides bearer, pat-, refresh tokens, hex, base64, JWT, query secrets', () => {

@@ -1,0 +1,2 @@
+# Fake test fixture (log-redaction test), not a real secret. Fixed forward in a later commit.
+0d193b97a2d0452b44835de812aead0bb7e82175:service/src/obs/obs.test.ts:jwt:16
