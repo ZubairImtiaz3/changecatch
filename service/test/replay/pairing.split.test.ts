@@ -6,28 +6,23 @@
 // 01a18af2-d82a (seen +13.6 s) -> was REMOVED + LABEL_CHANGED "(unknown)".
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Store, type LabelDefinition } from '../store/db.js';
-import { StoreLabelCache } from './labels.js';
-import { DEFAULT_PAIRING_CONFIG, mayBeHalf, offsetTimeMs, pairAssociations, categoryIsStructural, type PairingConfig } from './pairing.js';
-import { runOnce, type JournalReadResult } from './poller.js';
-import type { AssociationAction, AssociationEntry, JournalFile } from './types.js';
-import type { StampUpdate } from './stamp.js';
-import { entryKey } from './dedupe.js';
-import { ADD, CONTACT, DEAL, ev, REM, T0, UD } from './testutil.js';
+import { Store } from '../../src/store/db.js';
+import { StoreLabelCache } from '../../src/core/labels.js';
+import { DEFAULT_PAIRING_CONFIG, mayBeHalf, offsetTimeMs, pairAssociations, categoryIsStructural, type PairingConfig } from '../../src/core/pairing.js';
+import { runOnce, type JournalReadResult } from '../../src/core/poller.js';
+import type { AssociationAction, AssociationEntry, JournalFile } from '../../src/core/types.js';
+import type { StampUpdate } from '../../src/core/stamp.js';
+import { entryKey } from '../../src/core/dedupe.js';
+import { ADD, CONTACT, DEAL, ev, REM, T0, UD } from '../../src/core/testutil.js';
+import { DEAL_CONTACT_LABELS, HD } from '../fixtures/deal-contact-labels.js';
 
-const HD = 'HUBSPOT_DEFINED';
 const PORTAL = 1000001;
 // These tests pin the split-hold MECHANISM at the 15 s it had when they were written (default is now 4 s; later halves
 // are handled by late-half absorption, see absorb.test.ts).
 const CFG: PairingConfig = { ...DEFAULT_PAIRING_CONFIG, splitHoldMs: 15_000 };
 const SPLIT = CFG.splitHoldMs;
 
-const DEFS: LabelDefinition[] = [
-  { associationTypeId: 3, label: null, category: HD },
-  { associationTypeId: 247, label: 'Decision maker', category: UD },
-  { associationTypeId: 249, label: 'Influencer', category: UD },
-  { associationTypeId: 251, label: 'Billing contact', category: UD },
-];
+const DEFS = DEAL_CONTACT_LABELS;
 const structural = (_p: number, r: { associationTypeId: number }) => r.associationTypeId === 3;
 
 /** A UUIDv7 journal offset whose time part is `ms` (like HubSpot's). */

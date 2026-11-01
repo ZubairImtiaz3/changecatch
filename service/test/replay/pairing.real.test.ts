@@ -2,25 +2,20 @@
 // One direction only (from = the subscribed object), all isPrimary:false, steps ~25 s apart.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Store, type LabelDefinition } from '../store/db.js';
-import { buildStructuralCheck, StoreLabelCache, type LabelCache } from './labels.js';
-import { categoryIsStructural, DEFAULT_PAIRING_CONFIG, pairAssociations } from './pairing.js';
-import { runOnce, type JournalReadResult } from './poller.js';
-import type { AppEventOccurrence, JournalAssociationEntry, JournalFile } from './types.js';
-import { ADD, CONTACT, DEAL, entry, ev, file, REM, T0, UD } from './testutil.js';
+import { Store, type LabelDefinition } from '../../src/store/db.js';
+import { buildStructuralCheck, StoreLabelCache, type LabelCache } from '../../src/core/labels.js';
+import { categoryIsStructural, DEFAULT_PAIRING_CONFIG, pairAssociations } from '../../src/core/pairing.js';
+import { runOnce, type JournalReadResult } from '../../src/core/poller.js';
+import type { AppEventOccurrence, JournalAssociationEntry, JournalFile } from '../../src/core/types.js';
+import { ADD, CONTACT, DEAL, entry, ev, file, REM, T0, UD } from '../../src/core/testutil.js';
+import { DEAL_CONTACT_LABELS, HD } from '../fixtures/deal-contact-labels.js';
 
-const HD = 'HUBSPOT_DEFINED';
 const PETS = '2-23488212';
 const CAR = '2-8929543';
 const STEP = 25_000;
 
 const DEFS: Record<string, LabelDefinition[]> = {
-  [`${DEAL}>${CONTACT}`]: [
-    { associationTypeId: 3, label: null, category: HD },
-    { associationTypeId: 247, label: 'Decision maker', category: UD },
-    { associationTypeId: 249, label: 'Influencer', category: UD },
-    { associationTypeId: 251, label: 'Billing contact', category: UD },
-  ],
+  [`${DEAL}>${CONTACT}`]: DEAL_CONTACT_LABELS,
   [`${PETS}>${CONTACT}`]: [{ associationTypeId: 163, label: null, category: UD }],
   [`${CAR}>${CONTACT}`]: [
     { associationTypeId: 125, label: null, category: UD },

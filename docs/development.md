@@ -38,6 +38,8 @@ pnpm --filter @changecatch/service test          # service only
 cd service && node --import tsx --test src/core/pairing.test.ts   # one file
 ```
 
+Where tests live: small unit tests sit next to the code they test (`service/src/**/foo.test.ts`). Large tests go in `service/test/`: real-data replays and load-test regressions in `test/replay/`, burst/scale and worker robustness in `test/scale/`, and fixtures shared by more than one of them in `test/fixtures/`. `pnpm test` runs both folders.
+
 Areas with dedicated tests: pairing (including recorded journal payloads and split files), late-half absorption (including bursts), coalescing and stamp planning, the stamp queue and fair drain, the poller, label options, install and scopes, request-signature security, storage migrations, the HTTP client and rate limiter, and observability. CI runs `pnpm typecheck` and `pnpm test` on every push.
 
 When you change pipeline behaviour, add a test with a real payload shape. Journal behaviour under load (split files, late halves) is what broke in the past.

@@ -14,14 +14,14 @@
 //     (stamp id), so they kept pushing each other back; then every amend took its own 3 s spacing slot.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Store, type LabelDefinition } from '../store/db.js';
-import { StampQueue } from '../worker/stamp-queue.js';
-import type { TokenProvider } from '../worker/tokens.js';
-import { StoreLabelCache } from './labels.js';
-import { runOnce, type JournalReadResult } from './poller.js';
-import { recordKey, stampIdOf, type StampUpdate } from './stamp.js';
-import { ADD, CONTACT, DEAL, ev, REM, T0, UD } from './testutil.js';
-import type { AssociationAction, JournalFile } from './types.js';
+import { Store, type LabelDefinition } from '../../src/store/db.js';
+import { StampQueue } from '../../src/worker/stamp-queue.js';
+import type { TokenProvider } from '../../src/worker/tokens.js';
+import { StoreLabelCache } from '../../src/core/labels.js';
+import { runOnce, type JournalReadResult } from '../../src/core/poller.js';
+import { recordKey, stampIdOf, type StampUpdate } from '../../src/core/stamp.js';
+import { ADD, CONTACT, DEAL, ev, REM, T0, UD } from '../../src/core/testutil.js';
+import type { AssociationAction, JournalFile } from '../../src/core/types.js';
 
 const HD = 'HUBSPOT_DEFINED';
 const PORTAL = 1000001;

@@ -9,25 +9,19 @@
 // publish time) and becomes readable 2 s later; the worker reads every 3 s with the DEFAULT pairing config.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Store, type LabelDefinition } from '../store/db.js';
-import { StampQueue } from '../worker/stamp-queue.js';
-import type { TokenProvider } from '../worker/tokens.js';
-import { planLateHalf } from './absorb.js';
-import { StoreLabelCache } from './labels.js';
-import { DEFAULT_PAIRING_CONFIG } from './pairing.js';
-import { runOnce, type JournalReadResult } from './poller.js';
-import { recordKey, SENT_PREFIX, stampIdOf, type StampUpdate } from './stamp.js';
-import { ADD, CONTACT, DEAL, ev, REM, T0, UD } from './testutil.js';
-import type { AssociationAction, JournalAssociationEntry, JournalFile } from './types.js';
+import { Store } from '../../src/store/db.js';
+import { StampQueue } from '../../src/worker/stamp-queue.js';
+import type { TokenProvider } from '../../src/worker/tokens.js';
+import { StoreLabelCache } from '../../src/core/labels.js';
+import { DEFAULT_PAIRING_CONFIG } from '../../src/core/pairing.js';
+import { runOnce, type JournalReadResult } from '../../src/core/poller.js';
+import { recordKey, SENT_PREFIX, stampIdOf, type StampUpdate } from '../../src/core/stamp.js';
+import { ADD, CONTACT, DEAL, ev, REM, T0, UD } from '../../src/core/testutil.js';
+import { DEAL_CONTACT_LABELS, HD } from '../fixtures/deal-contact-labels.js';
+import type { AssociationAction, JournalAssociationEntry, JournalFile } from '../../src/core/types.js';
 
-const HD = 'HUBSPOT_DEFINED';
 const PORTAL = 1000001;
-const DEFS: LabelDefinition[] = [
-  { associationTypeId: 3, label: null, category: HD },
-  { associationTypeId: 247, label: 'Decision maker', category: UD },
-  { associationTypeId: 249, label: 'Influencer', category: UD },
-  { associationTypeId: 251, label: 'Billing contact', category: UD },
-];
+const DEFS = DEAL_CONTACT_LABELS;
 const NAME: Record<number, string> = { 247: 'Decision maker', 249: 'Influencer', 251: 'Billing contact' };
 const PUBLISH_DELAY = 1_500;
 const VISIBLE_DELAY = 2_000;
@@ -262,27 +256,3 @@ for (const delivery of ['immediate', 'deferred'] as const) {
     r.store.close();
   });
 }
-
-// ---------- pure decision table ----------
-
-test('planLateHalf decision table', () => {
-  const E = (changeType: 'ADDED' | 'REMOVED' | 'LABEL_CHANGED', o: Partial<{ before: string[]; after: string[]; removed: string[]; added: string[] }> = {}) => ({
-    actionKey: 'k', recordKey: 'r', portalId: PORTAL, changeId: 'c', changeType, otherTypeId: CONTACT,
-    labelsBefore: o.before, labelsAfter: o.after, removed: o.removed ?? [], added: o.added ?? [], occurredAtMs: T0,
-  });
-  // Unlink, structural first: late label REMOVED is absorbed.
-  assert.deepEqual(planLateHalf(E('REMOVED', { before: ['Billing contact'], after: [] }), 0, ['Billing contact'], []), { kind: 'absorb' });
-  // Link, structural first: late label ADDED amends.
-  assert.deepEqual(planLateHalf(E('ADDED', { before: [], after: [] }), 0, [], ['Influencer']), {
-    kind: 'amend', type: 'ADDED', before: [], after: ['Influencer'], current: ['Influencer'], removed: [], added: ['Influencer'],
-  });
-  // Unlink, label first: late REMOVED 3 converts to REMOVED with the labels from before.
-  assert.deepEqual(planLateHalf(E('LABEL_CHANGED', { before: ['Billing contact'], after: [], removed: ['Billing contact'] }), -1, [], []), {
-    kind: 'convert', type: 'REMOVED', before: ['Billing contact'], after: [], current: [], removed: ['Billing contact'], added: [],
-  });
-  // Link, label first: late ADDED 3 converts to ADDED.
-  assert.equal(planLateHalf(E('LABEL_CHANGED', { added: ['Influencer'] }), 1, [], [])?.kind, 'convert');
-  // Not a late half of the same action: a re-link after an unlink, or a label swap after a link.
-  assert.equal(planLateHalf(E('REMOVED'), 1, [], ['Influencer']), null);
-  assert.equal(planLateHalf(E('ADDED', { after: ['Influencer'] }), 0, ['Influencer'], ['Decision maker']), null);
-});
