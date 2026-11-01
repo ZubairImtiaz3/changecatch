@@ -126,6 +126,11 @@ export interface RunDeps {
   isParkable?(err: unknown): boolean;
   /** Info log (late-half absorption decisions). Default: none. */
   log?(msg: string): void;
+  /**
+   * `[ALERT] ...` lines for known data loss (parked entries dropped by the per-portal cap). The worker routes them to
+   * level error / event alert; the caller also counts data_loss from RunResult.parkDroppedByPortal. Default: console.error.
+   */
+  alert?(msg: string): void;
   config?: Partial<RunConfig>;
 }
 
@@ -195,6 +200,8 @@ export interface RunResult {
   changesByPortal: Map<number, number>;
   /** Parked entries dropped by the per-portal cap in this run. */
   parkDropped: number;
+  /** Same, per portal (for data_loss{reason="park_dropped"}). Only set once the run committed. */
+  parkDroppedByPortal: Map<number, number>;
   /** Late journal halves of already-emitted actions handled in this run (absorb.ts). */
   lateHalves: { absorbed: number; amended: number; converted: number };
 }
@@ -269,6 +276,8 @@ export async function runOnce(deps: RunDeps): Promise<RunResult> {
     const fresh = candidates.filter((e) => !isParked(e));
     let toPark = candidates.filter(isParked);
     let parkDropped = 0;
+    const parkDroppedByPortal = new Map<number, number>();
+    const parkAlerts: string[] = [];
     if (toPark.length) {
       const cap = Math.max(1, cfg.maxParkedPerPortal);
       const per = new Map<number, AssociationEntry[]>();
@@ -283,9 +292,10 @@ export async function runOnce(deps: RunDeps): Promise<RunResult> {
         kept.push(...sorted.slice(0, cap));
         const n = sorted.length - cap;
         parkDropped += n;
+        parkDroppedByPortal.set(portalId, n);
         const msg = `[ALERT] ${n} parked entr${n === 1 ? 'y' : 'ies'} DROPPED (cap ${cap} per portal; label lookup held too long)`;
         store.recordPortalError(portalId, msg, now());
-        console.error(`${new Date(now()).toISOString()} [poller] portal ${portalId}: ${msg}`);
+        parkAlerts.push(`[ALERT] portal ${portalId}: ${msg.replace('[ALERT] ', '')}. Changes in them are lost.`);
       }
       toPark = kept;
     }
@@ -389,6 +399,10 @@ export async function runOnce(deps: RunDeps): Promise<RunResult> {
       store.pruneEmittedActions(t);
     });
 
+    // Only after the commit: a run that fails re-reads, re-parks and decides again (no double counting).
+    const alert = deps.alert ?? ((m: string) => console.error(`${new Date(now()).toISOString()} [poller] ${m}`));
+    for (const m of parkAlerts) alert(m);
+
     return {
       eventsRead: all.length,
       changesEmitted: changes.length,
@@ -403,6 +417,7 @@ export async function runOnce(deps: RunDeps): Promise<RunResult> {
       newestOccurredAtMs: all.length ? all.reduce((m, e) => Math.max(m, e.occurredAtMs), -Infinity) : null,
       changesByPortal: changes.reduce((m, c) => m.set(c.portalId, (m.get(c.portalId) ?? 0) + 1), new Map<number, number>()),
       parkDropped,
+      parkDroppedByPortal,
       lateHalves: { absorbed: absorbed?.absorbed ?? 0, amended: absorbed?.amended ?? 0, converted: absorbed?.converted ?? 0 },
     };
   } catch (err) {

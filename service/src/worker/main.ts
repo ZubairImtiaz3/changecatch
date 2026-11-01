@@ -148,6 +148,7 @@ export class Worker {
         onOtherEvent: this.deps.lifecycleRetry?.onOtherEvent ?? this.deps.onOtherEvent,
         isParkable: this.deps.isParkable,
         log: (msg) => this.log('info', msg, 'poller'),
+        alert: (msg) => this.log('error', msg, 'alert'),
         config: { ...this.deps.runConfig, deliveryMode: 'stamp' },
       });
       if (result.eventsRead > 0 || this.deps.verbose) {
@@ -155,7 +156,7 @@ export class Worker {
         this.log(
           'info',
           `read ${result.eventsRead} event(s) -> ${result.changesEmitted} change(s), ${result.occurrencesSent} stamped now, ` +
-            `${queued} queued, ${result.pending} held for pairing; offset ${result.offset ?? '(none)'}`,
+            `${queued} queued, ${result.pending} event(s) held for pairing (saved with the offset); offset ${result.offset ?? '(none)'}`,
           'journal_read',
           {
             files: result.filesRead,
@@ -179,6 +180,7 @@ export class Worker {
           offsetSaved: result.offset != null,
         });
         for (const [p, n] of result.changesByPortal) m.changesProcessed(p, n);
+        for (const [p, n] of result.parkDroppedByPortal) m.dataLoss('park_dropped', n, p);
       }
       void this.deps.pulse?.ok();
       if (result.parkedPortals.length)

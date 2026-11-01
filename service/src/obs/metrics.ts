@@ -316,7 +316,7 @@ export const M = {
   httpRequests: 'http_requests', // {api}
   httpErrors: 'http_errors', // {status}
   rateLimited: 'rate_limited', // {portal}
-  dataLoss: 'data_loss', // {reason="dead_letter"|"skipped_entries"|"stamp_dropped"|"journal_gap"}
+  dataLoss: 'data_loss', // {reason="dead_letter"|"skipped_entries"|"stamp_dropped"|"journal_gap"|"park_dropped"}
 } as const;
 
 /**
@@ -373,7 +373,7 @@ export class ChangeCatchMetrics {
     r.define(M.httpRequests, 'counter', 'HubSpot HTTP requests by API family');
     r.define(M.httpErrors, 'counter', 'HubSpot HTTP errors by status');
     r.define(M.rateLimited, 'counter', '429s or local rate-limiter waits, per portal');
-    r.define(M.dataLoss, 'counter', 'Changes that will never be stamped (dead-lettered, skipped journal entries, dropped stamps, journal gaps)');
+    r.define(M.dataLoss, 'counter', 'Changes that will never be stamped (dead-lettered, skipped journal entries, dropped stamps, journal gaps, dropped parked entries)');
   }
 
   /**
@@ -452,7 +452,7 @@ export class ChangeCatchMetrics {
    * reason: dead_letter (gave up after retries), skipped_entries (journal entries we could not parse/process),
    * stamp_dropped (CRM rejected the record, e.g. deleted), journal_gap (offset expired: >3 days behind).
    */
-  dataLoss(reason: 'dead_letter' | 'skipped_entries' | 'stamp_dropped' | 'journal_gap', n = 1, portalId?: number): void {
+  dataLoss(reason: 'dead_letter' | 'skipped_entries' | 'stamp_dropped' | 'journal_gap' | 'park_dropped', n = 1, portalId?: number): void {
     if (n > 0) this.registry.inc(M.dataLoss, n, { reason, portal: portalId ?? 'app' });
   }
 
