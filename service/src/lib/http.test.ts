@@ -1,7 +1,8 @@
 // Rate limiter + http.ts behaviour. No HubSpot calls: fetch is stubbed.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { hsRequest, HttpError, parseRetryAfter, rateKeyFor, RetryLaterError, TimeoutError } from './http.js';
+import { hsRequest, HttpError, parseRetryAfter, rateKeyFor, RetryLaterError, setHttpLogger, TimeoutError } from './http.js';
+import { memoryLogger } from '../obs/log.js';
 import { RateLimiter, RateLimitWaitError, portalIdForToken, registerPortalToken, setRateLimiter } from './rate-limiter.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -159,6 +160,33 @@ test('timeout: a hung request is aborted and retried with backoff', async () => 
     assert.ok(Date.now() - t0 < 2_000);
   } finally {
     hs.restore();
+  }
+});
+
+test('retry log: one structured warn per 5xx retry; method + path + status only, no token or query string', async () => {
+  const mem = memoryLogger('http');
+  const restoreLog = setHttpLogger(mem.log);
+  let n = 0;
+  const hs = stubFetch(() => (n++ === 0 ? json({ message: 'oops' }, 503) : json({ ok: true })));
+  const token = 'CJabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH';
+  try {
+    assert.deepEqual(await hsRequest('/crm/2026-03/objects/deals', { token, query: { code: 'secret-code' }, rateKey: 'none' }), { ok: true });
+    assert.equal(mem.records.length, 1);
+    const r = mem.records[0];
+    assert.equal(r.level, 'warn');
+    assert.equal(r.component, 'http');
+    assert.equal(r.event, 'http_retry');
+    assert.equal(r.method, 'GET');
+    assert.equal(r.path, '/crm/2026-03/objects/deals');
+    assert.equal(r.status, 503);
+    assert.equal(r.reason, 'server_error');
+    assert.equal(r.attempt, 1);
+    assert.equal(r.retryInMs, 500);
+    assert.match(r.msg, /^GET \/crm\/2026-03\/objects\/deals -> 503, retry in 500ms$/);
+    assert.ok(!mem.lines[0].includes(token) && !mem.lines[0].includes('secret-code') && !mem.lines[0].includes('?'));
+  } finally {
+    hs.restore();
+    restoreLog();
   }
 });
 

@@ -8,7 +8,7 @@
 
 import type { DatabaseSync, StatementSync } from 'node:sqlite';
 import {
-  MAINTENANCE_INTERVAL_MS, PRUNE_CHUNK_ROWS, StatementCache, openDatabase, optimizeDatabase, runInTransaction, runMigrations,
+  MAINTENANCE_INTERVAL_MS, PRUNE_CHUNK_ROWS, StatementCache, getStoreLogger, openDatabase, optimizeDatabase, runInTransaction, runMigrations,
   type Migration,
 } from './db.js';
 import type { WatchedPair } from '../core/types.js';
@@ -80,7 +80,7 @@ export class PortalStore {
         try {
           if (this.db.isOpen) this.runMaintenance();
         } catch (e) {
-          console.error(`[portals] maintenance failed: ${(e as Error).message}`);
+          getStoreLogger().error('maintenance_failed', `portals maintenance failed: ${(e as Error).message}`, { store: 'portals', error: e });
         }
       }, MAINTENANCE_INTERVAL_MS);
       this.maintenanceTimer.unref();

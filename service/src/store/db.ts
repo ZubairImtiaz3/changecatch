@@ -2,6 +2,7 @@ import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { dbPath } from '../lib/env.js';
+import { createLogger, type Logger } from '../obs/log.js';
 import type { ChangeRecord, StampUpdate } from '../core/stamp.js';
 import type { AssociationEntry, ChangeType, PendingEntry, WatchedPair } from '../core/types.js';
 
@@ -137,6 +138,22 @@ export function pipePrefixRange(prefix: string): [string, string] {
   return [`${prefix}|`, `${prefix}}`];
 }
 
+// --- structured logging (component "store"; shared by both stores) ---
+
+let storeLog: Logger = createLogger('store');
+/** The store logger (portals.ts uses it too). */
+export function getStoreLogger(): Logger {
+  return storeLog;
+}
+/** Swap the store logger (tests). Returns a function that restores the previous one. */
+export function setStoreLogger(l: Logger): () => void {
+  const prev = storeLog;
+  storeLog = l;
+  return () => {
+    storeLog = prev;
+  };
+}
+
 // --- versioned schema migrations (shared by both stores) ---
 
 /** One schema step. APPEND ONLY per scope; never edit or reorder a shipped step. `up` must be idempotent. */
@@ -168,15 +185,27 @@ export function runMigrations(db: DatabaseSync, scope: string, steps: Migration[
   const isApplied = db.prepare('SELECT 1 FROM schema_migrations WHERE scope = ? AND version = ?');
   const mark = db.prepare('INSERT INTO schema_migrations (scope, version, name, applied_at) VALUES (?, ?, ?, ?)');
   const applied: number[] = [];
+  // A brand-new schema (every test store, first boot) logs ONE debug line; upgrades of an existing one log each step.
+  const fresh = schemaVersion(db, scope) === 0;
+  const t0All = Date.now();
   for (const m of sorted) {
     if (isApplied.get(scope, m.version) !== undefined) continue;
+    const t0 = Date.now();
     runInTransaction(db, () => {
       if (isApplied.get(scope, m.version) !== undefined) return; // the other process won the race
       m.up(db);
       mark.run(scope, m.version, m.name, now);
       applied.push(m.version);
     });
+    if (applied[applied.length - 1] === m.version && !fresh)
+      storeLog.info('migration_applied', `${scope} migration ${m.version} applied: ${m.name}`, {
+        scope, version: m.version, name: m.name, durationMs: Date.now() - t0,
+      });
   }
+  if (fresh && applied.length)
+    storeLog.debug('schema_created', `${scope} schema created at version ${applied[applied.length - 1]}`, {
+      scope, versions: applied, durationMs: Date.now() - t0All,
+    });
   return applied;
 }
 
@@ -522,7 +551,8 @@ export class Store {
       try {
         if (this.db.isOpen) this.runMaintenance();
       } catch (e) {
-        console.error(`[store] maintenance failed: ${(e as Error).message}`); // e.g. busy > 5 s; next tick retries
+        // e.g. busy > 5 s; next tick retries
+        storeLog.error('maintenance_failed', `maintenance failed: ${(e as Error).message}`, { store: 'store', error: e });
       }
     }, intervalMs);
     this.maintenanceTimer.unref();

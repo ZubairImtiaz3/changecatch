@@ -10,8 +10,11 @@
 //   (default 10 s) we do not wait inline: we throw RetryLaterError (an HttpError with status 429 and
 //   retryAfterMs), so a serial worker loop is never stuck behind one throttled portal.
 // - 5xx / network / timeout: retried with exponential backoff.
-// - Never logs tokens: only method, path and status.
+// - Never logs tokens: only method, path and status (structured logger, component "http").
+// - Metrics: NOT counted here. src/obs/wiring.ts instrumentFetch() wraps fetch and counts every attempt,
+//   so adding counters here would double count.
 
+import { createLogger, type Logger } from '../obs/log.js';
 import { getRateLimiter, keyName, portalIdForToken, RateLimitWaitError, type RateKey } from './rate-limiter.js';
 
 export const HUBSPOT_API = 'https://api.hubapi.com';
@@ -59,6 +62,16 @@ export class TimeoutError extends Error {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+let log: Logger = createLogger('http');
+/** Swap the http logger (tests). Returns a function that restores the previous one. */
+export function setHttpLogger(l: Logger): () => void {
+  const prev = log;
+  log = l;
+  return () => {
+    log = prev;
+  };
+}
 
 function envMs(name: string, dflt: number): number {
   const n = Number(process.env[name]);
@@ -133,7 +146,11 @@ export async function hsRequest<T = any>(path: string, opts: RequestOpts = {}): 
       const err = timedOut ? new TimeoutError(`${method} ${url.pathname} timed out after ${timeoutMs}ms`) : (e as Error);
       if (attempt >= retries) throw err;
       const wait = Math.min(30_000, 500 * 2 ** attempt);
-      console.warn(`[http] ${method} ${url.pathname} -> ${timedOut ? 'timeout' : `network error (${err.message})`}, retry in ${wait}ms`);
+      log.warn(
+        'http_retry',
+        `${method} ${url.pathname} -> ${timedOut ? 'timeout' : `network error (${err.message})`}, retry in ${wait}ms`,
+        { method, path: url.pathname, reason: timedOut ? 'timeout' : 'network', attempt: attempt + 1, retryInMs: wait },
+      );
       await sleep(wait);
       continue;
     }
@@ -148,13 +165,18 @@ export async function hsRequest<T = any>(path: string, opts: RequestOpts = {}): 
       if (key) limiter.pause(key, wait); // only this bucket waits; other portals keep going
       if (attempt >= retries) throw isPortal ? new RetryLaterError(wait, data, errMsg) : new HttpError(429, data, errMsg);
       if (isPortal && maxWaitMs !== undefined && wait > maxWaitMs) throw new RetryLaterError(wait, data, errMsg);
-      console.warn(`[http] ${method} ${url.pathname} -> 429 (${key ? keyName(key) : 'unlimited'}), retry in ${wait}ms`);
+      log.warn('http_retry', `${method} ${url.pathname} -> 429 (${key ? keyName(key) : 'unlimited'}), retry in ${wait}ms`, {
+        method, path: url.pathname, status: 429, reason: 'rate_limited', bucket: key ? keyName(key) : 'unlimited',
+        ...(isPortal ? { portalId: (key as { portalId: number }).portalId } : {}), attempt: attempt + 1, retryInMs: wait,
+      });
       if (!key) await sleep(wait); // with a key, the next acquire() waits for the pause
       continue;
     }
     if (res.status >= 500 && attempt < retries) {
       const wait = Math.min(30_000, 500 * 2 ** attempt);
-      console.warn(`[http] ${method} ${url.pathname} -> ${res.status}, retry in ${wait}ms`);
+      log.warn('http_retry', `${method} ${url.pathname} -> ${res.status}, retry in ${wait}ms`, {
+        method, path: url.pathname, status: res.status, reason: 'server_error', attempt: attempt + 1, retryInMs: wait,
+      });
       await sleep(wait);
       continue;
     }

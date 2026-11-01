@@ -9,8 +9,9 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
   LABEL_CACHE_RETENTION_MS, PRUNE_CHUNK_ROWS, PRUNE_CHUNK_ROWS_IN_TX, STORE_MIGRATIONS, Store, StatementCache, pipePrefixRange,
-  runMigrations, schemaVersion,
+  addColumnIfMissing, runMigrations, schemaVersion, setStoreLogger,
 } from './db.js';
+import { memoryLogger } from '../obs/log.js';
 import { PORTAL_MIGRATIONS, PortalStore, UNINSTALLED_PORTAL_RETENTION_MS } from './portals.js';
 
 const KEY = randomBytes(32);
@@ -87,6 +88,40 @@ test('migrations: versioned per scope, idempotent, and upgrade a pre-versioning 
     p.close();
   } finally {
     t.done();
+  }
+});
+
+test('migrations log: fresh schema = one debug line; each upgrade step = one info record (component store); re-runs log nothing', () => {
+  const mem = memoryLogger('store');
+  const restore = setStoreLogger(mem.log);
+  try {
+    const db = new DatabaseSync(':memory:');
+    const steps = [
+      { version: 1, name: 'create a', up: (d: DatabaseSync) => d.exec('CREATE TABLE a (x)') },
+      { version: 2, name: 'add a.y', up: (d: DatabaseSync) => addColumnIfMissing(d, 'a', 'y', 'TEXT') },
+    ];
+    // Fresh schema: one debug summary line.
+    assert.deepEqual(runMigrations(db, 't', [steps[0]]), [1]);
+    assert.equal(mem.records.length, 1);
+    assert.equal(mem.records[0].level, 'debug');
+    assert.equal(mem.records[0].event, 'schema_created');
+    assert.deepEqual(mem.records[0].versions, [1]);
+    // Upgrade: one info record per applied step.
+    assert.deepEqual(runMigrations(db, 't', steps), [2]);
+    assert.equal(mem.records.length, 2);
+    const r = mem.records[1];
+    assert.equal(r.level, 'info');
+    assert.equal(r.component, 'store');
+    assert.equal(r.event, 'migration_applied');
+    assert.equal(r.scope, 't');
+    assert.equal(r.version, 2);
+    assert.equal(r.name, 'add a.y');
+    assert.equal(typeof r.durationMs, 'number');
+    assert.equal(r.msg, 't migration 2 applied: add a.y');
+    assert.deepEqual(runMigrations(db, 't', steps), []);
+    assert.equal(mem.records.length, 2, 're-run logs nothing');
+  } finally {
+    restore();
   }
 });
 
