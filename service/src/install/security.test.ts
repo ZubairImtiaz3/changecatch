@@ -13,6 +13,7 @@ import type { ChangeReport } from './installer.js';
 import { rotateTokens } from './rotate.js';
 import { assertHubSpotAuthorizeUrl, assertUnsignedAllowed, createAppServer, createStateCodec, logSafe, MAX_BODY_BYTES } from './server.js';
 import { PortalNotInstalledError, PortalTokenProvider, PortalTokenRevokedError } from './token-provider.js';
+import { memoryLogger } from '../obs/log.js';
 
 const P = 4242;
 const SECRET = 'client-secret';
@@ -310,7 +311,7 @@ test('token provider: invalid_grant marks the portal revoked; reinstall clears i
   const tp = new PortalTokenProvider({
     store,
     now: () => now,
-    log: () => {},
+    logger: memoryLogger().log,
     refresh: async () => {
       calls++;
       if (fail) throw new HttpError(400, { status: 'BAD_REFRESH_TOKEN', message: 'missing or invalid refresh token' }, 'POST /oauth -> 400');
@@ -325,7 +326,7 @@ test('token provider: invalid_grant marks the portal revoked; reinstall clears i
   assert.equal(calls, 1, 'no more HubSpot calls once revoked');
 
   // Survives a restart (SQLite table).
-  const tp2 = new PortalTokenProvider({ store, refresh: async () => { throw new Error('unused'); }, log: () => {} });
+  const tp2 = new PortalTokenProvider({ store, refresh: async () => { throw new Error('unused'); }, logger: memoryLogger().log });
   assert.equal(tp2.isRevoked(P), true);
 
   // A reinstall after the revocation clears it.
@@ -336,7 +337,7 @@ test('token provider: invalid_grant marks the portal revoked; reinstall clears i
   assert.equal(await tp.getAccessToken(P), 'at');
 
   // Other errors (5xx, network) don't mark anything.
-  const tp3 = new PortalTokenProvider({ store: { getRefreshToken: () => 'x', updateRefreshToken: () => {} }, log: () => {}, refresh: async () => { throw new HttpError(503, 'down', 'POST -> 503'); } });
+  const tp3 = new PortalTokenProvider({ store: { getRefreshToken: () => 'x', updateRefreshToken: () => {} }, logger: memoryLogger().log, refresh: async () => { throw new HttpError(503, 'down', 'POST -> 503'); } });
   await assert.rejects(tp3.getAccessToken(1), (e: unknown) => e instanceof HttpError);
   assert.equal(tp3.isRevoked(1), false);
   store.close();

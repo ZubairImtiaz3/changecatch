@@ -316,6 +316,7 @@ export const M = {
   httpRequests: 'http_requests', // {api}
   httpErrors: 'http_errors', // {status}
   rateLimited: 'rate_limited', // {portal}
+  tokenRefreshes: 'token_refreshes', // {result="ok"|"revoked"|"error"}
   dataLoss: 'data_loss', // {reason="dead_letter"|"skipped_entries"|"stamp_dropped"|"journal_gap"|"park_dropped"}
 } as const;
 
@@ -373,6 +374,7 @@ export class ChangeCatchMetrics {
     r.define(M.httpRequests, 'counter', 'HubSpot HTTP requests by API family');
     r.define(M.httpErrors, 'counter', 'HubSpot HTTP errors by status');
     r.define(M.rateLimited, 'counter', '429s or local rate-limiter waits, per portal');
+    r.define(M.tokenRefreshes, 'counter', 'Customer OAuth access-token refresh calls to HubSpot, by result (ok | revoked | error)');
     r.define(M.dataLoss, 'counter', 'Changes that will never be stamped (dead-lettered, skipped journal entries, dropped stamps, journal gaps, dropped parked entries)');
   }
 
@@ -440,6 +442,11 @@ export class ChangeCatchMetrics {
 
   httpError(status: number | 'timeout' | 'network' | undefined): void {
     this.registry.inc(M.httpErrors, 1, { status: statusLabel(status) });
+  }
+
+  /** One customer access-token refresh call to HubSpot (callers that joined it via single-flight are not counted). */
+  tokenRefresh(result: 'ok' | 'revoked' | 'error'): void {
+    this.registry.inc(M.tokenRefreshes, 1, { result });
   }
 
   /** portalId undefined = app-level (journal/subscriptions) limit. */

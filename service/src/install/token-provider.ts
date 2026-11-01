@@ -9,11 +9,20 @@
 // PortalTokenRevokedError without calling HubSpot. isRevoked() lets the worker pause the portal; revokedPortals()
 // lets it purge after its grace period. A reinstall clears the mark (prime() is called on install, and a mark older
 // than the portal's latest install is ignored).
+//
+// Observability: every refresh call to HubSpot logs ONE structured line (component `oauth`):
+//   token_refreshed       info        { portalId, expiresInSec, singleFlight, joiners, durationMs }
+//   token_refresh_failed  warn/error  { portalId, status, reason, singleFlight, joiners, durationMs }
+// reason: revoked (invalid_grant / BAD_REFRESH_TOKEN) | http_<status> | network. singleFlight = other callers joined
+// this refresh while it was in flight (joiners = how many). Counted in changecatch_token_refreshes_total{result}.
+// Token material (access or refresh) is never passed to the logger.
 
 import type { DatabaseSync } from 'node:sqlite';
 import { refreshAccessToken, type TokenResponse } from '../hubspot/oauth.js';
 import { HttpError } from '../lib/http.js';
 import { forgetPortalTokens, registerPortalToken } from '../lib/rate-limiter.js';
+import { createLogger, type Logger } from '../obs/log.js';
+import type { ChangeCatchMetrics } from '../obs/metrics.js';
 import type { PortalStore } from '../store/portals.js';
 
 export interface TokenProvider {
@@ -109,22 +118,36 @@ export interface PortalTokenProviderDeps {
   /** Default: a SQLite table in the store's database when it has one, else in memory. */
   revocations?: RevocationStore;
   now?: () => number;
-  log?: (msg: string) => void;
+  /** Structured logger. Default: createLogger('oauth'). The component is always set to `oauth`. */
+  logger?: Logger;
+  /** Counts refreshes in token_refreshes{result}. Optional (the app server has no metrics registry). */
+  metrics?: Pick<ChangeCatchMetrics, 'tokenRefresh'>;
+}
+
+export type TokenRefreshResult = 'ok' | 'revoked' | 'error';
+
+/** Classify a failed refresh for logs/metrics. Never reads token material. */
+export function refreshFailure(e: unknown): { result: Exclude<TokenRefreshResult, 'ok'>; status: number | null; reason: string } {
+  if (isRevokedGrantError(e)) return { result: 'revoked', status: (e as HttpError).status, reason: 'revoked' };
+  if (e instanceof HttpError && e.status) return { result: 'error', status: e.status, reason: `http_${e.status}` };
+  return { result: 'error', status: null, reason: 'network' };
 }
 
 export class PortalTokenProvider implements TokenProvider {
   private readonly cache = new Map<number, { token: string; expiresAt: number }>();
   private readonly inflight = new Map<number, Promise<string>>();
+  /** Callers that joined the in-flight refresh for a portal (single-flight), for the refresh log line. */
+  private readonly joiners = new Map<number, number>();
   private readonly refresh: (rt: string) => Promise<TokenResponse>;
   private readonly now: () => number;
   private readonly revocations: RevocationStore;
-  private readonly log: (msg: string) => void;
+  private readonly logger: Logger;
 
   constructor(private readonly deps: PortalTokenProviderDeps) {
     this.refresh = deps.refresh ?? refreshAccessToken;
     this.now = deps.now ?? Date.now;
     this.revocations = deps.revocations ?? (deps.store.db ? new SqliteRevocations(deps.store.db) : new MemoryRevocations());
-    this.log = deps.log ?? ((m) => console.warn(`[tokens] ${m}`));
+    this.logger = (deps.logger ?? createLogger('oauth')).child({ component: 'oauth' });
   }
 
   /** When the portal's refresh token was rejected (since its latest install), else null. */
@@ -157,33 +180,80 @@ export class PortalTokenProvider implements TokenProvider {
     if (hit && hit.expiresAt - EARLY_REFRESH_MS > this.now()) return hit.token;
 
     const pending = this.inflight.get(portalId);
-    if (pending) return pending;
+    if (pending) {
+      this.joiners.set(portalId, (this.joiners.get(portalId) ?? 0) + 1);
+      return pending;
+    }
 
     const p = (async () => {
       try {
         const rt = this.deps.store.getRefreshToken(portalId);
         if (!rt) throw new PortalNotInstalledError(portalId);
+        const started = this.now();
         let res: TokenResponse;
         try {
           res = await this.refresh(rt);
         } catch (e) {
+          this.logRefreshFailed(portalId, e, started);
           if (!isRevokedGrantError(e)) throw e;
           const at = this.now();
           this.revocations.markRevoked(portalId, at, 'invalid_grant');
           this.forget(portalId);
-          this.log(`portal ${portalId}: refresh token rejected by HubSpot; marked revoked`);
           throw new PortalTokenRevokedError(portalId, this.revocations.revokedAt(portalId) ?? at);
         }
         if (res.refresh_token && res.refresh_token !== rt) this.deps.store.updateRefreshToken(portalId, res.refresh_token);
         this.cache.set(portalId, { token: res.access_token, expiresAt: this.now() + res.expires_in * 1000 });
         registerPortalToken(res.access_token, portalId); // so http.ts uses this portal's rate-limit bucket
+        this.logRefreshed(portalId, res.expires_in, started);
         return res.access_token;
       } finally {
         this.inflight.delete(portalId);
+        this.joiners.delete(portalId);
       }
     })();
     this.inflight.set(portalId, p);
     return p;
+  }
+
+  private singleFlight(portalId: number): { singleFlight: boolean; joiners: number } {
+    const joiners = this.joiners.get(portalId) ?? 0;
+    return { singleFlight: joiners > 0, joiners };
+  }
+
+  private logRefreshed(portalId: number, expiresInSec: number, started: number): void {
+    try {
+      this.deps.metrics?.tokenRefresh('ok');
+      this.logger.info('token_refreshed', `portal ${portalId}: access token refreshed`, {
+        portalId,
+        expiresInSec,
+        ...this.singleFlight(portalId),
+        durationMs: Math.max(0, this.now() - started),
+      });
+    } catch {
+      /* observability must never break a token refresh */
+    }
+  }
+
+  private logRefreshFailed(portalId: number, e: unknown, started: number): void {
+    try {
+      const f = refreshFailure(e);
+      this.deps.metrics?.tokenRefresh(f.result);
+      // Revoked (uninstall) and transient failures (5xx, network) are warn; any other 4xx (bad client secret...) is error.
+      const level = f.result === 'revoked' || f.status === null || f.status >= 500 ? 'warn' : 'error';
+      const msg =
+        f.result === 'revoked'
+          ? `portal ${portalId}: refresh token rejected by HubSpot; marked revoked`
+          : `portal ${portalId}: access token refresh failed (${f.reason})`;
+      this.logger.log(level, 'token_refresh_failed', msg, {
+        portalId,
+        status: f.status,
+        reason: f.reason,
+        ...this.singleFlight(portalId),
+        durationMs: Math.max(0, this.now() - started),
+      });
+    } catch {
+      /* observability must never break a token refresh */
+    }
   }
 
   /** Seed the cache with the access token we got from the install code exchange (saves one refresh). */

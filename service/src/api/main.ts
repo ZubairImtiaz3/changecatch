@@ -58,7 +58,7 @@ function main(): void {
   defaultPairs(); // fail fast on a bad CHANGECATCH_DEFAULT_PAIRS
   const mode = customWriteMode(); // fail fast on a bad CUSTOM_WRITE_MODE (conditional | optional)
   const portals = new PortalStore();
-  const tokens = new PortalTokenProvider({ store: portals, log: classifiedLog(log.child({ component: 'tokens' }), { fallbackEvent: 'tokens' }) });
+  const tokens = new PortalTokenProvider({ store: portals, logger: log.child({ component: 'oauth' }) });
   const installer = new Installer({ portals, tokens, log: classifiedLog(log.child({ component: 'install' }), { fallbackEvent: 'install' }) });
 
   const server = createAppServer({

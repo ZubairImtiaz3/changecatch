@@ -354,7 +354,8 @@ export function createWorkerFromEnv(opts: WorkerFromEnvOptions = {}): {
   const db = dbPath(env.DB_PATH);
   const store = opts.store ?? new Store(db);
   const portals = opts.portals ?? new PortalStore({ path: db });
-  const realTokens = new PortalTokenProvider({ store: portals, log: (m) => logFor('tokens')('warn', m) });
+  const metrics = opts.metrics ?? new ChangeCatchMetrics();
+  const realTokens = new PortalTokenProvider({ store: portals, logger: root.child({ component: 'oauth' }), metrics });
   const tokens = opts.tokens ?? workerTokenProvider({ portals, real: realTokens });
   const installer = opts.installer ?? new Installer({ portals, tokens: realTokens, log: (m) => logFor('install')('info', m) });
 
@@ -378,7 +379,6 @@ export function createWorkerFromEnv(opts: WorkerFromEnvOptions = {}): {
     maxHoldMs: numEnv(env.LABEL_MAX_HOLD_MS),
     log: logFor('labels'),
   });
-  const metrics = opts.metrics ?? new ChangeCatchMetrics();
   const tables = new WorkerTables(store);
   registerWorkerGauges(metrics, store, tables);
   const coalesce = coalesceOptionsFromEnv(env);
