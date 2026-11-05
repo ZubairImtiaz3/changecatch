@@ -36,7 +36,10 @@ class FakeSubs implements SubscriptionApi {
   async createSubscription(b: SubscriptionRequest) {
     this.calls.push(`create ${'objectTypeId' in b ? b.objectTypeId : b.eventTypeId}`);
     if (b.subscriptionType === 'APP_LIFECYCLE_EVENT') {
-      const s = { id: this.nextId++, appId: 1, subscriptionType: b.subscriptionType, eventTypeId: b.eventTypeId, actions: [], createdAt: '', updatedAt: '' } as Subscription;
+      // Mirrors real HubSpot: the event type comes back as `objectTypeId`, and create is an upsert (no duplicates).
+      const hit = this.subs.find((s) => s.subscriptionType === 'APP_LIFECYCLE_EVENT' && s.objectTypeId === b.eventTypeId);
+      if (hit) return { ...hit };
+      const s = { id: this.nextId++, appId: 1, subscriptionType: b.subscriptionType, objectTypeId: b.eventTypeId, actions: [], createdAt: '', updatedAt: '' } as unknown as Subscription;
       this.subs.push(s);
       return s;
     }
@@ -362,11 +365,11 @@ test('lifecycle subs self-heal: created at start, recreated when deleted, failur
   const w = startLifecycleSubscriptionWatch({ api, intervalMs: 60_000, log: (m) => logs.push(m) });
   try {
     await w.ready;
-    assert.deepEqual(api.subs.map((s) => (s as { eventTypeId?: string }).eventTypeId).sort(), ['4-1909196', '4-1916193']);
+    assert.deepEqual(api.subs.map((s) => (s as { objectTypeId?: string }).objectTypeId).sort(), ["4-1909196", "4-1916193"]);
 
     assert.equal((await w.check())!.created.length, 0, 'nothing to do when both exist');
 
-    api.subs = api.subs.filter((s) => (s as { eventTypeId?: string }).eventTypeId !== '4-1916193'); // "deleted after an uninstall"
+    api.subs = api.subs.filter((s) => (s as { objectTypeId?: string }).objectTypeId !== "4-1916193"); // "deleted after an uninstall"
     assert.deepEqual((await w.check())!.created, ['4-1916193']);
     assert.ok(logs.some((l) => /MISSING, recreated .*4-1916193/.test(l)), 'recreation is logged');
 
@@ -393,4 +396,23 @@ test('lifecycle subs self-heal: the timer re-checks periodically', async () => {
   } finally {
     w.stop();
   }
+});
+
+test('ensureLifecycleSubscriptions recognises the real HubSpot list shape (event type in objectTypeId)', async () => {
+  // Shape copied from a live GET /webhooks-journal/subscriptions/2026-09 response: lifecycle subs carry the event
+  // type in `objectTypeId` and have no `eventTypeId` field. Reading the wrong field made every check report "missing".
+  const live = [
+    { id: 60406478, appId: 1, subscriptionType: 'APP_LIFECYCLE_EVENT', objectTypeId: '4-1909196', actions: [], createdAt: '2026-10-30T02:54:00.020Z', updatedAt: '' },
+    { id: 60406479, appId: 1, subscriptionType: 'APP_LIFECYCLE_EVENT', objectTypeId: '4-1916193', actions: [], createdAt: '2026-10-30T02:54:00.349Z', updatedAt: '' },
+    { id: 60406509, appId: 1, subscriptionType: 'ASSOCIATION', portalId: 1234567, objectTypeId: '0-3', associatedObjectTypeIds: ['0-1'], actions: [], createdAt: '', updatedAt: '' },
+  ] as unknown as Subscription[];
+  const created: unknown[] = [];
+  const api: SubscriptionApi = {
+    listSubscriptions: async () => live,
+    createSubscription: async (b: SubscriptionRequest) => { created.push(b); return live[0]; },
+    deleteSubscription: async () => {},
+  } as unknown as SubscriptionApi;
+  const r = await ensureLifecycleSubscriptions(api);
+  assert.deepEqual(r, { created: [], existing: ['4-1909196', '4-1916193'] });
+  assert.equal(created.length, 0, 'no create call when both already exist');
 });

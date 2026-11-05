@@ -158,7 +158,11 @@ export const LIFECYCLE_PROPERTIES = ['hs_app_id', 'hs_app_install_level', 'hs_in
 export async function ensureLifecycleSubscriptions(api: SubscriptionApi = journalSubscriptionApi): Promise<{ created: string[]; existing: string[] }> {
   const all = await api.listSubscriptions();
   const have = new Set(
-    all.filter((s) => s.subscriptionType === 'APP_LIFECYCLE_EVENT' && !s.deletedAt).map((s) => String((s as { eventTypeId?: unknown }).eventTypeId ?? '')),
+    // HubSpot's list returns a lifecycle subscription's event type in `objectTypeId` (e.g. "4-1909196"), even though
+    // the create request calls it `eventTypeId`. Read both, or every check wrongly reports the subscription missing.
+    all
+      .filter((s) => s.subscriptionType === 'APP_LIFECYCLE_EVENT' && !s.deletedAt)
+      .map((s) => String((s as { objectTypeId?: unknown }).objectTypeId ?? (s as { eventTypeId?: unknown }).eventTypeId ?? '')),
   );
   const out = { created: [] as string[], existing: [] as string[] };
   for (const eventTypeId of [APP_EVENT_TYPE.INSTALL, APP_EVENT_TYPE.UNINSTALL]) {
