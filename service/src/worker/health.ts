@@ -11,7 +11,8 @@ import { isStale, STALE_AFTER_MS } from '../core/poller.js';
 import { createLogger } from '../obs/log.js';
 import { legacyInfoLog } from '../obs/wiring.js';
 import type { BucketStats } from '../lib/rate-limiter.js';
-import { PROMETHEUS_CONTENT_TYPE, type ChangeCatchMetrics, type MetricSnapshot } from '../obs/metrics.js';
+import { offsetTimeMs, PROMETHEUS_CONTENT_TYPE, type ChangeCatchMetrics, type MetricSnapshot } from '../obs/metrics.js';
+import { compareOffsets, DEFAULT_OFFSET_CHECK_EVERY_MS, offsetMaxAgeMsFromEnv, readOffsetCheck } from './journal-reader.js';
 import type { PortalMetrics, Store } from '../store/db.js';
 import type { LatencyStats } from './latency.js';
 import type { WorkerTables } from './worker-tables.js';
@@ -39,7 +40,13 @@ export interface HealthTotals {
 }
 
 export interface HealthSnapshot {
-  status: 'ok' | 'stale';
+  /** stale = no successful read for 1 h; degraded = reads succeed but the offset is too old / far behind latest. */
+  status: 'ok' | 'degraded' | 'stale';
+  /** Age of the stored offset (UUIDv7 time), seconds. null = no offset / not a UUIDv7. Aggregate only. */
+  offsetAgeSeconds: number | null;
+  offsetMaxAgeSeconds: number;
+  /** Why status is "degraded" (no portal ids). */
+  degradedReason?: string;
   now: string;
   startedAt: string;
   lastSuccessfulReadAt: string | null;
@@ -66,6 +73,37 @@ export interface HealthExtras {
   tables?: WorkerTables;
   metrics?: ChangeCatchMetrics;
   rateLimiter?: () => Record<string, BucketStats>;
+  /** Default env JOURNAL_OFFSET_MAX_AGE_MS (48 h). */
+  offsetMaxAgeMs?: number;
+}
+
+/**
+ * Offset freshness for /health. Degraded when:
+ *  - the stored offset is older than maxAge, unless a recent earliest/latest check (journal-reader) showed we
+ *    are simply caught up on a quiet journal; or
+ *  - the last check saw `latest` more than maxAge ahead of the stored offset.
+ */
+export function offsetHealth(
+  store: Store,
+  now: number,
+  maxAgeMs: number,
+): { offsetAgeSeconds: number | null; degradedReason: string | null } {
+  const off = store.getOffset();
+  const ot = off ? offsetTimeMs(off) : null;
+  if (!off || ot === null) return { offsetAgeSeconds: null, degradedReason: null };
+  const ageMs = Math.max(0, now - ot);
+  const c = readOffsetCheck(store);
+  const check = c && c.offset === off ? c : null;
+  if (check?.expired) return { offsetAgeSeconds: ageMs / 1000, degradedReason: 'journal offset expired' };
+  const latestT = check?.latest ? offsetTimeMs(check.latest) : null;
+  if (latestT !== null && latestT - ot > maxAgeMs)
+    return { offsetAgeSeconds: ageMs / 1000, degradedReason: 'stored offset is far behind the journal latest' };
+  if (ageMs > maxAgeMs) {
+    const caughtUp =
+      !!check && now - check.at <= 2 * DEFAULT_OFFSET_CHECK_EVERY_MS && (!check.latest || compareOffsets(check.latest, off) <= 0);
+    if (!caughtUp) return { offsetAgeSeconds: ageMs / 1000, degradedReason: 'stored journal offset is older than JOURNAL_OFFSET_MAX_AGE_MS' };
+  }
+  return { offsetAgeSeconds: ageMs / 1000, degradedReason: null };
 }
 
 const iso = (ms: number | null | undefined) => (ms === null || ms === undefined ? null : new Date(ms).toISOString());
@@ -89,8 +127,13 @@ export function healthSnapshot(
   const holds = store.listLabelHolds();
   const lock = t?.lockInfo();
   const sum = (f: (m: PortalMetrics) => number) => metrics.reduce((a, m) => a + f(m), 0);
+  const maxAgeMs = extras.offsetMaxAgeMs ?? offsetMaxAgeMsFromEnv();
+  const oh = offsetHealth(store, now, maxAgeMs);
   return {
-    status: isStale(store, now, staleAfterMs) ? 'stale' : 'ok',
+    status: isStale(store, now, staleAfterMs) ? 'stale' : oh.degradedReason ? 'degraded' : 'ok',
+    ...(oh.degradedReason ? { degradedReason: oh.degradedReason } : {}),
+    offsetAgeSeconds: oh.offsetAgeSeconds === null ? null : Math.round(oh.offsetAgeSeconds),
+    offsetMaxAgeSeconds: Math.round(maxAgeMs / 1000),
     now: iso(now)!,
     startedAt: iso(startedAt)!,
     lastSuccessfulReadAt: iso(store.getLastSuccessfulReadAt()),
@@ -230,7 +273,7 @@ export function isAuthorised(req: Pick<IncomingMessage, 'headers'>, token: strin
 }
 
 /**
- * GET /health (or /healthz) -> 200 JSON when fine, 503 JSON when stale.
+ * GET /health (or /healthz) -> 200 JSON when fine, 503 JSON when stale or degraded (offset expired / too old).
  * GET /metrics -> Prometheus text (needs `metrics`).
  * Per-portal detail only with a valid x-health-token (healthToken, default env HEALTH_TOKEN). Anything else -> 404.
  */

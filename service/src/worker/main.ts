@@ -432,6 +432,7 @@ export function createWorkerFromEnv(opts: WorkerFromEnvOptions = {}): {
     batchSize: numEnv(env.JOURNAL_BATCH_SIZE),
     skipAfterMs: numEnv(env.JOURNAL_SKIP_FAILED_AFTER_MS),
     downloadConcurrency: numEnv(env.JOURNAL_DOWNLOAD_CONCURRENCY),
+    offsetMaxAgeMs: numEnv(env.JOURNAL_OFFSET_MAX_AGE_MS),
     metrics,
     log: logFor('journal'),
   });

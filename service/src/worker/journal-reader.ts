@@ -17,12 +17,19 @@
 //    We log an [ALERT], remember it in worker_state (journal_offset_reset), and restart from `earliest`.
 //    Re-reading is safe: seen_events (kept 4 days) and the stamp:<id> keys stop double stamps. Changes that
 //    expired before we got back are lost; the alert says so.
+//  - BUT (seen live 2026-11-05): an expired offset can also come back as 204 / EMPTY, not 404, so the worker
+//    would read "nothing new" forever. So when a read is empty AND the stored offset's UUIDv7 time is older than
+//    JOURNAL_OFFSET_MAX_AGE_MS (default 48 h, under the ~72 h retention), we call `earliest` + `latest` (at most
+//    every 5 min). Offset older than `earliest` = expired: [ALERT], data_loss{reason="offset_expired"}, restart
+//    from `earliest`. Not expired but `latest` is newer = unexpected: warn, check again next time.
+//    The result is saved in worker_state (journal_offset_check) for /health ("degraded").
 
 import type { JournalReadResult as CoreReadResult } from '../core/poller.js';
 import type { JournalFile } from '../core/types.js';
 import type { Store } from '../store/db.js';
 import {
   batchEarliest as realBatchEarliest,
+  getEarliest as realGetEarliest,
   batchNext as realBatchNext,
   getLatest as realGetLatest,
   MAX_BATCH,
@@ -31,11 +38,13 @@ import {
 } from '../hubspot/journal.js';
 import { HttpError } from '../lib/http.js';
 import { createLogger } from '../obs/log.js';
-import type { ChangeCatchMetrics } from '../obs/metrics.js';
+import { offsetTimeMs, type ChangeCatchMetrics } from '../obs/metrics.js';
 import { legacyLog } from '../obs/wiring.js';
 
 export interface JournalApi {
   latest(): Promise<JournalFetchResponse | null>;
+  /** Oldest entry still in the journal. Optional (fakes): falls back to batchEarliest(1). */
+  earliest?(): Promise<JournalFetchResponse | null>;
   /** Oldest entries still in the journal (recovery after an expired offset). */
   batchEarliest(count: number): Promise<JournalBatchResponse | undefined>;
   /** May resolve to undefined for HTTP 204 (nothing new). */
@@ -132,6 +141,7 @@ async function readCapped(res: Response, maxBytes: number): Promise<string> {
 
 export const realJournalApi: JournalApi = {
   latest: () => realGetLatest(),
+  earliest: () => realGetEarliest(),
   batchEarliest: (count) => realBatchEarliest(count),
   batchNext: (offset, count) => realBatchNext(offset, count),
   download: (entry) => secureDownloadJournalFile(entry),
@@ -170,6 +180,50 @@ export interface JournalReaderOptions {
   log?: (level: 'info' | 'warn' | 'error', msg: string) => void;
   /** data_loss{reason="journal_gap"|"skipped_entries"} when changes are known to be lost. */
   metrics?: Pick<ChangeCatchMetrics, 'dataLoss'>;
+  /** An empty read with a stored offset older than this triggers the earliest/latest check. Default 48 h. */
+  offsetMaxAgeMs?: number;
+  /** At most one earliest/latest check per this many ms. Default 5 min. */
+  offsetCheckEveryMs?: number;
+}
+
+// ---------------------------------------------------------------- expired-offset detection (empty reads)
+
+export const DEFAULT_OFFSET_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+export const DEFAULT_OFFSET_CHECK_EVERY_MS = 5 * 60 * 1000;
+/** worker_state key: the last earliest/latest check (read by /health). */
+export const OFFSET_CHECK_KEY = 'journal_offset_check';
+
+export interface OffsetCheck {
+  at: number;
+  /** The stored offset that was checked. */
+  offset: string;
+  earliest: string | null;
+  latest: string | null;
+  expired: boolean;
+}
+
+/** JOURNAL_OFFSET_MAX_AGE_MS, or the 48 h default. */
+export function offsetMaxAgeMsFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number(env.JOURNAL_OFFSET_MAX_AGE_MS);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_OFFSET_MAX_AGE_MS;
+}
+
+/** UUIDv7 offsets are time-ordered: compare as lower-case strings. */
+export function compareOffsets(a: string, b: string): number {
+  const x = a.toLowerCase();
+  const y = b.toLowerCase();
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
+export function readOffsetCheck(store: Store): OffsetCheck | null {
+  const raw = store.getState(OFFSET_CHECK_KEY);
+  if (!raw) return null;
+  try {
+    const c = JSON.parse(raw) as OffsetCheck;
+    return c && typeof c.offset === 'string' && typeof c.at === 'number' ? c : null;
+  } catch {
+    return null;
+  }
 }
 
 export class JournalPartialError extends Error {
@@ -187,6 +241,9 @@ export function makeJournalReader(api: JournalApi, opts: JournalReaderOptions): 
   const now = opts.now ?? Date.now;
   const log = opts.log ?? legacyLog(createLogger('journal'));
   const { store } = opts;
+  const offsetMaxAgeMs = opts.offsetMaxAgeMs ?? offsetMaxAgeMsFromEnv();
+  const checkEveryMs = opts.offsetCheckEveryMs ?? DEFAULT_OFFSET_CHECK_EVERY_MS;
+  let lastCheckAt: number | null = null;
 
   const concurrency = Math.max(1, opts.downloadConcurrency ?? DEFAULT_DOWNLOAD_CONCURRENCY);
   // scale-review C3: download in parallel, but return files in the order of `entries` (sorted by offset), so
@@ -204,6 +261,45 @@ export function makeJournalReader(api: JournalApi, opts: JournalReaderOptions): 
     }
   };
 
+  const earliest = async (): Promise<JournalFetchResponse | null> => {
+    if (api.earliest) return api.earliest();
+    return (await api.batchEarliest(1))?.results?.[0] ?? null;
+  };
+
+  /** Empty read: returns the earliest batch when the offset turned out to be expired, else undefined. */
+  const checkOldOffset = async (afterOffset: string): Promise<JournalBatchResponse | undefined> => {
+    const t = now();
+    const ot = offsetTimeMs(afterOffset);
+    if (ot === null || t - ot < offsetMaxAgeMs) return undefined; // fresh (or not a UUIDv7): no extra calls
+    if (lastCheckAt !== null && t - lastCheckAt < checkEveryMs) return undefined; // don't loop hot
+    lastCheckAt = t;
+    const [e, l] = await Promise.all([earliest(), api.latest()]);
+    const expired = !!e && compareOffsets(afterOffset, e.currentOffset) < 0;
+    const check: OffsetCheck = { at: t, offset: afterOffset, earliest: e?.currentOffset ?? null, latest: l?.currentOffset ?? null, expired };
+    store.setState(OFFSET_CHECK_KEY, JSON.stringify(check));
+    const ageH = Math.round((t - ot) / 3_600_000);
+    if (expired) {
+      log(
+        'error',
+        `[ALERT] journal offset expired; recovered from earliest. Stored offset ${afterOffset} (${ageH} h old) is older than ` +
+          `the earliest entry ${e!.currentOffset}, and HubSpot returned an EMPTY read (not 404). Duplicates are skipped; ` +
+          `changes between the old offset and earliest may be lost.`,
+      );
+      store.setState('journal_offset_reset', JSON.stringify({ from: afterOffset, at: t, earliest: e!.currentOffset, via: 'empty_read' }));
+      store.recordError(`journal offset ${afterOffset} expired (empty read); restarted from earliest`, t);
+      opts.metrics?.dataLoss('offset_expired', 1);
+      lastCheckAt = null;
+      return (await api.batchEarliest(n)) ?? undefined;
+    }
+    if (l && compareOffsets(l.currentOffset, afterOffset) > 0)
+      log(
+        'warn',
+        `journal read after offset ${afterOffset} (${ageH} h old) was empty, but latest is newer (${l.currentOffset}) and the ` +
+          `offset is not older than earliest. Will check again in ${Math.round(checkEveryMs / 60000)} min.`,
+      );
+    return undefined;
+  };
+
   return async (afterOffset) => {
     if (afterOffset === null) {
       const latest = await api.latest();
@@ -214,6 +310,7 @@ export function makeJournalReader(api: JournalApi, opts: JournalReaderOptions): 
     }
 
     let raw: JournalBatchResponse | undefined;
+    let reset = false;
     try {
       raw = await api.batchNext(afterOffset, n);
     } catch (e) {
@@ -227,9 +324,15 @@ export function makeJournalReader(api: JournalApi, opts: JournalReaderOptions): 
       store.setState('journal_offset_reset', JSON.stringify({ from: afterOffset, at: t }));
       store.recordError(`journal offset ${afterOffset} expired (404); restarted from earliest`, t);
       opts.metrics?.dataLoss('journal_gap', 1);
+      reset = true;
       raw = await api.batchEarliest(n);
     }
-    if (!raw) return { files: [], nextOffset: null, full: false }; // 204: nothing new
+    if (!raw || (!(raw.results?.length) && !(raw.errors?.length) && !(raw.numErrors ?? 0))) {
+      // 204 / empty: nothing new, OR (seen live) an expired offset. Check only when the offset is old.
+      const recovered = reset ? undefined : await checkOldOffset(afterOffset);
+      if (!recovered) return { files: [], nextOffset: null, full: false };
+      raw = recovered;
+    }
     const results = [...(raw.results ?? [])].sort((a, b) => (a.currentOffset < b.currentOffset ? -1 : a.currentOffset > b.currentOffset ? 1 : 0));
     const errors = raw.errors ?? [];
 

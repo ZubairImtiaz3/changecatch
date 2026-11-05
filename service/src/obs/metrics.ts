@@ -317,7 +317,7 @@ export const M = {
   httpErrors: 'http_errors', // {status}
   rateLimited: 'rate_limited', // {portal}
   tokenRefreshes: 'token_refreshes', // {result="ok"|"revoked"|"error"}
-  dataLoss: 'data_loss', // {reason="dead_letter"|"skipped_entries"|"stamp_dropped"|"journal_gap"|"park_dropped"}
+  dataLoss: 'data_loss', // {reason="dead_letter"|"skipped_entries"|"stamp_dropped"|"journal_gap"|"offset_expired"|"park_dropped"}
 } as const;
 
 /**
@@ -457,9 +457,10 @@ export class ChangeCatchMetrics {
   /**
    * Something that should have become a stamp never will. Any increase should page someone.
    * reason: dead_letter (gave up after retries), skipped_entries (journal entries we could not parse/process),
-   * stamp_dropped (CRM rejected the record, e.g. deleted), journal_gap (offset expired: >3 days behind).
+   * stamp_dropped (CRM rejected the record, e.g. deleted), journal_gap (offset expired: >3 days behind, HTTP 404),
+   * offset_expired (offset expired but HubSpot returned an EMPTY read; detected via earliest).
    */
-  dataLoss(reason: 'dead_letter' | 'skipped_entries' | 'stamp_dropped' | 'journal_gap' | 'park_dropped', n = 1, portalId?: number): void {
+  dataLoss(reason: 'dead_letter' | 'skipped_entries' | 'stamp_dropped' | 'journal_gap' | 'offset_expired' | 'park_dropped', n = 1, portalId?: number): void {
     if (n > 0) this.registry.inc(M.dataLoss, n, { reason, portal: portalId ?? 'app' });
   }
 

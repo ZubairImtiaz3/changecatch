@@ -71,6 +71,7 @@ Rotate: put the new key **first** in `TOKEN_ENC_KEYS` (keep the old one after it
 | `JOURNAL_MAX_FILE_BYTES` | W | `20971520` (20 MB) | Size cap for one journal file. |
 | `JOURNAL_DOWNLOAD_TIMEOUT_MS` | W | `15000` | Download timeout per journal file. |
 | `JOURNAL_SKIP_FAILED_AFTER_MS` | W | `1800000` | Skip a journal entry that keeps failing (HTTP 207) after this long. Counted as data loss. |
+| `JOURNAL_OFFSET_MAX_AGE_MS` | W | `172800000` | An empty journal read with a stored offset older than this (48 h) triggers an `earliest`/`latest` check (max every 5 min) to catch expired offsets that HubSpot returns as empty, not 404. Also the age at which `/health` reports `degraded`. Keep it under the ~72 h retention. |
 
 ## 6. Worker: pairing and labels
 
