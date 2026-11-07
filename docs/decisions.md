@@ -6,6 +6,7 @@ All decisions below were made in October 2026, while v1 was being built and test
 
 | ID | Decision | Status |
 |---|---|---|
+| D8 | Pre-launch squash of legacy upgrade paths | Adopted |
 | D6 | Late-half absorption instead of a longer split hold | Adopted |
 | D5 | Trim the properties from 9 to 7 | Adopted |
 | D4 | No custom workflow action in v1 | Adopted (action deferred) |
@@ -14,6 +15,18 @@ All decisions below were made in October 2026, while v1 was being built and test
 | D1 | Detect changes with the Webhooks Journal | Adopted |
 
 ---
+
+## D8: Pre-launch squash (2026-11-07, owner decision)
+
+**Why:** no customer has installed yet, so code that only upgrades our own dev data is surplus. Keeping it means every reader has to understand 13 schema steps and two token formats that no real database will ever need.
+
+**What went:**
+- The 13 schema migrations (incl. tables once created by their own modules) became ONE initial migration that creates today's schema exactly (`service/src/store/schema.ts`). Appending new versions works as before.
+- The legacy `v1:` token format and the single-key `TOKEN_ENC_KEY` variable. `TOKEN_ENC_KEYS` (with key ids) and the rotation CLI stay for real rotations; the crypto module moved to `service/src/lib/crypto.ts`.
+- The free-text -> checkbox property migration. Properties are created as dropdowns from day one; an existing property of another type is reported as `exists-mismatch` and left alone. Option merge (add / unhide / relabel) stays.
+- The coalescing `off` mode (only tests used it).
+
+**Cost:** the dev DB is recreated once and the app is reinstalled on the test portal ([development.md](development.md), "Recreate the dev DB"). A DB file made before the squash is refused at start with that instruction; it is never mixed with the new schema.
 
 ## D7: Naming of everything in the customer's portal (2026-11-07)
 
@@ -128,7 +141,7 @@ Requirement: Pro accounts can install, and Enterprise accounts get custom-object
 - **Conditionally required:** `crm.objects.custom.write`, `crm.schemas.custom.write`.
 - **Removed:** `timeline.write` (only needed for app events, unused in v1).
 
-Install flow (`CUSTOM_WRITE_MODE`, default `conditional`):
+Install flow (was `CUSTOM_WRITE_MODE`, default `conditional`; the `optional` mode and the env var were removed on 2026-11-07, only `conditional` remains):
 - **`conditional`:** the OAuth callback sees custom read granted but write missing (which means Enterprise), and immediately redirects to a second consent screen that includes the conditional scopes. A loop guard prevents repeats. The settings page keeps an "Enable custom objects" button as a backup, which also covers accounts that use app approval (app governance).
 - **`optional`:** custom write goes in the optional scopes on the first screen. Tested on a fresh install: HubSpot **never granted optional custom write**. So `conditional` stays the default.
 
@@ -168,7 +181,7 @@ No app-defined workflow trigger exists on the new developer platform other than 
 ### Decision
 **v1 = property stamping.** For each change, the worker PATCHes the record once with the 7 `changecatch_*` properties (D5). Workflows trigger on "Property value changed: ChangeCatch: last change ID" with re-enrollment on. Testing confirmed re-enrollment once per change, on Deals and on custom objects.
 
-- Delivery mode is configurable (`DELIVERY_MODE=stamp|app_events`), so moving to app events later is a config change plus uploading the event types.
+- Stamping is the only delivery path in the code. App events, if approved later, become a new sink behind the stamp queue (a code change plus uploading the event types), not a config switch. The first app-events implementation was deleted in the 2026-11 untangle; git history has it.
 - Stamping needs write scopes: `crm.objects.{contacts,companies,deals}.write` and `crm.schemas.{contacts,companies,deals}.write`, plus custom-object write (see D3).
 
 ---
