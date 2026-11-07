@@ -2,7 +2,8 @@
 //   GET  /                    -> redirect to the HubSpot install URL (same as /install)
 //   GET  /install             -> redirect to the HubSpot install URL
 //   GET  /install?custom=1    -> same, plus the 2 conditionally required custom-object write scopes (second consent)
-//   GET  /oauth/callback      -> code exchange, save tokens, provision the portal (path comes from HUBSPOT_REDIRECT_URI)
+//   GET  /oauth/callback      -> code exchange, save tokens, provision the portal (path comes from HUBSPOT_REDIRECT_URI),
+//                                then 302 to HubSpot's Marketplace returnUrl, else to the ChangeCatch settings tab in HubSpot
 //   GET  /api/settings        -> settings for the calling portal (signed hubspot.fetch from the settings page)
 //   POST /api/settings        -> save settings, diff subscriptions, create properties
 //   GET  /health              -> "ok"
@@ -17,7 +18,9 @@
 // - SETTINGS_ALLOW_UNSIGNED is refused unless NODE_ENV != production AND PUBLIC_BASE_URL is localhost (or unset).
 // - OAuth state is HMAC-signed (step + expiry + nonce) and single-use, so it survives restarts and can't be forged.
 //   Installs from HubSpot's own Install button carry no state: allowed, but logged. A state that IS present but
-//   expired/forged/reused is rejected (CSRF). Redirects only ever go to the fixed HubSpot authorize URL.
+//   expired/forged/reused is rejected (CSRF). Redirects only go to the fixed HubSpot authorize URL, a validated HubSpot
+//   returnUrl (https app[-region].hubspot.com only), or the settings tab URL we build from portalId + HUBSPOT_APP_ID.
+//   Only the callback may be framed (by *.hubspot.com), as HubSpot's embedded Marketplace install needs.
 // - 64 KB body limit (413), JSON errors -> 400, generic 5xx messages with a reference id (details only in logs),
 //   security headers on every response, no CORS headers (hubspot.fetch is proxied server-side), request timeouts.
 // - Never log codes, tokens or signed URLs. Logged values from the request are stripped of newlines and truncated.
@@ -68,6 +71,8 @@ export interface AppServerOptions {
   exchangeCode: (code: string) => Promise<TokenResponse>;
   clientSecret: string;
   callbackPath: string;
+  /** HubSpot app ID (HUBSPOT_APP_ID). When set, a finished install redirects to the app's settings tab in HubSpot. */
+  appId?: number;
   /** Public origin HubSpot calls (e.g. https://changecatch.fly.dev). Required for the settings API. */
   publicBaseUrl?: string;
   /** Local testing only: skip signature checks and take portalId from the query. Refused outside localhost/dev. */
@@ -113,9 +118,10 @@ export function assertHubSpotAuthorizeUrl(u: string): string {
 // ---------------------------------------------------------------- OAuth state (signed, single-use)
 
 export interface StateCodec {
-  issue(step: 1 | 2): string;
+  /** returnUrl: HubSpot's Marketplace returnUrl, carried through the second consent so we can still go back to it. */
+  issue(step: 1 | 2, returnUrl?: string | null): string;
   /** 'none' = no state given; 'invalid' = forged / malformed / expired / reused. */
-  take(state: string | null): { status: 'ok'; step: 1 | 2 } | { status: 'none' } | { status: 'invalid'; reason: string };
+  take(state: string | null): { status: 'ok'; step: 1 | 2; returnUrl: string | null } | { status: 'none' } | { status: 'invalid'; reason: string };
 }
 
 export function createStateCodec(secret: string, now: () => number = Date.now, ttlMs = STATE_TTL_MS): StateCodec {
@@ -124,16 +130,19 @@ export function createStateCodec(secret: string, now: () => number = Date.now, t
   const used = new Map<string, number>(); // nonce -> expiry
 
   return {
-    issue(step) {
-      const body = `${step}.${now() + ttlMs}.${randomBytes(16).toString('base64url')}`;
+    issue(step, returnUrl) {
+      // Format: step.expiry.nonce[.base64url(returnUrl)].mac  (the returnUrl part is optional and also signed)
+      const ret = returnUrl ? `.${Buffer.from(returnUrl, 'utf8').toString('base64url')}` : '';
+      const body = `${step}.${now() + ttlMs}.${randomBytes(16).toString('base64url')}${ret}`;
       return `${body}.${mac(body)}`;
     },
     take(state) {
       if (!state) return { status: 'none' };
       const parts = state.split('.');
-      if (parts.length !== 4) return { status: 'invalid', reason: 'malformed' };
-      const [step, exp, nonce, sig] = parts;
-      const want = Buffer.from(mac(`${step}.${exp}.${nonce}`));
+      if (parts.length !== 4 && parts.length !== 5) return { status: 'invalid', reason: 'malformed' };
+      const sig = parts.pop()!;
+      const [step, exp, nonce, ret] = parts;
+      const want = Buffer.from(mac(parts.join('.')));
       const got = Buffer.from(sig);
       if (want.length !== got.length || !timingSafeEqual(want, got)) return { status: 'invalid', reason: 'bad signature' };
       if (step !== '1' && step !== '2') return { status: 'invalid', reason: 'bad step' };
@@ -143,10 +152,57 @@ export function createStateCodec(secret: string, now: () => number = Date.now, t
       if (used.has(nonce)) return { status: 'invalid', reason: 'reused' };
       if (used.size >= MAX_USED_NONCES) used.delete(used.keys().next().value!); // bounded memory
       used.set(nonce, Number(exp));
-      return { status: 'ok', step: step === '2' ? 2 : 1 };
+      const returnUrl = ret ? safeReturnUrl(Buffer.from(ret, 'base64url').toString('utf8')) : null;
+      return { status: 'ok', step: step === '2' ? 2 : 1, returnUrl };
     },
   };
 }
+
+// ---------------------------------------------------------------- where the browser goes after install
+
+/**
+ * HubSpot's Marketplace "seamless install" sends ?returnUrl= to our redirect URL; after the code exchange we MUST
+ * redirect there ("required to avoid an infinite login loop"):
+ *   https://developers.hubspot.com/docs/apps/developer-platform/list-apps/understand-app-install-flow.md
+ * Accept only https HubSpot app hosts (app.hubspot.com, app-eu1.hubspot.com, ...), so it can't become an open redirect.
+ */
+export function safeReturnUrl(u: string | null | undefined): string | null {
+  if (!u) return null;
+  try {
+    const p = new URL(u);
+    const okHost = p.hostname === 'app.hubspot.com' || /^app-[a-z]{2,3}\d{1,2}\.hubspot\.com$/.test(p.hostname);
+    if (p.protocol !== 'https:' || !okHost || p.username || p.password || p.port) return null;
+    return p.toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * HubSpot web host for the portal's data region. HubSpot OAuth codes and refresh tokens start with the region
+ * ("na1-...", "eu1-..."): na1 is app.hubspot.com, any other region is app-<region>.hubspot.com.
+ */
+export function hubspotAppHost(regionPrefixed?: string | null): string {
+  const m = /^([a-z]{2,3}\d{1,2})-/.exec(regionPrefixed ?? '');
+  return !m || m[1] === 'na1' ? 'https://app.hubspot.com' : `https://app-${m[1]}.hubspot.com`;
+}
+
+/**
+ * The ChangeCatch tab in HubSpot (Settings > Integrations > Connected apps > ChangeCatch), where the settings page
+ * lives. Not documented by HubSpot; format copied from the browser on 2026-11-07 (without the suffix HubSpot opens
+ * the Overview tab; it adds ?accountId= itself):
+ *   https://app.hubspot.com/connected-apps/{portalId}/installed/framework/{appId}/settings/general-settings
+ */
+export function settingsPageUrl(o: { appId?: number; portalId: number; regionPrefixed?: string | null }): string | null {
+  if (!o.appId || !Number.isSafeInteger(o.portalId) || o.portalId <= 0) return null;
+  return `${hubspotAppHost(o.regionPrefixed)}/connected-apps/${o.portalId}/installed/framework/${o.appId}/settings/general-settings`;
+}
+
+/** The OAuth callback must be frameable by HubSpot (Marketplace install runs in an embedded browser context). */
+const CALLBACK_FRAME_HEADERS: Record<string, string> = {
+  'Content-Security-Policy':
+    "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'self' https://app.hubspot.com https://*.hubspot.com; base-uri 'none'; form-action 'none'",
+};
 
 // ---------------------------------------------------------------- helpers
 
@@ -298,10 +354,22 @@ export function createAppServer(opts: AppServerOptions): Server {
   const enableCustomObjectsUrl = publicBase ? `${publicBase}/install?custom=1` : null;
   const LATER = 'Custom objects can be enabled later from the ChangeCatch settings page in HubSpot.';
 
-  function redirectToHubSpot(res: ServerResponse, step: 1 | 2): void {
-    const target = assertHubSpotAuthorizeUrl(opts.buildInstallUrl(states.issue(step), { custom: step === 2 }));
+  function redirectToHubSpot(res: ServerResponse, step: 1 | 2, returnUrl: string | null = null): void {
+    const target = assertHubSpotAuthorizeUrl(opts.buildInstallUrl(states.issue(step, returnUrl), { custom: step === 2 }));
     res.writeHead(302, { Location: target });
     res.end();
+  }
+
+  /** 302 to a HubSpot page we built or validated (returnUrl / settings tab). */
+  function redirectInto(res: ServerResponse, target: string): void {
+    res.writeHead(302, { Location: target });
+    res.end();
+  }
+
+  /** "Open ChangeCatch settings" button for the fallback pages, or '' when we can't build the link. */
+  function settingsButton(portalId: number, regionPrefixed: string | null | undefined, label = 'Open ChangeCatch settings in HubSpot'): string {
+    const u = settingsPageUrl({ appId: opts.appId, portalId, regionPrefixed });
+    return u ? `<p><a href="${esc(u)}" style="display:inline-block;padding:.6em 1.2em;background:#ff7a59;color:#fff;border-radius:4px;text-decoration:none">${esc(label)}</a></p>` : '';
   }
 
   /** Verify the hubspot.fetch signature and return the trusted portalId, or send an error and return null. */
@@ -391,6 +459,9 @@ export function createAppServer(opts: AppServerOptions): Server {
       }
 
       if (req.method === 'GET' && path === opts.callbackPath) {
+        // HubSpot's Marketplace install may load this URL in an embedded browser: allow HubSpot to frame it.
+        res.removeHeader('X-Frame-Options');
+        for (const [k, v] of Object.entries(CALLBACK_FRAME_HEADERS)) res.setHeader(k, v);
         const error = url.searchParams.get('error');
         const st = states.take(url.searchParams.get('state'));
         if (st.status === 'invalid') {
@@ -399,7 +470,15 @@ export function createAppServer(opts: AppServerOptions): Server {
           return sendHtml(res, 400, 'Install link expired', 'This install link has expired or was already used. Please start the install again.');
         }
         const step = st.status === 'ok' ? st.step : 1;
+        // Marketplace returnUrl: on the URL for a HubSpot-initiated install, or carried in our state through step 2.
+        const returnUrl = safeReturnUrl(url.searchParams.get('returnUrl')) ?? (st.status === 'ok' ? st.returnUrl : null);
         if (error) {
+          // The app is already installed when the optional custom-object consent (step 2) is declined: in the
+          // Marketplace flow we must still go back to HubSpot, or the user is stuck in a login loop.
+          if (step === 2 && returnUrl) {
+            log(`oauth[${ref}]: custom-object consent not granted (${logSafe(error)}); returning to HubSpot`);
+            return redirectInto(res, returnUrl);
+          }
           // Friendly page (governance / declined custom consent / other). Step 2 never loops back automatically.
           const description = url.searchParams.get('error_description');
           const page = oauthErrorPage({ error, description, step, ref });
@@ -425,8 +504,13 @@ export function createAppServer(opts: AppServerOptions): Server {
           const granted = t.scopes ?? [];
           if (needsCustomStep(granted, mode, step)) {
             log(`install[${ref}]: portal ${r.portalId} has custom objects but no custom write scopes: asking for them now`);
-            return redirectToHubSpot(res, 2);
+            return redirectToHubSpot(res, 2, returnUrl);
           }
+          // Done: Marketplace install -> back to HubSpot's returnUrl (required). Our own install link -> straight to
+          // the ChangeCatch settings tab in HubSpot, where the admin picks object pairs.
+          const target = returnUrl ?? settingsPageUrl({ appId: opts.appId, portalId: r.portalId, regionPrefixed: t.refresh_token ?? code });
+          if (target) return redirectInto(res, target);
+          // Fallback when HUBSPOT_APP_ID isn't configured.
           const access = customAccess(granted);
           const note = access.available && !access.enabled ? ` ${LATER}` : '';
           return sendHtml(res, 200, 'ChangeCatch is installed',
@@ -434,8 +518,10 @@ export function createAppServer(opts: AppServerOptions): Server {
         } catch (e) {
           // Tokens are saved before provisioning, so the admin can fix it from the settings page (Save retries).
           log(`install[${ref}]: provisioning failed: ${logSafe((e as Error).message)}`);
-          return sendHtml(res, 500, 'Installed, but setup did not finish',
-            `ChangeCatch is installed, but setup did not finish. Open the ChangeCatch settings page in HubSpot and press Save to retry. Reference: ${ref}`);
+          if (returnUrl) return redirectInto(res, returnUrl); // never strand a Marketplace install; the settings page shows the error
+          return sendPage(res, 500, 'Installed, but setup did not finish',
+            `<p>${esc(`ChangeCatch is installed, but setup did not finish. Open the ChangeCatch settings page in HubSpot and press Save to retry. Reference: ${ref}`)}</p>` +
+              settingsButton(Number(t.hub_id), t.refresh_token ?? code));
         }
       }
 

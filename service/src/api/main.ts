@@ -5,7 +5,7 @@
 //   On start, and then every LIFECYCLE_SUB_CHECK_MS (default 10 min), it makes sure the 2 app-level
 //   APP_LIFECYCLE_EVENT journal subscriptions exist and recreates any that are missing (idempotent);
 //   --no-lifecycle skips that.
-// Env: HUBSPOT_CLIENT_ID, HUBSPOT_CLIENT_SECRET, HUBSPOT_REDIRECT_URI, TOKEN_ENC_KEYS (or legacy TOKEN_ENC_KEY),
+// Env: HUBSPOT_CLIENT_ID, HUBSPOT_CLIENT_SECRET, HUBSPOT_REDIRECT_URI, HUBSPOT_APP_ID, TOKEN_ENC_KEYS (or legacy TOKEN_ENC_KEY),
 //      PORT, CUSTOM_WRITE_MODE, PUBLIC_BASE_URL (needed for settings-page signatures; required when NODE_ENV=production),
 //      DB_PATH (optional), CHANGECATCH_DEFAULT_PAIRS (optional),
 //      SETTINGS_ALLOW_UNSIGNED=1 (local testing only; refused with NODE_ENV=production or a non-localhost PUBLIC_BASE_URL).
@@ -44,6 +44,8 @@ function main(): void {
   const publicBaseUrl = optionalEnv('PUBLIC_BASE_URL');
   const allowUnsigned = optionalEnv('SETTINGS_ALLOW_UNSIGNED') === '1';
   const production = (process.env.NODE_ENV ?? '').toLowerCase() === 'production';
+  const appIdRaw = optionalEnv('HUBSPOT_APP_ID');
+  const appId = appIdRaw ? Number(appIdRaw) : undefined;
 
   // Fail fast on unsafe config (security review H1): exit with a clear error, never start half-protected.
   try {
@@ -51,6 +53,7 @@ function main(): void {
     if (production && !publicBaseUrl) throw new Error('PUBLIC_BASE_URL is required when NODE_ENV=production (settings signatures cover the public URL).');
     if (publicBaseUrl && !/^https?:\/\/[^/?#]+\/?$/.test(publicBaseUrl)) throw new Error('PUBLIC_BASE_URL must be an origin like https://changecatch.example.com (no path or query).');
     if (production && publicBaseUrl && !publicBaseUrl.startsWith('https://')) throw new Error('PUBLIC_BASE_URL must use https:// when NODE_ENV=production.');
+    if (appId !== undefined && !(Number.isSafeInteger(appId) && appId > 0)) throw new Error('HUBSPOT_APP_ID must be the numeric app ID (from the app URL in HubSpot).');
   } catch (e) {
     fatal((e as Error).message);
   }
@@ -70,6 +73,7 @@ function main(): void {
     exchangeCode,
     clientSecret: env('HUBSPOT_CLIENT_SECRET'),
     callbackPath: redirect.pathname,
+    appId,
     publicBaseUrl,
     allowUnsigned,
     log: classifiedLog(log, { fallbackEvent: 'app' }),
@@ -85,6 +89,7 @@ function main(): void {
       customConsent: `http://localhost:${port}/install?custom=1`,
       installedPortals: portals.listInstalled().map((p) => p.portalId),
     });
+    if (!appId) log.warn('no_app_id', 'HUBSPOT_APP_ID is not set: after install, users see a plain "installed" page instead of being sent to the ChangeCatch settings in HubSpot.');
     if (allowUnsigned) log.warn('unsigned_settings', 'SETTINGS_ALLOW_UNSIGNED=1, signature checks are OFF. Local testing only.');
     if (!process.argv.includes('--no-lifecycle')) {
       startLifecycleSubscriptionWatch({ log: classifiedLog(log.child({ component: 'lifecycle-subs' }), { fallbackEvent: 'lifecycle_subscriptions' }) });

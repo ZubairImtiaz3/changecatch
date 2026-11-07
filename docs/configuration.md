@@ -19,6 +19,7 @@ From the app in the HubSpot developer project (`hubspot-app/`).
 |---|---|---|---|
 | `HUBSPOT_CLIENT_ID` | A, W, T | (required) | App client ID. Used for OAuth and the client-credentials token. |
 | `HUBSPOT_CLIENT_SECRET` | A, W, T | (required) | App client secret. Also verifies settings-page request signatures. |
+| `HUBSPOT_APP_ID` | A | unset | Numeric app ID (the last number in the app's URL in HubSpot). When set, a finished install redirects to the ChangeCatch tab under Settings > Connected apps in the customer's portal. Unset = a plain "installed" page. Marketplace installs always return to HubSpot's `returnUrl`. |
 | `HUBSPOT_JOURNAL_SCOPES` | W, T | `developer.webhooks_journal.read developer.webhooks_journal.subscriptions.read developer.webhooks_journal.subscriptions.write` | Space-separated scopes for the app-level client-credentials token (journal and subscriptions). |
 
 ## 2. Security and secrets

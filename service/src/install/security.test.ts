@@ -66,7 +66,7 @@ test('state: signed, single-use, expires, rejects forgeries', () => {
   let t = 1_000_000;
   const c = createStateCodec(SECRET, () => t, 60_000);
   const s1 = c.issue(1);
-  assert.deepEqual(c.take(s1), { status: 'ok', step: 1 });
+  assert.deepEqual(c.take(s1), { status: 'ok', step: 1, returnUrl: null });
   assert.equal(c.take(s1).status, 'invalid', 'reuse');
   assert.deepEqual(c.take(null), { status: 'none' });
   const s2 = c.issue(2);

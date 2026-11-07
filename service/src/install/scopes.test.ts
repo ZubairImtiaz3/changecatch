@@ -7,7 +7,7 @@ import type { TokenResponse } from '../hubspot/oauth.js';
 import { buildInstallUrl } from '../hubspot/oauth.js';
 import { PortalStore } from '../store/portals.js';
 import type { ChangeReport } from './installer.js';
-import { createAppServer, isGovernanceError } from './server.js';
+import { createAppServer, isGovernanceError, safeReturnUrl } from './server.js';
 import { CUSTOM_WRITE_SCOPES, customAccess, customWriteMode, installScopes, needsCustomStep } from './scopes.js';
 
 const SETS = {
@@ -50,7 +50,7 @@ test('scopes: redirect decision', () => {
 
 // ---------------------------------------------------------------- the server flow
 
-async function startServer(grants: string[][], mode: 'conditional' | 'optional' = 'conditional') {
+async function startServer(grants: string[][], mode: 'conditional' | 'optional' = 'conditional', extra: { appId?: number; refreshToken?: string } = {}) {
   const portals = new PortalStore({ path: ':memory:', key: randomBytes(32) });
   let n = 0;
   const installs: number[] = [];
@@ -69,9 +69,10 @@ async function startServer(grants: string[][], mode: 'conditional' | 'optional' 
     publicBaseUrl: 'http://localhost:3001/', // allowUnsigned is only accepted for localhost
     allowUnsigned: true,
     customWriteMode: mode,
+    appId: extra.appId,
     objectTypes: async () => [{ objectTypeId: '0-3', label: 'Deal', custom: false }, { objectTypeId: '2-9', label: 'Pet', custom: true }],
     buildInstallUrl: (state, o) => `https://app.hubspot.com/oauth/authorize?state=${state}&custom=${o?.custom ? 1 : 0}`,
-    exchangeCode: async () => ({ token_type: 'bearer', access_token: 'a', refresh_token: 'r', expires_in: 1800, hub_id: 111, scopes: grants[n++] }),
+    exchangeCode: async () => ({ token_type: 'bearer', access_token: 'a', refresh_token: extra.refreshToken ?? 'r', expires_in: 1800, hub_id: 111, scopes: grants[n++] }),
     log: () => {},
   });
   await new Promise<void>((r) => server.listen(0, r));
@@ -126,6 +127,96 @@ test('callback: optional mode never redirects', async () => {
   const s = await startServer([ENT_READ], 'optional');
   try {
     assert.equal((await s.get('/oauth/callback?code=c1')).status, 200);
+  } finally {
+    await s.close();
+  }
+});
+
+// ---------------------------------------------------------------- where the browser lands after install
+
+const APP_ID = 60681660;
+const SETTINGS = `https://app.hubspot.com/connected-apps/111/installed/framework/${APP_ID}/settings/general-settings`;
+
+test('landing: our own install link -> straight to the ChangeCatch settings tab (after the custom consent)', async () => {
+  const s = await startServer([ENT_READ, ENT_ALL, PRO], 'conditional', { appId: APP_ID, refreshToken: 'na1-' + 'abc' });
+  try {
+    const st1 = s.stateOf((await s.get('/install')).headers.get('location'));
+    const cb1 = await s.get(`/oauth/callback?code=na1-c1&state=${st1}`);
+    assert.match(cb1.headers.get('location')!, /custom=1/, 'custom consent first');
+    const cb2 = await s.get(`/oauth/callback?code=na1-c2&state=${s.stateOf(cb1.headers.get('location'))}`);
+    assert.equal(cb2.status, 302);
+    assert.equal(cb2.headers.get('location'), SETTINGS);
+    const pro = await s.get('/oauth/callback?code=na1-c3'); // HubSpot-initiated, Pro: no consent step
+    assert.equal(pro.headers.get('location'), SETTINGS);
+  } finally {
+    await s.close();
+  }
+});
+
+test('landing: EU portals go to app-eu1.hubspot.com', async () => {
+  const s = await startServer([PRO], 'conditional', { appId: APP_ID, refreshToken: 'eu1-' + 'abc' });
+  try {
+    assert.equal((await s.get('/oauth/callback?code=eu1-c1')).headers.get('location'), `https://app-eu1.hubspot.com/connected-apps/111/installed/framework/${APP_ID}/settings/general-settings`);
+  } finally {
+    await s.close();
+  }
+});
+
+test('landing: Marketplace returnUrl wins, survives the custom consent, and is used even when step 2 is declined', async () => {
+  const ret = 'https://app.hubspot.com/marketplace/111/install-complete?x=1';
+  const s = await startServer([ENT_READ, ENT_ALL, ENT_READ, ENT_READ], 'conditional', { appId: APP_ID });
+  try {
+    const q = `returnUrl=${encodeURIComponent(ret)}&step=finalize`;
+    const cb1 = await s.get(`/oauth/callback?code=c1&${q}`);
+    const consent = cb1.headers.get('location')!;
+    assert.match(consent, /custom=1/);
+    assert.doesNotMatch(consent, /marketplace/, 'returnUrl travels inside the signed state, not in clear');
+    const cb2 = await s.get(`/oauth/callback?code=c2&state=${s.stateOf(consent)}`);
+    assert.equal(cb2.headers.get('location'), ret);
+
+    const cb3 = await s.get(`/oauth/callback?code=c3&${q}`);
+    const declined = await s.get(`/oauth/callback?error=access_denied&state=${s.stateOf(cb3.headers.get('location'))}`);
+    assert.equal(declined.status, 302);
+    assert.equal(declined.headers.get('location'), ret, 'declining custom objects must not strand a Marketplace install');
+  } finally {
+    await s.close();
+  }
+});
+
+test('landing: a non-HubSpot returnUrl is ignored (no open redirect)', async () => {
+  const s = await startServer([PRO, PRO, PRO], 'conditional', { appId: APP_ID });
+  try {
+    for (const bad of ['https://evil.example/x', 'http://app.hubspot.com/x', 'https://app.hubspot.com.evil.example/', 'https://user@app.hubspot.com/', 'javascript:alert(1)']) {
+      const r = await s.get(`/oauth/callback?code=c&returnUrl=${encodeURIComponent(bad)}`);
+      assert.equal(r.headers.get('location'), SETTINGS, bad);
+    }
+  } finally {
+    await s.close();
+  }
+  assert.equal(safeReturnUrl('https://app-eu1.hubspot.com/a'), 'https://app-eu1.hubspot.com/a');
+  assert.equal(safeReturnUrl('https://app.hubspot.com:8443/a'), null);
+});
+
+test('landing: the callback can be framed by HubSpot; other routes still cannot be framed', async () => {
+  const s = await startServer([PRO], 'conditional', { appId: APP_ID });
+  try {
+    const cb = await s.get('/oauth/callback?code=c1');
+    assert.match(cb.headers.get('content-security-policy')!, /frame-ancestors 'self' https:\/\/app\.hubspot\.com/);
+    assert.equal(cb.headers.get('x-frame-options'), null);
+    const other = await s.get('/health');
+    assert.match(other.headers.get('content-security-policy')!, /frame-ancestors 'none'/);
+    assert.equal(other.headers.get('x-frame-options'), 'DENY');
+  } finally {
+    await s.close();
+  }
+});
+
+test('landing: without HUBSPOT_APP_ID the plain "installed" page is kept', async () => {
+  const s = await startServer([PRO]);
+  try {
+    const r = await s.get('/oauth/callback?code=c1');
+    assert.equal(r.status, 200);
+    assert.match(await r.text(), /ChangeCatch is installed/);
   } finally {
     await s.close();
   }
