@@ -7,8 +7,10 @@
 // Data: hubspot.fetch to our app server. HubSpot adds ?portalId=&userId=&userEmail=&appId= and signs the request (v3);
 //   the server trusts portalId only after checking that signature. Contract: docs/install-flow.md (GET/POST /api/settings).
 //   https://developers.hubspot.com/docs/apps/developer-platform/add-features/ui-extensions/fetching-data.md
-// API_BASE must be listed (as a prefix) in app-hsmeta.json -> permittedUrls.fetch. HTTPS only, no localhost.
-// Before upload: set API_BASE to the public server URL, and use the same URL in app-hsmeta.json permittedUrls.fetch and PUBLIC_BASE_URL on the server.
+// Server URL: the PUBLIC_BASE_URL variable of the project config profile used for the upload (src/hsprofile.<env>.json),
+//   read from context.variables. The same variable fills permittedUrls.fetch and redirectUrls in app-hsmeta.json, and must
+//   equal PUBLIC_BASE_URL in the server's .env. HTTPS only, no localhost.
+//   https://developers.hubspot.com/docs/developer-tooling/local-development/build-with-config-profiles.md
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
@@ -31,8 +33,6 @@ import {
 } from '@hubspot/ui-extensions';
 
 // ---- Constants (edit these) --------------------------------------------------------------------------------------
-const API_BASE = 'https://REPLACE-WITH-PUBLIC-BASE-URL';
-const SETTINGS_URL = `${API_BASE}/api/settings`;
 /** Placeholder until the public user guide is hosted. */
 const USER_GUIDE_URL = 'https://example.com/changecatch/user-guide';
 const SUPPORT_EMAIL = 'support@changecatch.example';
@@ -89,8 +89,8 @@ function friendlyError(e: unknown): string {
   return msg;
 }
 
-async function callApi(method: 'GET' | 'POST', body?: unknown): Promise<SettingsView> {
-  const res = await hubspot.fetch(SETTINGS_URL, {
+async function callApi(settingsUrl: string, method: 'GET' | 'POST', body?: unknown): Promise<SettingsView> {
+  const res = await hubspot.fetch(settingsUrl, {
     method,
     timeout: method === 'GET' ? 30000 : 120000, // creating properties on new objects can take a while
     ...(body ? { body } : {}),
@@ -105,9 +105,14 @@ async function callApi(method: 'GET' | 'POST', body?: unknown): Promise<Settings
   return json as SettingsView;
 }
 
-hubspot.extend(({ actions }) => <ChangeCatchSettings addAlert={actions.addAlert as AddAlert} />);
+hubspot.extend(({ actions, context }) => (
+  <ChangeCatchSettings
+    addAlert={actions.addAlert as AddAlert}
+    settingsUrl={`${String((context as { variables?: Record<string, string> }).variables?.PUBLIC_BASE_URL ?? '').replace(/\/+$/, '')}/api/settings`}
+  />
+));
 
-function ChangeCatchSettings({ addAlert }: { addAlert: AddAlert }) {
+function ChangeCatchSettings({ addAlert, settingsUrl }: { addAlert: AddAlert; settingsUrl: string }) {
   const [view, setView] = useState<SettingsView | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [spacing, setSpacing] = useState<number>(3);
@@ -125,11 +130,11 @@ function ChangeCatchSettings({ addAlert }: { addAlert: AddAlert }) {
   const load = useCallback(() => {
     setLoading(true);
     setLoadError(null);
-    callApi('GET')
+    callApi(settingsUrl, 'GET')
       .then(apply)
       .catch((e) => setLoadError(friendlyError(e)))
       .finally(() => setLoading(false));
-  }, []);
+  }, [settingsUrl]);
 
   useEffect(load, [load]);
 
@@ -185,7 +190,7 @@ function ChangeCatchSettings({ addAlert }: { addAlert: AddAlert }) {
         const [objectTypeId, associatedObjectTypeId] = k.split('|');
         return { objectTypeId, associatedObjectTypeId };
       });
-      const v = await callApi('POST', { watchedPairs, stampSpacingSeconds: spacing });
+      const v = await callApi(settingsUrl, 'POST', { watchedPairs, stampSpacingSeconds: spacing });
       apply(v);
       addAlert({
         title: 'Settings saved',

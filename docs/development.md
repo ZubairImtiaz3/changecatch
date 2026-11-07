@@ -57,15 +57,21 @@ Every environment needs **its own new HubSpot app**, created in your own develop
 
 1. In `hubspot-app/`, set a unique project `name` and app `uid`, and the app `name` "ChangeCatch" (add a suffix such as "ChangeCatch Dev" for non-production apps).
 2. Add your redirect URI (for example `http://localhost:3001/oauth/callback`) to `auth.redirectUrls`.
-3. Add your public API origin to `permittedUrls.fetch` (see the next section).
-4. Validate and upload:
+3. Create a config profile for your environment and set its URL (see the next section):
 
    ```bash
-   pnpm --filter @changecatch/hubspot-app validate
-   pnpm --filter @changecatch/hubspot-app upload
+   cd hubspot-app
+   npx hs project profile add <env> --target-account <your-test-account-id>
    ```
 
-5. Copy the new app's client ID and client secret into `.env` (`HUBSPOT_CLIENT_ID`, `HUBSPOT_CLIENT_SECRET`).
+4. Validate and upload with that profile:
+
+   ```bash
+   npx hs project validate --profile <env>
+   npx hs project upload --profile <env>
+   ```
+
+5. Copy the new app's client ID, client secret and app ID into `.env` (`HUBSPOT_CLIENT_ID`, `HUBSPOT_CLIENT_SECRET`, `HUBSPOT_APP_ID`).
 6. Start the service and open `http://localhost:3001/install` to install the app into your test account. An Enterprise account with custom objects shows a second consent screen for the custom-object permissions.
 
 Rules for project changes:
@@ -82,11 +88,10 @@ The settings page runs inside HubSpot. `hubspot.fetch` calls are made by HubSpot
 2. In VS Code, open the **Ports** panel, choose **Forward a Port**, and enter `3001`.
 3. Right-click the port → **Port Visibility** → **Public**. (Private ports require a GitHub sign-in that HubSpot cannot do.)
 4. Copy the forwarded address, for example `https://<id>-3001.<region>.devtunnels.ms`.
-5. Set the same origin in three places:
+5. Set the same origin in two places:
    - `.env`: `PUBLIC_BASE_URL=https://<id>-3001.<region>.devtunnels.ms`
-   - `hubspot-app/src/app/app-hsmeta.json`: `permittedUrls.fetch` → `https://<id>-3001.<region>.devtunnels.ms/api/`
-   - the settings page's API base URL constant in `hubspot-app/src/app/settings/`
-6. Restart the API server and upload the HubSpot project.
+   - `hubspot-app/src/hsprofile.<env>.json`: `variables.PUBLIC_BASE_URL` (same value). The profile fills the redirect URL, `permittedUrls.fetch` and the settings page ([HubSpot config profiles](https://developers.hubspot.com/docs/developer-tooling/local-development/build-with-config-profiles.md)).
+6. Restart the API server and upload: `npx hs project upload --profile <env>` from `hubspot-app/`.
 
 The forwarded URL stays stable for the same VS Code account and port. If it changes, repeat step 5. Request signatures are verified against `PUBLIC_BASE_URL`, so a mismatch shows up as 401 responses from `/api/settings`.
 

@@ -144,7 +144,14 @@ Full setup (your own HubSpot app, local HTTPS tunnel): [development.md](developm
 
 - Surface: an app **settings page** (`type: "settings"`, React, `@hubspot/ui-extensions`), the recommended account-level surface on the new developer platform.
 - It lists Contact, Company, Deal plus the portal's custom objects (`GET /crm-object-schemas/2026-09/schemas`), shows every pair as a checkbox, and a number input for stamp spacing.
-- `API_BASE` in `hubspot-app/src/app/settings/ChangeCatchSettings.tsx` must be listed in `app-hsmeta.json` → `permittedUrls.fetch` (HTTPS, no localhost, prefix match). When the public URL changes, update `API_BASE`, `permittedUrls.fetch` and `PUBLIC_BASE_URL` together ([runbook.md](runbook.md) B9).
+- The server URL comes from the HubSpot **config profile** used for the upload (`hubspot-app/src/hsprofile.<env>.json`, variable `PUBLIC_BASE_URL`). `app-hsmeta.json` uses `${PUBLIC_BASE_URL}` in `redirectUrls` and `permittedUrls.fetch`, and the settings page reads `context.variables.PUBLIC_BASE_URL`. It must equal `PUBLIC_BASE_URL` in the server's `.env` (HTTPS, no localhost). When the URL changes, see [runbook.md](runbook.md) B9.
+  Docs: https://developers.hubspot.com/docs/developer-tooling/local-development/build-with-config-profiles.md
+
+## After install
+
+- Our own install link (`/install`): after the consent screen(s) the callback redirects to the ChangeCatch **Settings** tab in HubSpot: `https://app[-<region>].hubspot.com/connected-apps/{portalId}/installed/framework/{HUBSPOT_APP_ID}/settings/general-settings`. This URL is **not documented** by HubSpot (copied from the browser, 2026-11-07); recheck it after HubSpot UI changes. Without `HUBSPOT_APP_ID` a plain "installed" page is shown.
+- Marketplace "seamless install": HubSpot sends `returnUrl` (and `step=finalize`) to the redirect URL; after the code exchange we **must** redirect there ("required to avoid an infinite login loop"). The `returnUrl` is kept through the custom-object consent inside the signed state, and only `https://app[-<region>].hubspot.com` URLs are accepted. The callback may be framed by `*.hubspot.com`.
+  Docs: https://developers.hubspot.com/docs/apps/developer-platform/list-apps/understand-app-install-flow.md
 
 ## Known gaps
 

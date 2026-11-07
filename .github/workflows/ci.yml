@@ -44,7 +44,7 @@ jobs:
       - name: Validate HubSpot project
         if: ${{ env.HUBSPOT_PERSONAL_ACCESS_KEY != '' && env.HUBSPOT_ACCOUNT_ID != '' }}
         working-directory: hubspot-app
-        run: pnpm exec hs project validate --use-env
+        run: pnpm exec hs project validate --use-env --profile dev
 
       - name: Skip note for HubSpot validate
         if: ${{ env.HUBSPOT_PERSONAL_ACCESS_KEY == '' || env.HUBSPOT_ACCOUNT_ID == '' }}

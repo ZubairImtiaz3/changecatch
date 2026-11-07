@@ -9,7 +9,7 @@
       "type": "oauth",
       "redirectUrls": [
         "http://localhost:3001/oauth/callback",
-        "https://REPLACE-WITH-PUBLIC-BASE-URL/oauth/callback"
+        "${PUBLIC_BASE_URL}/oauth/callback"
       ],
       "requiredScopes": [
         "oauth",
@@ -34,7 +34,7 @@
     },
     "permittedUrls": {
       "fetch": [
-        "https://REPLACE-WITH-PUBLIC-BASE-URL/api/"
+        "${PUBLIC_BASE_URL}/api/"
       ],
       "iframe": [],
       "img": []

@@ -307,19 +307,18 @@ This can happen if the worker was "up" but stuck, for example erroring for days 
   2. Run **one** worker only. Don't scale up to "help".
   3. **Database schema:** migrations are append-only (`runMigrations` in `service/src/store/db.ts`), and normally only add tables or columns, so old code usually runs on a newer file. If the bad release did a destructive migration, restore the database (B7) **before** rolling back.
   4. If the bad release **stamped wrong values**, list the affected `change_id`s from `change_log` for the window, and correct them with the reconcile in silent-refresh mode after the rollback.
-  5. If the release also changed the HubSpot app (scopes, `permittedUrls`, settings page), roll that back separately with `hs project upload` from `hubspot-app/` on the previous version. Get sign-off first: a project upload affects every installed portal.
+  5. If the release also changed the HubSpot app (scopes, `permittedUrls`, settings page), roll that back separately with `hs project upload --profile <env>` from `hubspot-app/` on the previous version. Get sign-off first: a project upload affects every installed portal.
 - **Recovery time:** minutes if the previous build is ready, plus journal catch-up for the downtime.
 
 ### B9. Public URL change for the settings page
 
 - **Symptoms:** the settings page in HubSpot shows a fetch error, or every `/api/settings` call returns **401**. OAuth install fails with `redirect_uri mismatch`.
 - **Detect:** API server logs show 401 signature failures. Signatures are checked against `PUBLIC_BASE_URL + path`, so a URL mismatch is always the cause. The worker is not affected.
-- **Fix:** change all four places together:
-  1. `hubspot-app/src/app/app-hsmeta.json`: `config.auth.redirectUrls` (add the new `/oauth/callback`) and `config.permittedUrls.fetch` (the new HTTPS origin).
-  2. `hubspot-app/src/app/settings/ChangeCatchSettings.tsx`: `API_BASE`.
-  3. From `hubspot-app/`: `hs project upload` (get sign-off before uploading).
-  4. Set `PUBLIC_BASE_URL=https://<new>` and `HUBSPOT_REDIRECT_URI=https://<new>/oauth/callback` on the host, then restart the API server.
-  - For a custom domain, set up its TLS certificate and DNS on the host first, then do steps 1–4.
+- **Fix:** change the URL in two places, the profile and the server:
+  1. `hubspot-app/src/hsprofile.<env>.json`: `variables.PUBLIC_BASE_URL` (the new HTTPS origin, no trailing slash). It feeds `redirectUrls`, `permittedUrls.fetch` and the settings page.
+  2. From `hubspot-app/`: `hs project upload --profile <env>` (get sign-off before uploading).
+  3. Set `PUBLIC_BASE_URL=https://<new>` (and `HUBSPOT_REDIRECT_URI=https://<new>/oauth/callback` if installs use it) on the host, then restart the API server.
+  - For a custom domain, set up its TLS certificate and DNS on the host first, then do steps 1–3.
 - **Test:** open the settings page and save once. Run a fresh `/install` in a test portal.
 - **Recovery time:** 10–15 min, mostly the project build. Use a **stable** URL in production. Quick tunnels change on every restart.
 
