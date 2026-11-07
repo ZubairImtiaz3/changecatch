@@ -7,9 +7,9 @@ Every tool is a **dry run by default**. It only reads, prints the plan, and chan
 ## Setup
 
 - Run `pnpm install` at the repo root. The tools import service code as `@changecatch/service/...` (workspace package).
-- `.env`: the tools load the first `.env` they find for each variable, in this order: the current folder, `tools/.env`, `service/.env`, then the repo root `.env`. Variables already set in your shell win.
+- Configuration: each tool calls the service's `loadConfig('tool')` once (`service/src/lib/config.ts`, reference in `docs/configuration.md`). It loads the first `.env` it finds for each variable, in this order: the current folder, `service/.env`, then the repo root `.env`. Variables already set in your shell win.
 - `DB_PATH`: the worker's SQLite file. A relative path is resolved against `service/` (where the worker runs). The default is `service/data/changecatch.db`.
-- Reports (JSON) go to `tools/samples/`, or to `SAMPLES_DIR` if you set it. Keep `tools/samples/` out of git.
+- Reports (JSON) go to `tools/samples/`, or to `SAMPLES_DIR` if you set it (a relative path is resolved against the repo root). Keep `tools/samples/` out of git.
 
 Run the tools from `tools/`:
 
@@ -24,37 +24,16 @@ pnpm exec tsx src/<tool>.ts [args]
 |---|---|---|
 | `HUBSPOT_TEST_PORTAL_ID` | all | Fallback when `--portal` is not passed. There is no built-in default. |
 | `HUBSPOT_SETUP_TOKEN` | e2e-check, load-test | A service key for the test portal. It makes the association changes. |
-| `TOKEN_ENC_KEYS` / `TOKEN_ENC_KEY` | all except load-test | Decrypts the stored install token in `DB_PATH`, which gives the portal's OAuth token. |
-| `HUBSPOT_TEST_REFRESH_TOKEN` | all except load-test | Dev-only fallback. Used only for `HUBSPOT_TEST_PORTAL_ID`, and you get a warning. Any uninstall revokes it. |
+| `TOKEN_ENC_KEYS` | e2e-check | Decrypts the stored install token in `DB_PATH`, which gives the portal's OAuth token. Install the app through the API server first. |
 | App client credentials (see `.env.example`) | e2e-check | Used to list journal subscriptions. |
 | `WORKER_HEALTH_PORT` | e2e-check, load-test | The worker's `/health` port. Default `3002`. |
+| `HEALTH_TOKEN` | e2e-check, load-test | If set, sent as `x-health-token` so `/health` includes the per-portal detail. |
 | `CHANGECATCH_TEST_LABELS` | e2e-check, load-test | Deal->Contact label names, comma-separated. Same as `--labels`. |
 | `DB_PATH`, `SAMPLES_DIR` | see above | |
 
 **No portal-specific defaults.** The portal, the deal, and the record IDs are always flags, env vars, or picked at runtime. The tools look up association label type IDs by **name** with the labels API. The default names are `Influencer`, `Decision maker`, `Billing contact`. Use `--labels "A,B,C"` to pick others; they must already exist as Deal->Contact labels in the portal.
 
 ## Tools
-
-### `properties-setup.ts`: create the ChangeCatch properties
-
-Creates the `changecatch` property group and the `changecatch_*` properties on each object type. It is idempotent, so existing properties are skipped. It also migrates old free-text label properties to multiple checkboxes. If you get a 403 on a custom object (`2-…`), `crm.schemas.custom.write` was not granted.
-
-```sh
-pnpm exec tsx src/properties-setup.ts --portal <id> --objects 0-1,0-3,2-xxx         # dry run
-pnpm exec tsx src/properties-setup.ts --portal <id> --objects 0-1,0-3,2-xxx --yes   # create
-```
-
-Auth: the portal's OAuth token (from its stored install).
-
-### `labels-sync.ts`: sync label options
-
-Adds one option per association label to the 3 label properties: `changecatch_label_before`, `changecatch_label_after`, and `changecatch_labels_current`. It only adds options and never removes any. Run it after `properties-setup`.
-
-```sh
-pnpm exec tsx src/labels-sync.ts --portal <id> --objects 0-1,0-3,2-xxx [--pairs 0-3:0-1,2-xxx:0-1] [--yes]
-```
-
-`--pairs` lists the watched pairs. By default it uses every pair among `--objects`.
 
 ### `e2e-check.ts`: one real change, end to end
 
@@ -102,9 +81,8 @@ Output: a functional PASS/FAIL table, then the **KPI scorecard** (correctness, l
 
 ## Files
 
-- `src/lib/env.ts`: loads `.env` and sets `DB_PATH` to an absolute path. Import it first in every tool.
-- `src/lib/paths.ts`: the repo, service, and tools roots, `dbPath()`, and the samples folder.
-- `src/lib/cli.ts`: argument parsing, `portalIdFrom()`, `saveSample()`, and `run()`.
-- `src/lib/portal-token.ts`: the portal's OAuth token, from the stored install (with the env fallback described above).
-- `src/lib/test-labels.ts`: label names from flags or env, and lookup by name.
-- `src/load-test-lib.ts`: the rate limiter, HubSpot association helpers, a read-only worker DB view, and stats.
+- `src/lib/paths.ts`: the tools root and the samples folder.
+- `src/lib/cli.ts`: argument parsing, `portalIdFrom()` and `setupTokenOf()`.
+- `src/lib/portal-token.ts`: the portal's OAuth token, from the stored install (the service's `PortalTokenProvider`).
+- `src/lib/test-labels.ts`: label names from flags or config, and lookup by name.
+- `src/load-test-lib.ts`: HubSpot association helpers (through the service's rate limiter), a read-only worker DB view, `/health` reading, and stats.

@@ -16,30 +16,27 @@
 //
 // Safety: creates/deletes NO records. Only links (deal, contact) pairs that are NOT linked today (checked first), so
 // every link it touches is fresh. Every created link is removed in `finally` (also on Ctrl+C), then re-checked.
-// Requests go through a client-side limiter (80 req / 10 s) because the service key shares the portal limit with
-// the app. One "association operation" = one input item in a batch call (create, label add, label archive, unlink).
+// Requests go through the portal bucket of the service limiter at 80 req / 10 s (TOOL_RATE_PER_10S in
+// load-test-lib.ts says why). One "association operation" = one input item in a batch call (create, label add, label archive, unlink).
 // Auth: HUBSPOT_SETUP_TOKEN service key (never printed). The worker DB is opened READ-ONLY.
 
-import { env, optionalEnv } from './lib/env.js'; // must stay first
 import { writeFileSync, existsSync, appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { STAMP_PROPS } from '@changecatch/service/core/stamp.js';
-import { formatLabelValues, labelOptionValue, splitValues, NONE, UNKNOWN } from '@changecatch/service/core/label-options.js';
+import { NONE, STAMP_PROPS, UNKNOWN } from '@changecatch/service/core/contract.js';
+import { loadConfig, REPO_ROOT } from '@changecatch/service/lib/config.js';
+import { formatLabelValues, labelOptionValue, splitValues } from '@changecatch/service/core/label-options.js';
+import type { HealthSnapshot } from '@changecatch/service/worker/health.js';
 import {
   AbortedError,
   CONTACT,
   DEAL,
   Hs,
-  RateLimiter,
   Sampler,
+  TOOL_RATE_PER_10S,
   WorkerDb,
   abortState,
   dbFileSize,
-  healthDropped,
-  healthHttp,
-  healthRss,
-  httpCounters,
-  installHttpCounter,
+  startTool,
   readHealth,
   windowPeak,
   iso,
@@ -55,51 +52,44 @@ import {
   type Label,
   type Pair,
 } from './load-test-lib.js';
-import { parseArgs, portalIdFrom } from './lib/cli.js';
-import { REPO_ROOT, dbPath, samplePath } from './lib/paths.js';
+import { flag, num, parseArgs, portalIdFrom, setupTokenOf, str } from './lib/cli.js';
+import { samplePath } from './lib/paths.js';
 import { labelByName, testLabelNames } from './lib/test-labels.js';
 
 // ------------------------------------------------------------------ args
 
-const args = process.argv.slice(2);
-const flag = (n: string) => args.includes(n);
-const opt = (n: string) => (args.includes(n) ? args[args.indexOf(n) + 1] : undefined);
-const num = (n: string, d: number) => {
-  const v = Number(opt(n));
-  return Number.isFinite(v) && v > 0 ? v : d;
-};
+const parsed = parseArgs(process.argv.slice(2), ['yes', 'append-kpis']);
 
 const SCENARIOS = ['burst-one-record', 'spread-many-records', 'label-churn', 'mixed'] as const;
 type ScenarioName = (typeof SCENARIOS)[number];
-const scenarioArg = args.find((a) => !a.startsWith('--') && (SCENARIOS as readonly string[]).includes(a)) as ScenarioName | undefined;
+const scenarioArg = parsed._.find((a) => (SCENARIOS as readonly string[]).includes(a)) as ScenarioName | undefined;
 
-const yes = flag('--yes');
-const N = Math.floor(num('--n', 100));
-const RELABEL = Math.floor(num('--relabel', 20));
-const BURST_DEAL = opt('--deal');
-const LINKS = Math.floor(num('--links', 10));
-const FLIPS = Math.floor(num('--flips', 5));
-const FLIP_GAP_MS = num('--flip-gap', 1) * 1000;
-const GAP_MS = num('--gap', 10) * 1000;
-const TIMEOUT_MS = num('--timeout', 1800) * 1000;
-const SETTLE_MS = num('--settle', 15) * 1000;
-const MAX_OPS = Math.floor(num('--max-ops', 500));
-const parsed = parseArgs(args);
-const DB_PATH = dbPath();
+const yes = flag(parsed, 'yes');
+const N = Math.floor(num(parsed, 'n') ?? 100);
+const RELABEL = Math.floor(num(parsed, 'relabel') ?? 20);
+const BURST_DEAL = str(parsed, 'deal');
+const LINKS = Math.floor(num(parsed, 'links') ?? 10);
+const FLIPS = Math.floor(num(parsed, 'flips') ?? 5);
+const FLIP_GAP_MS = (num(parsed, 'flip-gap') ?? 1) * 1000;
+const GAP_MS = (num(parsed, 'gap') ?? 10) * 1000;
+const TIMEOUT_MS = (num(parsed, 'timeout') ?? 1800) * 1000;
+const SETTLE_MS = (num(parsed, 'settle') ?? 15) * 1000;
+const MAX_OPS = Math.floor(num(parsed, 'max-ops') ?? 500);
+const config = loadConfig('tool');
+const DB_PATH = config.dbPath;
 const POLL_MS = 2_000;
 /** Set at the start of main() from --portal / HUBSPOT_TEST_PORTAL_ID (no default). */
 let PORTAL_ID = 0;
 
-const HEALTH_PORT = Number(optionalEnv('WORKER_HEALTH_PORT') ?? 3002);
-const APPEND_KPIS = flag('--append-kpis');
+const APPEND_KPIS = flag(parsed, 'append-kpis');
 const KPI_DOC = join(REPO_ROOT, 'docs', 'kpis.md');
 /** KPI targets (owner, 2026-10-30). WARN band: latency up to 2x target; peak up to the 110/10 s portal limit. */
 const T = {
-  p50Ms: num('--kpi-p50', 10) * 1000,
-  p95Ms: num('--kpi-p95', 20) * 1000,
-  correctPct: num('--kpi-correct', 100),
-  wrongMax: Math.max(0, Number(opt('--kpi-wrong') ?? 0) || 0),
-  peakPer10s: num('--kpi-peak', 100),
+  p50Ms: (num(parsed, 'kpi-p50') ?? 10) * 1000,
+  p95Ms: (num(parsed, 'kpi-p95') ?? 20) * 1000,
+  correctPct: num(parsed, 'kpi-correct') ?? 100,
+  wrongMax: Math.max(0, num(parsed, 'kpi-wrong') ?? 0),
+  peakPer10s: num(parsed, 'kpi-peak') ?? 100,
   portalLimitPer10s: 110,
 };
 
@@ -239,7 +229,7 @@ function noteCorrections(ctx: Ctx, scenario: string, pairs: Pair[], sinceMs: num
 
 /** Did every pair get a row of each type? */
 function coverage(rows: ChangeRow[], pairs: Pair[], type: string): number {
-  const have = new Set(rows.filter((r) => r.change_type === type).map((r) => `${r.object_id}|${r.other_record_id}`));
+  const have = new Set(rows.filter((r) => r.changeType === type).map((r) => `${r.objectId}|${r.otherRecordId}`));
   return pairs.filter((p) => have.has(pairKey(p))).length;
 }
 
@@ -270,7 +260,7 @@ interface RowTiming {
 
 /** occurredAt -> stamped, from the deals' changecatch_last_change_id history (HubSpot clock); DB mark as fallback. */
 function stampInfo(ctx: Ctx, scenario: string, rows: ChangeRow[], snaps: Map<string, DealSnapshot>): StampInfo {
-  const byId = new Map(rows.map((r) => [r.change_id, r]));
+  const byId = new Map(rows.map((r) => [r.changeId, r]));
   const hist = new Map<string, number>();
   for (const s of snaps.values())
     for (const h of s.history[STAMP_PROPS.changeId] ?? []) if (byId.has(h.value) && !hist.has(h.value)) hist.set(h.value, Date.parse(h.timestamp));
@@ -279,22 +269,22 @@ function stampInfo(ctx: Ctx, scenario: string, rows: ChangeRow[], snaps: Map<str
   const timings: RowTiming[] = [];
   let fromDb = 0;
   for (const r of rows) {
-    const occurred = Date.parse(r.occurred_at);
-    const at = hist.get(r.change_id) ?? marks.get(r.change_id);
+    const occurred = Date.parse(r.occurredAt);
+    const at = hist.get(r.changeId) ?? marks.get(r.changeId);
     const ok = at !== undefined && Number.isFinite(occurred);
     if (ok) {
-      if (!hist.has(r.change_id)) fromDb++;
+      if (!hist.has(r.changeId)) fromDb++;
       lat.push(at - occurred);
     }
     timings.push({
       scenario,
-      changeId: r.change_id,
-      type: r.change_type,
-      dealId: r.object_id,
-      loggedMs: Number(r.created_at) - occurred,
-      loggedAt: Number(r.created_at),
+      changeId: r.changeId,
+      type: r.changeType,
+      dealId: r.objectId,
+      loggedMs: Number(r.createdAt) - occurred,
+      loggedAt: Number(r.createdAt),
       stampedMs: ok ? at - occurred : null,
-      stampAtLocal: marks.get(r.change_id) ?? hist.get(r.change_id) ?? null,
+      stampAtLocal: marks.get(r.changeId) ?? hist.get(r.changeId) ?? null,
     });
   }
   const times = [...hist.values()].sort((a, b) => a - b);
@@ -359,14 +349,14 @@ const latLine = (s: StampInfo) =>
 
 /** The deal's current stamp must be (one of) the newest change_log row(s) for that deal. */
 function finalStampOk(rows: ChangeRow[], dealId: string, snap: DealSnapshot | undefined): { ok: boolean; detail: string } {
-  const mine = rows.filter((r) => r.object_id === dealId);
+  const mine = rows.filter((r) => r.objectId === dealId);
   const last = latest(mine);
   if (!last) return { ok: false, detail: 'no rows' };
-  const maxAt = Date.parse(last.occurred_at);
-  const newest = new Set(mine.filter((r) => Date.parse(r.occurred_at) === maxAt).map((r) => r.change_id));
+  const maxAt = Date.parse(last.occurredAt);
+  const newest = new Set(mine.filter((r) => Date.parse(r.occurredAt) === maxAt).map((r) => r.changeId));
   const cur = snap?.properties[STAMP_PROPS.changeId] ?? null;
   const ok = !!cur && newest.has(cur);
-  return { ok, detail: `stamp ${cur ?? '(none)'} ${snap?.properties[STAMP_PROPS.changeType] ?? ''}; newest row(s) ${[...newest].slice(0, 2).join(',')} ${last.change_type}` };
+  return { ok, detail: `stamp ${cur ?? '(none)'} ${snap?.properties[STAMP_PROPS.changeType] ?? ''}; newest row(s) ${[...newest].slice(0, 2).join(',')} ${last.changeType}` };
 }
 
 // ------------------------------------------------------------------ cleanup (always runs)
@@ -452,7 +442,7 @@ function burstScenario(pairs: Pair[]): Scenario {
         const INF = optVal(L.inf);
         const DM = optVal(L.dm);
         const lcOk = rel.filter((p) =>
-          rows.some((x) => x.change_type === 'LABEL_CHANGED' && x.other_record_id === p.contactId && splitValues(x.label_before).includes(INF) && splitValues(x.label_after).includes(DM)),
+          rows.some((x) => x.changeType === 'LABEL_CHANGED' && x.otherRecordId === p.contactId && splitValues(x.labelBefore).includes(INF) && splitValues(x.labelAfter).includes(DM)),
         ).length;
         check(ctx, name, `label changes read "${L.inf.label} -> ${L.dm.label}"`, lcOk === rel.length, `${lcOk}/${rel.length}`);
 
@@ -528,13 +518,13 @@ function spreadScenario(pairs: Pair[]): Scenario {
 
         const labelOk = pairs.filter((p) => {
           const want = optVal(labelOf.get(pairKey(p))!);
-          return rows.some((x) => x.change_type === 'ADDED' && x.object_id === p.dealId && x.other_record_id === p.contactId && splitValues(x.label_after).includes(want));
+          return rows.some((x) => x.changeType === 'ADDED' && x.objectId === p.dealId && x.otherRecordId === p.contactId && splitValues(x.labelAfter).includes(want));
         }).length;
         check(ctx, name, 'ADDED rows carry the right label', labelOk === pairs.length, `${labelOk}/${pairs.length}`);
 
         const deals = pairs.map((p) => p.dealId);
         const snaps = await hs.dealsWithHistory(deals, PROPS, HISTORY_PROPS);
-        const runIds = new Set(rows.map((x) => x.change_id));
+        const runIds = new Set(rows.map((x) => x.changeId));
         let stamped = 0;
         let finalOk = 0;
         const bad: string[] = [];
@@ -612,7 +602,7 @@ function churnScenario(pairs: Pair[]): Scenario {
         res.flipsEndedAt = iso(tFlips);
 
         const d = await waitDrain(ctx, name, pairs, since, tFlips, (rows) => {
-          const ok = pairs.filter((p) => latest(rows.filter((x) => x.object_id === p.dealId))?.labels_current === expectedFinal).length;
+          const ok = pairs.filter((p) => latest(rows.filter((x) => x.objectId === p.dealId))?.labelsCurrent === expectedFinal).length;
           return { done: ok === pairs.length, detail: `${ok}/${pairs.length} deals' newest row = ${expectedFinal}` };
         });
         const rows = d.rows;
@@ -634,7 +624,7 @@ function churnScenario(pairs: Pair[]): Scenario {
           const got = snaps.get(p.dealId)?.properties[STAMP_PROPS.labelsCurrent] ?? null;
           if (got === want) stampOk++;
           else if (mism.length < 3) mism.push(`${p.dealId}: stamp "${got}" vs HubSpot "${want}"`);
-          if (latest(rows.filter((x) => x.object_id === p.dealId))?.labels_current === want) rowOk++;
+          if (latest(rows.filter((x) => x.objectId === p.dealId))?.labelsCurrent === want) rowOk++;
         }
         check(ctx, name, 'deal labels_current = HubSpot labels', stampOk === pairs.length, `${stampOk}/${pairs.length}${mism.length ? `; ${mism.join(' | ')}` : ''}`);
         check(ctx, name, 'newest change_log row = HubSpot labels', rowOk === pairs.length, `${rowOk}/${pairs.length}`);
@@ -651,19 +641,19 @@ function churnScenario(pairs: Pair[]): Scenario {
           }
         };
         for (const x of rows) {
-          scan(`${x.change_id} label_before`, x.label_before, x.change_type === 'ADDED');
-          scan(`${x.change_id} label_after`, x.label_after, x.change_type === 'REMOVED');
-          scan(`${x.change_id} labels_current`, x.labels_current, x.change_type === 'REMOVED');
+          scan(`${x.changeId} label_before`, x.labelBefore, x.changeType === 'ADDED');
+          scan(`${x.changeId} label_after`, x.labelAfter, x.changeType === 'REMOVED');
+          scan(`${x.changeId} labels_current`, x.labelsCurrent, x.changeType === 'REMOVED');
         }
         for (const [dId, s] of snaps)
           for (const h of s.history[STAMP_PROPS.labelsCurrent] ?? []) if (Date.parse(h.timestamp) >= t0) scan(`deal ${dId} history`, h.value, false);
         check(ctx, name, 'no wrong labels (change_log + labels_current history)', wrong.length === 0, wrong.length ? `${wrong.length}: ${wrong.slice(0, 3).join(' | ')}` : 'none');
         if (transientNone) check(ctx, name, 'transient "(none)" values', null, `${transientNone} (a link that always had a label showed none for a moment)`);
 
-        const types = rows.reduce<Record<string, number>>((m, x) => ((m[x.change_type] = (m[x.change_type] ?? 0) + 1), m), {});
+        const types = rows.reduce<Record<string, number>>((m, x) => ((m[x.changeType] = (m[x.changeType] ?? 0) + 1), m), {});
         const s = stampInfo(ctx, name, rows, snaps);
         // Expected: 1 ADDED + FLIPS LABEL_CHANGED per link (+ 1 REMOVED, added after the unlink below).
-        const lcPerPair = (p: Pair) => rows.filter((x) => x.change_type === 'LABEL_CHANGED' && x.object_id === p.dealId && x.other_record_id === p.contactId).length;
+        const lcPerPair = (p: Pair) => rows.filter((x) => x.changeType === 'LABEL_CHANGED' && x.objectId === p.dealId && x.otherRecordId === p.contactId).length;
         Object.assign(kpi, {
           logged: coverage(rows, pairs, 'ADDED') + pairs.reduce((n, p) => n + Math.min(FLIPS, lcPerPair(p)), 0),
           rows: rows.length, timings: s.timings, stampsInHistory: s.stampsInHistory,
@@ -720,10 +710,9 @@ interface KpiRow {
 interface RunEnv {
   scenario: string;
   hs: Hs;
-  rl: RateLimiter;
   sampler: Sampler;
-  healthBefore: Record<string, any> | null;
-  healthAfter: Record<string, any> | null;
+  healthBefore: HealthSnapshot | null;
+  healthAfter: HealthSnapshot | null;
   dbBytesBefore: number;
   dbBytesAfter: number;
 }
@@ -733,9 +722,15 @@ const fmtPct = (v: number) => `${v.toFixed(1)}%`;
 const gradeLat = (v: number | null, target: number): Grade => (v === null ? 'FAIL' : v <= target ? 'PASS' : v <= target * 2 ? 'WARN' : 'FAIL');
 const latStr = (s: ReturnType<typeof latencyStats>) => `p50 ${secs(s.p50Ms)} / p95 ${secs(s.p95Ms)} / p99 ${secs(s.p99Ms)} / max ${secs(s.maxMs)} (n=${s.count})`;
 const mb = (b: number | null) => (b === null ? 'n/a' : `${(b / 1024 / 1024).toFixed(1)} MB`);
-const healthLat = (h: Record<string, any> | null) => {
+const healthLat = (h: HealthSnapshot | null) => {
   const l = h?.latency;
-  return l ? `p50 ${secs(l.p50Ms)}, p95 ${secs(l.p95Ms)}, max ${secs(l.maxMs)}, n=${l.count}, total ${l.totalSamples}` : h ? 'not exposed' : 'unreachable';
+  return l ? `p50 ${secs(l.p50Ms)}, p95 ${secs(l.p95Ms)}, max ${secs(l.maxMs)}, n=${l.count}, total ${l.totalSamples}` : h ? 'not wired' : 'unreachable';
+};
+/** Change of a /health number over the run. null if either snapshot is missing. */
+const delta = (f: (h: HealthSnapshot) => number | undefined, a: HealthSnapshot | null, b: HealthSnapshot | null) => {
+  const x = a && f(a);
+  const y = b && f(b);
+  return typeof x === 'number' && typeof y === 'number' ? y - x : null;
 };
 
 /** Peak + sustained rate per second over a list of local timestamps. */
@@ -815,22 +810,20 @@ function scorecard(kpis: ScenarioKpi[], e: RunEnv): { rows: KpiRow[]; verdict: G
 
   // 4. Per-portal pressure (script requests are exact; worker stamp calls are estimated from distinct stamp times)
   const stampBatchTimes = [...new Set(all.flatMap((t) => (t.stampAtLocal === null ? [] : [t.stampAtLocal])))];
-  const wh = healthHttp(e.healthAfter);
   const scriptPeak = windowPeak(e.hs.times, 10_000);
-  const combinedPeak = wh?.peakPer10s !== undefined ? scriptPeak + wh.peakPer10s : windowPeak([...e.hs.times, ...stampBatchTimes], 10_000);
+  const combinedPeak = windowPeak([...e.hs.times, ...stampBatchTimes], 10_000);
   const peakGrade: Grade = combinedPeak <= T.peakPer10s ? 'PASS' : combinedPeak <= T.portalLimitPer10s ? 'WARN' : 'FAIL';
   add('pressure', 'peak requests / 10 s, portal ' + PORTAL_ID,
-    `${combinedPeak} (script ${scriptPeak}${wh?.peakPer10s !== undefined ? `, worker ${wh.peakPer10s} from /health` : `, worker stamp batches estimated; label calls not counted`}); headroom ${T.portalLimitPer10s - combinedPeak} vs ${T.portalLimitPer10s}`,
+    `${combinedPeak} (script ${scriptPeak}, worker stamp batches estimated; label calls not counted); headroom ${T.portalLimitPer10s - combinedPeak} vs ${T.portalLimitPer10s}`,
     `<= ${T.peakPer10s}`, peakGrade);
-  const w429 = wh?.status429;
-  const w5xx = wh?.status5xx;
-  add('pressure', '429 / 5xx / retries (script)', `${httpCounters.status429} / ${httpCounters.status5xx} / ${httpCounters.retries} (network ${httpCounters.network})`, '0 / 0', httpCounters.status429 + httpCounters.status5xx === 0 ? 'PASS' : 'WARN');
-  add('pressure', '429 / 5xx / retries (worker)', wh ? `${w429 ?? 'n/a'} / ${w5xx ?? 'n/a'} / ${wh.retries ?? 'n/a'}` : 'not exposed by /health', 'info', 'INFO');
-  const dropBefore = healthDropped(e.healthBefore, PORTAL_ID);
-  const dropAfter = healthDropped(e.healthAfter, PORTAL_ID);
-  const dropped = dropBefore !== null && dropAfter !== null ? dropAfter - dropBefore : null;
+  // Worker-wide counters (all portals), so other portals' traffic during the run shows up here too.
+  const w429 = delta((h) => h?.httpErrors?.status429, e.healthBefore, e.healthAfter);
+  const w5xx = delta((h) => h?.httpErrors?.status5xx, e.healthBefore, e.healthAfter);
+  add('pressure', 'worker HubSpot 429 / 5xx during the run', w429 === null || w5xx === null ? '/health unreachable' : `${w429} / ${w5xx}`, '0 / 0',
+    w429 === null || w5xx === null ? 'INFO' : w429 + w5xx === 0 ? 'PASS' : 'WARN');
+  const dropped = delta((h) => h.totals.stampsDropped, e.healthBefore, e.healthAfter);
   const lossGrade: Grade = dropped === null ? (missed === 0 && unstamped === 0 ? 'PASS' : 'WARN') : dropped === 0 && missed === 0 ? 'PASS' : 'FAIL';
-  add('pressure', 'no 5xx-induced loss (stamps dropped)', dropped === null ? `stampsDropped not in /health; missed ${missed}, unstamped ${unstamped}` : `${dropped} dropped during the run`, '0', lossGrade);
+  add('pressure', 'no 5xx-induced loss (stamps dropped)', dropped === null ? `/health unreachable; missed ${missed}, unstamped ${unstamped}` : `${dropped} dropped during the run (all portals)`, '0', lossGrade);
 
   // 5. Efficiency
   const reads = e.sampler.reads.size;
@@ -852,9 +845,6 @@ function scorecard(kpis: ScenarioKpi[], e: RunEnv): { rows: KpiRow[]; verdict: G
   }
 
   // 7. Resources
-  const rssB = healthRss(e.healthBefore);
-  const rssA = healthRss(e.healthAfter);
-  add('resources', 'worker RSS before -> after', rssA === null ? 'not exposed by /health (skipped)' : `${mb(rssB)} -> ${mb(rssA)}`, 'info', 'INFO');
   add('resources', 'DB size before -> after', `${mb(e.dbBytesBefore)} -> ${mb(e.dbBytesAfter)} (+${((e.dbBytesAfter - e.dbBytesBefore) / 1024).toFixed(0)} KB)`, 'info', 'INFO');
 
   const graded = rows.filter((r) => r.grade !== 'INFO');
@@ -862,11 +852,11 @@ function scorecard(kpis: ScenarioKpi[], e: RunEnv): { rows: KpiRow[]; verdict: G
   const summary = {
     scenario: e.scenario, changes: all.length, expected, logged, loggedPct, finalPct, wrong, missed, unstamped,
     stamped: stampedAll, logged_latency: loggedAll, worstDrainMs: worstDrain, peakPer10s: combinedPeak,
-    http: { ...httpCounters }, coalescing, verdict,
+    workerHttpErrors: { status429: w429, status5xx: w5xx }, coalescing, verdict,
   };
   const markdown =
     `| ${new Date().toISOString().slice(0, 16).replace('T', ' ')} | ${e.scenario} | ${all.length} | ${fmtPct(loggedPct)} | ${fmtPct(finalPct)} | ${wrong} | ${missed} | ` +
-    `${secs(stampedAll.p50Ms)} | ${secs(stampedAll.p95Ms)} | ${secs(stampedAll.p99Ms)} | ${secs(worstDrain)} | ${combinedPeak} | ${httpCounters.status429}/${httpCounters.status5xx} | ` +
+    `${secs(stampedAll.p50Ms)} | ${secs(stampedAll.p95Ms)} | ${secs(stampedAll.p99Ms)} | ${secs(worstDrain)} | ${combinedPeak} | ${w429 ?? '-'}/${w5xx ?? '-'} | ` +
     `${coalescing === null ? '-' : coalescing.toFixed(2)} | ${verdict} |`;
   return { rows, verdict, summary, markdown };
 }
@@ -893,7 +883,7 @@ function usage() {
 
 function save(out: Record<string, unknown>, scenario: string, kind: string) {
   out.endedAt = iso(Date.now());
-  const file = samplePath(`load-${scenario}-${kind}`);
+  const file = samplePath(config.tools.samplesDir, `load-${scenario}-${kind}`);
   writeFileSync(file, JSON.stringify(out, null, 2));
   console.log(`Saved: ${file}`);
 }
@@ -905,17 +895,18 @@ async function main() {
     return;
   }
   const scenario = scenarioArg;
-  PORTAL_ID = portalIdFrom(parsed);
+  PORTAL_ID = portalIdFrom(parsed, config.tools.testPortalId);
   const needsBurstDeal = scenario === 'burst-one-record' || scenario === 'mixed';
   if (needsBurstDeal && (!BURST_DEAL || !/^\d+$/.test(BURST_DEAL))) {
     console.error(`Scenario "${scenario}" needs --deal <dealId> (the deal that gets the burst). No default.`);
     process.exitCode = 1;
     return;
   }
-  const labelNames = testLabelNames(parsed, 3);
-  const rl = new RateLimiter(80, 10_000);
+  const labelNames = testLabelNames(parsed, 3, config.tools.testLabels);
+  const serviceKey = setupTokenOf(config.tools);
+  startTool(config);
   const budget = { used: 0, max: MAX_OPS };
-  const hs = new Hs(env('HUBSPOT_SETUP_TOKEN'), rl, budget);
+  const hs = new Hs(serviceKey, PORTAL_ID, budget);
   const out: Record<string, unknown> = {
     startedAt: iso(Date.now()),
     scenario,
@@ -929,12 +920,11 @@ async function main() {
   let db: WorkerDb | null = null;
   const problems: string[] = [];
   try {
-    db = new WorkerDb(DB_PATH, PORTAL_ID);
+    db = new WorkerDb(DB_PATH, PORTAL_ID, config.tokenKey);
     const pairsW = db.watchedPairs();
-    if (!pairsW.includes(`${DEAL}:${CONTACT}`) && !pairsW.includes(`${CONTACT}:${DEAL}`)) problems.push(`watched pair 0-3:0-1 missing in DB (have ${pairsW.join(', ') || 'none'})`);
+    if (!db.watches(DEAL, CONTACT)) problems.push(`watched pair 0-3:0-1 missing in DB (have ${pairsW.join(', ') || 'none'})`);
     const lr = db.lastSuccessfulRead();
-    // Stored as epoch ms (string) by the worker; ISO accepted too.
-    const lrMs = lr === null ? NaN : /^\d+$/.test(lr) ? Number(lr) : Date.parse(lr);
+    const lrMs = lr ?? NaN;
     const age = Number.isFinite(lrMs) ? Date.now() - lrMs : Infinity;
     if (!(age < 10 * 60_000)) problems.push(`worker's last successful read is ${Number.isFinite(lrMs) ? iso(lrMs) : 'never'} (>10 min): is the worker running?`);
     const sp = db.spacingSeconds();
@@ -969,7 +959,7 @@ async function main() {
   console.log('\nPlan (only fresh links between EXISTING records; no records created or deleted):');
   for (const s of scenarios) console.log(s.plan.join('\n') + `\n  = ${s.ops} association operations\n`);
   console.log(`Total: ${totalOps} association operations (cap ${MAX_OPS}${scenario === 'mixed' ? '; burst and spread run at the same time' : ''}).`);
-  console.log(`Rate limit: <= ${rl.max} requests / ${rl.windowMs / 1000} s (service key shares the portal limit with the app).`);
+  console.log(`Rate limit: <= ${TOOL_RATE_PER_10S} requests / 10 s (the portal bucket of this run).`);
   if (problems.length) console.log(`\nPre-check problems:\n  - ${problems.join('\n  - ')}`);
 
   if (totalOps > MAX_OPS) {
@@ -991,8 +981,7 @@ async function main() {
     console.log('\nCtrl+C: stopping and cleaning up (press again to quit WITHOUT cleanup)...');
   });
   const ctx: Ctx = { hs, db, labels, checks: [], out, kpis: [] };
-  installHttpCounter();
-  const healthBefore = await readHealth(HEALTH_PORT);
+  const healthBefore = await readHealth(config.worker);
   const dbBytesBefore = dbFileSize(DB_PATH);
   const sampler = new Sampler(db);
   sampler.start();
@@ -1005,25 +994,26 @@ async function main() {
   out.durationMs = Date.now() - t0;
   out.associationOpsUsed = budget.used;
   out.hubspotCalls = hs.calls;
-  out.rateLimiterPeakPer10s = rl.peak;
+  const scriptPeak = windowPeak(hs.times, 10_000);
+  out.rateLimiterPeakPer10s = scriptPeak;
   out.hubspotErrors = hs.errors;
   if (hs.errors.length) check(ctx, scenario, 'HubSpot batch errors', false, `${hs.errors.length}: ${hs.errors.slice(0, 2).join(' | ')}`);
-  check(ctx, scenario, 'usage', null, `${budget.used} association ops, ${hs.calls} API calls, peak ${rl.peak} req/10 s, ${secs(out.durationMs as number)} total`);
+  check(ctx, scenario, 'usage', null, `${budget.used} association ops, ${hs.calls} API calls, peak ${scriptPeak} req/10 s, ${secs(out.durationMs as number)} total`);
 
   out.checks = ctx.checks;
   const pass = printTable(ctx.checks);
   save(out, scenario, pass ? 'pass' : 'fail');
 
   // KPI scorecard (always printed after a real run; separate from the functional PASS/FAIL above).
-  const healthAfter = await readHealth(HEALTH_PORT);
-  const sc = scorecard(ctx.kpis, { scenario, hs, rl, sampler, healthBefore, healthAfter, dbBytesBefore, dbBytesAfter: dbFileSize(DB_PATH) });
+  const healthAfter = await readHealth(config.worker);
+  const sc = scorecard(ctx.kpis, { scenario, hs, sampler, healthBefore, healthAfter, dbBytesBefore, dbBytesAfter: dbFileSize(DB_PATH) });
   printScorecard(sc.rows, sc.verdict);
   const kpiOut = {
     at: iso(Date.now()), scenario, portalId: PORTAL_ID, targets: T, verdict: sc.verdict, summary: sc.summary, kpis: sc.rows, markdownRow: sc.markdown,
     perScenario: ctx.kpis.map(({ timings, ...k }) => ({ ...k, timingsCount: timings.length })), timings: ctx.kpis.flatMap((k) => k.timings),
     healthBefore, healthAfter,
   };
-  const kf = samplePath(`load-kpis-${scenario}`);
+  const kf = samplePath(config.tools.samplesDir, `load-kpis-${scenario}`);
   writeFileSync(kf, JSON.stringify(kpiOut, null, 2));
   console.log(`Saved: ${kf}`);
   console.log(`\nMarkdown row for ${KPI_DOC}:\n${sc.markdown}`);

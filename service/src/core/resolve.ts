@@ -1,19 +1,10 @@
 // Label KEYS, not names (naming review 2026-11-07): each label is carried as its association type id (direction
-// from -> to), so stamped option values survive a label rename (see label-options.ts). Names are kept on the side
-// (NormalizedChange.labelNames) for logs and the app-event mode.
-import { UNLABELED_KEY } from './label-options.js';
+// from -> to), so stamped option values survive a label rename (see label-options.ts). Names are looked up only to
+// translate keys for the mirror stamp (mirrorKeysOf).
+import { isTypeIdKey, typeIdKey, UNLABELED_KEY, unresolvedKey } from './label-options.js';
 import type { LabelCache } from './labels.js';
-import { pairKey } from './pairing.js';
-import type { LabelRef, NormalizedChange, PairedChange } from './types.js';
-
-export interface ResolveConfig {
-  /** Key used for a type with no label (the structural default link). Dropped when stamping. */
-  unlabeledName: string;
-  /** STAMP_MIRROR=1: also translate each label to the to -> from direction (mirrorLabelKeys) for the mirror stamp. */
-  mirror?: boolean;
-}
-
-export const DEFAULT_RESOLVE_CONFIG: ResolveConfig = { unlabeledName: UNLABELED_KEY };
+import { pairKey } from './keys.js';
+import type { AssociationEntry, LabelRef, NormalizedChange, PairedChange } from './types.js';
 
 export interface LabelStateReader {
   getAssociationLabels(pairKey: string): string[] | undefined;
@@ -29,19 +20,18 @@ export const uniqSorted = (xs: string[]) => [...new Set(xs)].sort();
 
 /**
  * Label keys of a paired change's removed / added type ids (sorted, unique), plus key -> name for the named ones.
- * Key = the type id as a string; the unlabeled structural type = config.unlabeledName; unresolvable = "type N".
+ * Keys: see label-options.ts (typeIdKey, UNLABELED_KEY for the unlabeled structural type, unresolvedKey).
  */
 export async function labelKeysOf(
   p: Pick<PairedChange, 'portalId' | 'removed' | 'added'>,
   labels: LabelCache,
-  config: ResolveConfig = DEFAULT_RESOLVE_CONFIG,
 ): Promise<{ removed: string[]; added: string[]; names: Record<string, string> }> {
   const names: Record<string, string> = {};
   const keyOf = async (r: LabelRef): Promise<string> => {
     const hit = await labels.get(p.portalId, r.fromObjectTypeId, r.toObjectTypeId, r.associationTypeId);
-    if (!hit) return `type ${r.associationTypeId}`;
-    if (hit.label === null) return config.unlabeledName;
-    const key = String(r.associationTypeId);
+    if (!hit) return unresolvedKey(r.associationTypeId);
+    if (hit.label === null) return UNLABELED_KEY;
+    const key = typeIdKey(r.associationTypeId);
     names[key] = hit.label;
     return key;
   };
@@ -64,7 +54,6 @@ export async function mirrorKeysOf(
   labels: LabelCache,
 ): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
-  if (!labels.findByName) return out;
   for (const k of keys) {
     const name = names[k];
     if (name === undefined || k in out) continue;
@@ -75,8 +64,8 @@ export async function mirrorKeysOf(
 }
 
 /**
- * Names for every label key of a change. Keys that came from stored state (an earlier event) are looked up by id;
- * the label cache already holds them, so this is normally a local read.
+ * Names for every label key of a change (mirror translation only). Keys that came from stored state (an earlier
+ * event) are looked up by id; the label cache already holds them, so this is normally a local read.
  */
 async function namesFor(
   p: Pick<PairedChange, 'portalId' | 'fromObjectTypeId' | 'toObjectTypeId'>,
@@ -87,16 +76,31 @@ async function namesFor(
   const out: Record<string, string> = {};
   for (const k of keys) {
     if (known[k] !== undefined) out[k] = known[k];
-    else if (/^\d+$/.test(k)) {
-      try {
-        const hit = await labels.get(p.portalId, p.fromObjectTypeId, p.toObjectTypeId, Number(k));
-        if (hit?.label) out[k] = hit.label;
-      } catch {
-        /* names are only for logs and app events; the stamp uses the key */
-      }
+    else if (isTypeIdKey(k)) {
+      const hit = await labels.get(p.portalId, p.fromObjectTypeId, p.toObjectTypeId, Number(k));
+      if (hit?.label) out[k] = hit.label;
     }
   }
   return out;
+}
+
+/**
+ * The lookups the mirror translation of these entries will need (names of their type ids and of the pair's stored
+ * labels, then the to -> from ids by name), done in the poller's per-portal label step: a LabelHoldError there parks
+ * only this portal, while the same lookup in resolveChanges / absorb would hold the whole batch. Afterwards those
+ * lookups are local reads.
+ */
+export async function prefetchMirrorLabels(entries: AssociationEntry[], labels: LabelCache, state: LabelStateReader): Promise<void> {
+  const done = new Set<string>();
+  for (const { event: e } of entries) {
+    const stored = state.getAssociationLabels(pairKey(e.portalId, e.fromObjectTypeId, e.fromObjectId, e.toObjectTypeId, e.toObjectId)) ?? [];
+    const keys = uniqSorted([typeIdKey(e.associationTypeId), ...stored])
+      .filter(isTypeIdKey)
+      .filter((k) => !done.has(`${e.portalId}|${e.fromObjectTypeId}|${e.toObjectTypeId}|${k}`));
+    if (!keys.length) continue;
+    for (const k of keys) done.add(`${e.portalId}|${e.fromObjectTypeId}|${e.toObjectTypeId}|${k}`);
+    await mirrorKeysOf(e, keys, await namesFor(e, keys, {}, labels), labels);
+  }
 }
 
 /*
@@ -109,7 +113,8 @@ export async function resolveChanges(
   paired: PairedChange[],
   labels: LabelCache,
   state: LabelStateReader,
-  config: ResolveConfig = DEFAULT_RESOLVE_CONFIG,
+  /** STAMP_MIRROR: also translate each label to the to -> from direction (mirrorLabelKeys) for the mirror stamp. */
+  mirror: boolean,
   /** State changes already decided earlier in this run (late-half absorption); they win over the store. */
   initialStateUpdates?: Map<string, string[] | null>,
 ): Promise<ResolveResult> {
@@ -121,7 +126,7 @@ export async function resolveChanges(
 
   const changes: NormalizedChange[] = [];
   for (const p of paired) {
-    const { removed, added, names } = await labelKeysOf(p, labels, config);
+    const { removed, added, names } = await labelKeysOf(p, labels);
     const k = pairKey(p.portalId, p.fromObjectTypeId, p.fromObjectId, p.toObjectTypeId, p.toObjectId);
     const prev = known(k);
 
@@ -148,7 +153,6 @@ export async function resolveChanges(
     }
 
     const allKeys = uniqSorted([...(labelBefore ?? []), ...(labelAfter ?? []), ...(labelsCurrent ?? []), ...removed, ...added]);
-    const labelNames = await namesFor(p, allKeys, names, labels);
     changes.push({
       portalId: p.portalId,
       changeType: p.changeType,
@@ -161,8 +165,7 @@ export async function resolveChanges(
       labelsCurrent,
       removedLabels: removed,
       addedLabels: added,
-      labelNames,
-      ...(config.mirror ? { mirrorLabelKeys: await mirrorKeysOf(p, allKeys, labelNames, labels) } : {}),
+      ...(mirror ? { mirrorLabelKeys: await mirrorKeysOf(p, allKeys, await namesFor(p, allKeys, names, labels), labels) } : {}),
       associationCategory: p.associationCategory,
       occurredAt: p.occurredAt,
       sourceOffsets: p.sourceOffsets,

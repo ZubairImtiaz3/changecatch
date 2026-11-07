@@ -14,30 +14,20 @@
 //     (stamp id), so they kept pushing each other back; then every amend took its own 3 s spacing slot.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Store, type LabelDefinition } from '../../src/store/db.js';
+import { Store } from '../../src/store/db.js';
+import { DEFAULT_RETRY_WINDOW_MS } from '../../src/worker/stamp-queue.js';
+import { DEFAULT_STAMP_SPACING_SECONDS } from '../../src/store/schema.js';
 import { StampQueue } from '../../src/worker/stamp-queue.js';
-import type { TokenProvider } from '../../src/worker/tokens.js';
-import { StoreLabelCache } from '../../src/core/labels.js';
-import { runOnce, type JournalReadResult } from '../../src/core/poller.js';
-import { recordKey, stampIdOf, type StampUpdate } from '../../src/core/stamp.js';
-import { ADD, CONTACT, DEAL, ev, REM, T0, UD } from '../../src/core/testutil.js';
+import { stampIdOf, type StampUpdate } from '../../src/core/stamp.js';
 import type { AssociationAction, JournalFile } from '../../src/core/types.js';
+import { ADD, CONTACT, DEAL, ev, HD, REM, T0, UD, uuid7 } from '../fixtures/journal.js';
+import { DEAL_CONTACT_LABELS } from '../fixtures/labels.js';
+import { memoryLogger } from '../fixtures/log.js';
+import { replay, type Rig } from '../fixtures/replay.js';
+import type { LoggedChange } from '../../src/store/change-log.js';
 
-const HD = 'HUBSPOT_DEFINED';
 const PORTAL = 1000001;
-const DEFS: LabelDefinition[] = [
-  { associationTypeId: 3, label: null, category: HD },
-  { associationTypeId: 247, label: 'Decision maker', category: UD },
-  { associationTypeId: 249, label: 'Influencer', category: UD },
-];
-const SPACING = 3_000;
-const VISIBLE_DELAY = 2_000;
-
-let seq = 0;
-function uuid7(ms: number): string {
-  const h = ms.toString(16).padStart(12, '0');
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-7000-8000-${(++seq).toString(16).padStart(12, '0')}`;
-}
+const SPACING = 3_000; // the default spacing (StampQueue, settings page)
 
 /** One journal event: occurredAt (ms after T0) and the publish time of the file it is in (ms after T0). */
 interface E {
@@ -50,20 +40,13 @@ interface E {
 }
 const e = (deal: number, contact: number, action: AssociationAction, typeId: number, at: number, pub: number): E => ({ deal, contact, action, typeId, at, pub });
 
-interface Sim {
-  store: Store;
-  sent: StampUpdate[];
-  sentAt: Map<string, number>;
-  props: Map<string, Record<string, string>>;
-}
+type Sim = Rig & { props: Map<string, Record<string, string>> };
 
 /**
- * Runs the worker like production: read every 3 s, real StampQueue (3 s spacing, COALESCE_MODE=latest) drained every
+ * Runs the worker like production: read every 3 s, real StampQueue (3 s spacing, coalescing 'latest') drained every
  * second, HubSpot accepts every stamp.
  */
-async function simulate(events: E[], opts: { coalesce?: boolean } = {}): Promise<Sim> {
-  const store = new Store(':memory:');
-  store.setWatchedPairs(PORTAL, [{ objectTypeId: DEAL, associatedObjectTypeId: CONTACT }]);
+async function simulate(events: E[]): Promise<Sim> {
   const byPub = new Map<number, E[]>();
   for (const x of events) (byPub.get(x.pub) ?? byPub.set(x.pub, []).get(x.pub)!).push(x);
   const files: { pub: number; file: JournalFile }[] = [...byPub.entries()]
@@ -77,51 +60,15 @@ async function simulate(events: E[], opts: { coalesce?: boolean } = {}): Promise
         ),
       },
     }));
-  let now = files[0].pub - 5_000;
-  const end = files.at(-1)!.pub + 120_000;
-  const labels = new StoreLabelCache(store, async (_p, f, t) => (f === DEAL && t === CONTACT ? DEFS : []), undefined, () => now);
-  let next = 0;
-  const readJournal = async (): Promise<JournalReadResult> => {
-    const out: JournalFile[] = [];
-    while (next < files.length && files[next].pub + VISIBLE_DELAY <= now) out.push(files[next++].file);
-    return { files: out, nextOffset: out.at(-1)?.offset ?? null, full: false };
-  };
-  const sent: StampUpdate[] = [];
-  const sentAt = new Map<string, number>();
-  const queue = new StampQueue({
-    store,
-    tokens: {} as TokenProvider,
-    now: () => now,
-    log: () => {},
-    defaultSpacingMs: SPACING,
-    drainInline: false,
-    coalesceFor: () => (opts.coalesce === false ? { mode: 'off', threshold: 3 } : { mode: 'latest', threshold: 3 }),
-    sendBatches: async (us) => {
-      for (const u of us) sentAt.set(stampIdOf(u), now);
-      sent.push(...us);
-      return us.map((update) => ({ update, ok: true as const }));
-    },
+  const rig = await replay({
+    portal: PORTAL, labels: DEAL_CONTACT_LABELS, files, start: files[0].pub - 5_000, end: files.at(-1)!.pub + 120_000,
+    tickMs: 1_000, readEvery: 3, delivery: 'queue',
   });
-  for (let i = 0; now <= end; i++, now += 1_000) {
-    if (i % 3 === 0) await runOnce({ readJournal, sendStamps: (u, d) => queue.sendStamps(u, d), store, labels, now: () => now });
-    await queue.drain();
-  }
-  assert.equal(store.loadPending().length, 0, 'nothing left on hold');
-  assert.equal(store.queueSize(), 0, 'queue drained');
-  const props = new Map<string, Record<string, string>>();
-  for (const u of sent) {
-    const k = recordKey(u);
-    props.set(k, { ...(props.get(k) ?? {}), ...(u.properties as Record<string, string>) });
-  }
-  return { store, sent, sentAt, props };
+  return Object.assign(rig, { props: rig.props() });
 }
 
-type Row = { change_id: string; change_type: string; label_before: string; label_after: string; labels_current: string; occurred_at: string };
-const rowsFor = (s: Sim, deal: number, contact: number) =>
-  s.store.db
-    .prepare('SELECT change_id, change_type, label_before, label_after, labels_current, occurred_at FROM change_log WHERE object_id = ? AND other_record_id = ? ORDER BY occurred_at, change_id')
-    .all(String(deal), String(contact)) as Row[];
-const shape = (rs: Row[]) => rs.map((r) => `${r.change_type} ${r.label_before} -> ${r.label_after} [${r.labels_current}]`);
+const rowsFor = (s: Sim, deal: number, contact: number) => s.loggedChanges([deal]).filter((r) => r.otherRecordId === String(contact));
+const shape = (rs: LoggedChange[]) => rs.map((r) => `${r.changeType} ${r.labelBefore} -> ${r.labelAfter} [${r.labelsCurrent}]`);
 const triggers = (s: Sim, deal: number) => s.sent.filter((u) => u.amendOf === undefined && u.objectId === String(deal));
 
 const INF = '0-1:249'; // Influencer (option value = type id)
@@ -186,14 +133,11 @@ test('04:30 spread deal 6610028205: REMOVED 249, REMOVED 3 later (both @ 37.631)
     shape(rows).sort(),
     [`ADDED none -> ${INF} [${INF}]`, `LABEL_CHANGED ${INF} -> none [none]`, `REMOVED ${INF} -> none [none]`].sort(),
   );
-  const lc = rows.find((r) => r.change_type === 'LABEL_CHANGED')!;
-  const removed = rows.find((r) => r.change_type === 'REMOVED')!;
-  assert.notEqual(removed.change_id, lc.change_id, 'new change id');
-  const sup = s.store.db.prepare('SELECT change_id, superseded_by FROM change_log WHERE superseded_by IS NOT NULL').all() as {
-    change_id: string;
-    superseded_by: string;
-  }[];
-  assert.deepEqual(sup.map((x) => [x.change_id, x.superseded_by]), [[lc.change_id, removed.change_id]]);
+  const lc = rows.find((r) => r.changeType === 'LABEL_CHANGED')!;
+  const removed = rows.find((r) => r.changeType === 'REMOVED')!;
+  assert.notEqual(removed.changeId, lc.changeId, 'new change id');
+  const sup = s.loggedChanges([deal]).filter((x) => x.supersededBy !== null);
+  assert.deepEqual(sup.map((x) => [x.changeId, x.supersededBy]), [[lc.changeId, removed.changeId]]);
   // 3 triggers: link, the stamped LABEL_CHANGED, and the REMOVED ("unlinked" workflows fire). No type-changing amend.
   const trig = triggers(s, deal);
   assert.deepEqual(trig.map((u) => u.properties.changecatch_change_type), ['ADDED', 'LABEL_CHANGED', 'REMOVED']);
@@ -201,7 +145,7 @@ test('04:30 spread deal 6610028205: REMOVED 249, REMOVED 3 later (both @ 37.631)
   const p = s.props.get(`${PORTAL}|${DEAL}|${deal}`)!;
   assert.equal(p.changecatch_change_type, 'REMOVED');
   assert.equal(p.changecatch_labels_current, 'none');
-  assert.equal(p.changecatch_last_change_id, removed.change_id);
+  assert.equal(p.changecatch_last_change_id, removed.changeId);
   s.store.close();
 });
 
@@ -209,19 +153,19 @@ test('label-first unlink split whose label half is still QUEUED -> converted in 
   const deal = 6610028206;
   const contact = 186168;
   // Other links on the deal just before keep the label half's stamp queued (3 s spacing) until the structural half.
-  const others = Array.from({ length: 5 }, (_, i) => 186200 + i);
+  // 2 others + the label half = 3 pending on the deal: at the coalescing threshold, so nothing is folded.
+  const others = Array.from({ length: 2 }, (_, i) => 186200 + i);
   const s = await simulate(
     [
       ...others.flatMap((c) => [e(deal, c, ADD, 3, 12_000, 13_000), e(deal, c, ADD, 249, 12_000, 13_000)]),
       e(deal, contact, ADD, 3, 0, 1_500),
       e(deal, contact, ADD, 249, 0, 1_500),
       e(deal, contact, REM, 249, 13_061, 14_500),
-      e(deal, contact, REM, 3, 13_061, 20_000),
+      e(deal, contact, REM, 3, 13_061, 17_000),
     ],
-    { coalesce: false },
   );
   assert.deepEqual(shape(rowsFor(s, deal, contact)), [`ADDED none -> ${INF} [${INF}]`, `REMOVED ${INF} -> none [none]`]);
-  assert.equal(Number((s.store.db.prepare('SELECT COUNT(*) AS n FROM change_log WHERE superseded_by IS NOT NULL').get() as { n: number }).n), 0);
+  assert.deepEqual(s.loggedChanges([deal]).filter((x) => x.supersededBy !== null), []);
   s.store.close();
 });
 
@@ -258,7 +202,7 @@ test('04:30 burst deal 5000000001: 300 links, 50 split relabels, 31 label-first 
   }
   const s = await simulate(evs);
 
-  const total = Number((s.store.db.prepare('SELECT COUNT(*) AS n FROM change_log WHERE object_id = ?').get(String(deal)) as { n: number }).n);
+  const total = s.loggedChanges([deal]).length;
   assert.equal(total, 650, '300 links + 50 relabels + 300 unlinks, no rows for late halves');
   for (const c of contacts) {
     const r = shape(rowsFor(s, deal, c));
@@ -271,14 +215,12 @@ test('04:30 burst deal 5000000001: 300 links, 50 split relabels, 31 label-first 
   const p = s.props.get(`${PORTAL}|${DEAL}|${deal}`)!;
   assert.equal(p.changecatch_change_type, 'REMOVED');
   assert.equal(p.changecatch_labels_current, 'none');
-  const lastRow = s.store.db
-    .prepare("SELECT change_id FROM change_log WHERE object_id = ? AND change_type = 'REMOVED' ORDER BY occurred_at DESC, change_id DESC LIMIT 1")
-    .get(String(deal)) as { change_id: string };
-  assert.equal(p.changecatch_last_change_id, lastRow.change_id);
+  const lastRow = s.loggedChanges([deal]).filter((r) => r.changeType === 'REMOVED').at(-1)!;
+  assert.equal(p.changecatch_last_change_id, lastRow.changeId);
   // No amend stamps for changes the record never showed (coalesced away), and no stamp waits behind a pile of them.
   const amends = s.sent.filter((u) => u.amendOf !== undefined);
   assert.ok(amends.length <= 1, `at most one amend on the burst record, got ${amends.length}`);
-  const deliveredAt = s.sentAt.get(lastRow.change_id)!;
+  const deliveredAt = s.sentAt.get(lastRow.changeId)!;
   const waited = deliveredAt - (T0 + unlinkAt);
   // Published at +1.7 s, visible at +3.7 s, read <= 3 s later; only a handful of slots can be ahead of it.
   assert.ok(waited <= 20_000, `final stamp ${waited / 1000} s after the unlink (was 278.6 s)`);
@@ -293,15 +235,14 @@ test('stamp queue: drain order = slot-planner order, so a record with many queue
   const sent: { id: string; at: number }[] = [];
   const queue = new StampQueue({
     store,
-    tokens: {} as TokenProvider,
+    revoked: { listRevoked: () => [] },
+    spacingFor: () => DEFAULT_STAMP_SPACING_SECONDS * 1000,
+    retryWindowMs: DEFAULT_RETRY_WINDOW_MS,
     now: () => now,
-    log: () => {},
-    defaultSpacingMs: SPACING,
-    drainInline: false,
-    coalesceFor: () => ({ mode: 'latest', threshold: 3 }),
+    log: memoryLogger().log,
     sendBatches: async (us) => {
       for (const u of us) sent.push({ id: stampIdOf(u), at: now });
-      return us.map((update) => ({ update, ok: true as const }));
+      return us.map((update) => ({ update, kind: 'ok' as const }));
     },
   });
   const base = { portalId: PORTAL, objectTypeId: DEAL, objectId: '5000000001' };
@@ -319,8 +260,8 @@ test('stamp queue: drain order = slot-planner order, so a record with many queue
     if (i % 3 === 0 && i < 30) queue.enqueue([normal(`1793334649${String(400 + i).padStart(3, '0')}-ffffffffff`, T0 + i * 100)]);
     await queue.drain();
   }
-  for (; store.queueSize() > 0 && now < T0 + 600_000; now += 1_000) await queue.drain();
-  assert.equal(store.queueSize(), 0);
+  for (; store.stamps.queueSize() > 0 && now < T0 + 600_000; now += 1_000) await queue.drain();
+  assert.equal(store.stamps.queueSize(), 0);
   // Every stamp goes out in planner order, one spacing slot after the previous one: no stamp waits longer than its
   // queue position x spacing (the old created_at order livelocked here while enqueues kept coming).
   const ids = sent.map((x) => x.id);

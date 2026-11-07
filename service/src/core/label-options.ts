@@ -1,5 +1,4 @@
-// Option sets + value formatting for the 3 label properties (changecatch_labels_before / _after / _current) and the
-// changecatch_other_object_type dropdown.
+// Option sets + value formatting for the 3 label properties (changecatch_labels_before / _after / _current).
 // The label properties are enumeration + checkbox ("multiple checkboxes"), so a record value is a set of option values.
 //
 // Docs (checked 2026-10-30):
@@ -18,35 +17,37 @@
 // The pipeline carries label KEYS (resolve.ts labelKeysOf): the type id as a string, UNLABELED_KEY for the structural
 // default link, or "type N" when the id could not be resolved.
 //
-// Pure: no HTTP. The sync (GET + PATCH) lives in src/hubspot/properties.ts.
+// Pure: no HTTP. The sync (GET + PATCH) lives in src/hubspot/properties.ts; the fixed options in ./contract.ts.
 
-/** Written instead of "" so workflow filters ("is any of (none)") work. Shown as "(none)". */
-export const NONE = 'none';
-/** Written when we genuinely don't know (e.g. a label edit on a pair we never saw being created). Shown as "(unknown)". */
-export const UNKNOWN = 'unknown';
+import {
+  buildObjectTypeOptions,
+  CHANGE_TYPE_OPTIONS,
+  FIXED_OPTIONS,
+  LABEL_PROPERTY_NAMES,
+  NONE,
+  STAMP_PROPS,
+  STANDARD_OTHER_TYPES,
+  UNKNOWN,
+  type PropertyOption,
+} from './contract.js';
+
 /** HubSpot's multi-checkbox separator. No spaces. */
 export const MULTI_SEPARATOR = ';';
-/** resolve.ts keys a structural (unlabeled) type like this. It is not a real label, so it is dropped. */
+
+// --- label keys (what the pipeline carries per label) ---
+/** The key of a structural (unlabeled) type. It is not a real label, so it is dropped when stamping. */
 export const UNLABELED_KEY = 'unlabeled';
-/** A resolved label key: the association type id. Anything else (e.g. "type 123") is unknown. */
-const LABEL_KEY = /^\d+$/;
+/** The key of a resolved label: its association type id (direction from -> to) as a string. */
+export const typeIdKey = (associationTypeId: number): string => String(associationTypeId);
+/** The key of a label whose name could not be resolved ("?" = no translation to the mirror direction). Stamped "unknown". */
+export const unresolvedKey = (associationTypeId: number | '?'): string => `type ${associationTypeId}`;
+/** True for a resolved label key (a type id); false for UNLABELED_KEY and unresolved keys. */
+export const isTypeIdKey = (key: string): boolean => /^\d+$/.test(key);
 
 export const MAX_OPTIONS = 5000;
 
-export interface PropertyOption {
-  label: string;
-  value: string;
-  displayOrder: number;
-  hidden: boolean;
-}
-
-export const FIXED_OPTIONS: PropertyOption[] = [
-  { label: '(none)', value: NONE, displayOrder: 0, hidden: false },
-  { label: '(unknown)', value: UNKNOWN, displayOrder: 1, hidden: false },
-];
-
-/** Tidy a label name for display. */
-const clean = (s: string) => s.trim().replace(/\s+/g, ' ');
+/** A label name trimmed, inner whitespace collapsed (case kept): for display and for the mirror translation by name. */
+export const normLabelName = (s: string): string => s.trim().replace(/\s+/g, ' ');
 
 /** The option value for one label seen from the stamped record, towards `otherObjectTypeId`. */
 export function labelOptionValue(otherObjectTypeId: string, associationTypeId: number | string): string {
@@ -54,7 +55,7 @@ export function labelOptionValue(otherObjectTypeId: string, associationTypeId: n
 }
 
 export function labelOptionLabel(otherObjectName: string, labelName: string): string {
-  return `${clean(labelName)} (${otherObjectName})`;
+  return `${normLabelName(labelName)} (${otherObjectName})`;
 }
 
 /**
@@ -68,7 +69,7 @@ export function formatLabelValues(labels: string[] | undefined, otherObjectTypeI
   for (const raw of labels) {
     const l = raw.trim();
     if (l === '' || l === UNLABELED_KEY) continue;
-    out.add(LABEL_KEY.test(l) ? labelOptionValue(otherObjectTypeId, l) : UNKNOWN);
+    out.add(isTypeIdKey(l) ? labelOptionValue(otherObjectTypeId, l) : UNKNOWN);
   }
   return out.size === 0 ? NONE : [...out].sort().join(MULTI_SEPARATOR);
 }
@@ -89,14 +90,28 @@ export interface LabelSource {
  * Desired option set for one object type: "(none)", "(unknown)", then every named label (USER_DEFINED and named
  * HUBSPOT_DEFINED ones like "Primary") per other object type, sorted by object name then label. Null labels are skipped.
  */
+/**
+ * The options each synced dropdown (SYNCED_ENUM_PROPERTY_NAMES) on one object type must hold: the change types, every
+ * standard + watched other type, and one option per label toward the watched other types (`sources`).
+ * `names`: display names of the other types (labels of changecatch_other_object_type options).
+ */
+export function desiredSyncedOptions(others: string[], sources: LabelSource[], names: Record<string, string>): Record<string, PropertyOption[]> {
+  const labels = buildLabelOptions(sources);
+  return {
+    [STAMP_PROPS.changeType]: CHANGE_TYPE_OPTIONS,
+    [STAMP_PROPS.otherObjectType]: buildObjectTypeOptions([...STANDARD_OTHER_TYPES, ...others], names),
+    ...Object.fromEntries(LABEL_PROPERTY_NAMES.map((n) => [n, labels])),
+  };
+}
+
 export function buildLabelOptions(sources: LabelSource[]): PropertyOption[] {
   const byValue = new Map<string, { label: string; sort: string }>();
   for (const s of sources) {
     for (const l of s.labels) {
-      if (l.label === null || clean(l.label) === '') continue;
+      if (l.label === null || normLabelName(l.label) === '') continue;
       const value = labelOptionValue(s.otherObjectTypeId, l.typeId);
       if (!byValue.has(value))
-        byValue.set(value, { label: labelOptionLabel(s.otherObjectName, l.label), sort: `${s.otherObjectName}\u0000${clean(l.label).toLowerCase()}` });
+        byValue.set(value, { label: labelOptionLabel(s.otherObjectName, l.label), sort: `${s.otherObjectName}\u0000${normLabelName(l.label).toLowerCase()}` });
     }
   }
   const labelled = [...byValue.entries()].sort((a, b) => (a[1].sort < b[1].sort ? -1 : a[1].sort > b[1].sort ? 1 : 0));
@@ -104,13 +119,6 @@ export function buildLabelOptions(sources: LabelSource[]): PropertyOption[] {
     ...FIXED_OPTIONS.map((o) => ({ ...o })),
     ...labelled.map(([value, v], i) => ({ label: v.label, value, displayOrder: FIXED_OPTIONS.length + i, hidden: false })),
   ];
-}
-
-/** changecatch_other_object_type options: value = object type id (stable), label = its display name. */
-export function buildObjectTypeOptions(otherTypeIds: string[], names: Record<string, string>): PropertyOption[] {
-  return [...new Set(otherTypeIds)]
-    .sort((a, b) => (names[a] ?? a).localeCompare(names[b] ?? b))
-    .map((id, i) => ({ label: names[id] ?? id, value: id, displayOrder: i, hidden: false }));
 }
 
 export interface MergeResult {

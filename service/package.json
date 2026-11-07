@@ -20,7 +20,7 @@
     "start:worker": "tsx src/worker/main.ts",
     "dev": "tsx src/cli/dev.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test \"src/**/*.test.ts\" \"test/**/*.test.ts\""
+    "test": "node --import tsx --import ./test/setup.ts --test \"src/**/*.test.ts\" \"test/**/*.test.ts\""
   },
   "dependencies": {
     "tsx": "^4.23.15"

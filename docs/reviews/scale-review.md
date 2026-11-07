@@ -133,7 +133,7 @@ Severity: **critical** = breaks correctness or stalls all portals at this scale.
 - Send different portals in parallel (for example 8 at a time), one at a time per portal, through the H1 limiter.
 - Don't drain inside `sendStamps`; just enqueue and let the loop drain. The journal read then never waits on CRM writes.
 
-**Status: fixed.** The drain takes at most 100 records per portal per cycle and stamps up to 8 portals in parallel (`STAMP_PORTAL_CONCURRENCY`). The production worker sets `drainInline: false`, so the loop drains after a read instead of inside it.
+**Status: fixed.** The drain takes at most 100 records per portal per cycle and stamps up to 8 portals in parallel (`STAMP_PORTAL_CONCURRENCY`). `StampQueue.sendStamps` only enqueues; the worker loop drains after a read instead of inside it.
 
 ### H4. Hot-record pile-up: should we coalesce bursts? **High (product + cost)**
 `service/src/worker/stamp-queue.ts`, with spacing from `portals.stamp_spacing_seconds`.

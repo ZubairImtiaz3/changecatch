@@ -1,11 +1,13 @@
 // Rate limiter + http.ts behaviour. No HubSpot calls: fetch is stubbed.
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { hsRequest, HttpError, parseRetryAfter, rateKeyFor, RetryLaterError, setHttpLogger, TimeoutError } from './http.js';
-import { memoryLogger } from '../obs/log.js';
-import { RateLimiter, RateLimitWaitError, portalIdForToken, registerPortalToken, setRateLimiter } from './rate-limiter.js';
+import { configureHttp, hsRequest, HubSpotError, parseRetryAfter } from './http.js';
+import type { LogRecord } from '../obs/log.js';
+import { ChangeCatchMetrics } from '../obs/metrics.js';
+import { getRateLimiter, HS_PORTAL_RATE_PER_10S, RateLimiter, type RateKey } from './rate-limiter.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const queued = (l: RateLimiter, portalId: number) => l.stats().portals[portalId]?.queued ?? 0;
 
 type Handler = (url: URL, init: RequestInit) => Promise<Response> | Response;
 function stubFetch(handler: Handler) {
@@ -18,72 +20,90 @@ function stubFetch(handler: Handler) {
   }) as typeof fetch;
   return { calls, restore: () => (globalThis.fetch = real) };
 }
+/** A fetch that never answers, as HubSpot does when it hangs: the per-attempt timeout signal ends it. */
+const timesOut = (init: RequestInit): Promise<Response> => {
+  assert.ok(init.signal instanceof AbortSignal, 'every attempt carries a timeout signal');
+  return Promise.reject(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+};
+
+/** Log lines http.ts writes to stderr (warn) while `f` runs. */
+async function captureStderr(f: () => Promise<void>): Promise<{ records: LogRecord[]; lines: string[] }> {
+  const lines: string[] = [];
+  const real = process.stderr.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => (lines.push(...String(chunk).split('\n').filter(Boolean)), true)) as typeof process.stderr.write;
+  try {
+    await f();
+  } finally {
+    process.stderr.write = real;
+  }
+  return { records: lines.map((l) => JSON.parse(l) as LogRecord), lines };
+}
+
 const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } });
 
-// ---------------------------------------------------------------- limiter
+// ---------------------------------------------------------------- limiter (mocked clock + timers)
 
-test('limiter: sliding window caps starts per window, FIFO', async () => {
-  const l = new RateLimiter({ portal: { limit: 2, windowMs: 150 } });
-  const t0 = Date.now();
-  const done: number[] = [];
-  await Promise.all([0, 1, 2, 3].map((i) => l.acquire({ portalId: 1 }).then(() => done.push(i))));
-  assert.deepEqual(done, [0, 1, 2, 3]);
-  assert.ok(Date.now() - t0 >= 140, 'the 3rd and 4th waited for the window');
+const flush = () => new Promise((r) => setImmediate(r));
+/** Start acquires and record which ones have been granted. */
+function track(l: RateLimiter, keys: RateKey[]) {
+  const granted: number[] = [];
+  keys.forEach((k, i) => void l.acquire(k).then(() => granted.push(i)));
+  return granted;
+}
+const clock = (t: TestContext) => t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+
+test('limiter: sliding window caps starts per window, FIFO', async (t) => {
+  clock(t);
+  const l = new RateLimiter(2);
+  const granted = track(l, [{ portalId: 1 }, { portalId: 1 }, { portalId: 1 }, { portalId: 1 }]);
+  await flush();
+  assert.deepEqual(granted, [0, 1]);
+  t.mock.timers.tick(9_999);
+  await flush();
+  assert.deepEqual(granted, [0, 1], 'not before the 10 s window has passed');
+  t.mock.timers.tick(1);
+  await flush();
+  assert.deepEqual(granted, [0, 1, 2, 3]);
 });
 
-test('limiter fairness: a throttled portal does not block another portal', async () => {
-  const l = new RateLimiter({ portal: { limit: 2, windowMs: 300 } });
-  const a = [1, 2, 3, 4, 5].map(() => l.acquire({ portalId: 1 }));
-  await sleep(5);
-  assert.equal(l.queueDepth(1), 3, '3 of portal 1 are queued');
-  const t0 = Date.now();
-  await l.acquire({ portalId: 2 });
-  assert.ok(Date.now() - t0 < 50, 'portal 2 got a slot at once');
-  assert.equal(l.queueDepth(2), 0);
-  await Promise.all(a);
-  assert.equal(l.queueDepth(1), 0);
+test('limiter fairness: a throttled portal does not block another portal', async (t) => {
+  clock(t);
+  const l = new RateLimiter(2);
+  const granted = track(l, [1, 1, 1, 1, 1, 2].map((portalId) => ({ portalId })));
+  await flush();
+  assert.deepEqual(granted, [0, 1, 5], 'portal 2 got a slot at once');
+  assert.equal(queued(l, 1), 3);
+  t.mock.timers.tick(10_000);
+  await flush();
+  assert.equal(granted.length, 5, 'two more of portal 1 per window');
+  t.mock.timers.tick(10_000);
+  await flush();
+  assert.equal(granted.length, 6);
 });
 
-test('limiter: pause() holds only that key; maxWaitMs throws instead of queueing', async () => {
-  const l = new RateLimiter({ portal: { limit: 100, windowMs: 10_000 } });
+test('limiter: pause() holds only that key; waitMs reports the wait', async (t) => {
+  clock(t);
+  const l = new RateLimiter();
   l.pause({ portalId: 1 }, 150);
-  const t0 = Date.now();
-  await l.acquire({ portalId: 2 });
-  assert.ok(Date.now() - t0 < 50);
-  await assert.rejects(l.acquire({ portalId: 1 }, { maxWaitMs: 50 }), RateLimitWaitError);
-  assert.equal(l.queueDepth(1), 0, 'a rejected acquire is not queued');
-  await l.acquire({ portalId: 1 });
-  assert.ok(Date.now() - t0 >= 140, 'portal 1 waited for the pause');
-  assert.ok(l.stats()['portal:1'].inWindow >= 1);
+  assert.equal(l.waitMs({ portalId: 1 }), 150);
+  assert.equal(l.waitMs({ portalId: 2 }), 0);
+  const granted = track(l, [{ portalId: 1 }, { portalId: 2 }]);
+  await flush();
+  assert.deepEqual(granted, [1]);
+  t.mock.timers.tick(150);
+  await flush();
+  assert.deepEqual(granted, [1, 0], 'portal 1 waited for the pause');
 });
 
-test('limiter: app-level buckets are separate from portal buckets', async () => {
-  const l = new RateLimiter({ journal: { limit: 1, windowMs: 10_000 } });
-  await l.acquire('journal');
-  assert.ok(l.waitMs('journal') > 1000);
-  assert.equal(l.waitMs('subscriptions'), 0);
-  assert.equal(l.waitMs({ portalId: 9 }), 0);
-});
-
-test('rateKeyFor: journal / subscriptions / oauth / presigned / registered portal token', () => {
-  registerPortalToken('tok-77', 77);
-  const u = (p: string) => new URL(p.startsWith('http') ? p : 'https://api.hubapi.com' + p);
-  assert.equal(rateKeyFor(u('/webhooks-journal/journal/2026-09/next'), {}), 'journal');
-  assert.equal(rateKeyFor(u('/webhooks-journal/subscriptions/2026-09'), {}), 'subscriptions');
-  assert.equal(rateKeyFor(u('/oauth/2026-09/token'), { token: 'tok-77' }), null);
-  assert.equal(rateKeyFor(u('https://s3.amazonaws.com/x?sig=1'), { token: 'tok-77' }), null);
-  assert.deepEqual(rateKeyFor(u('/crm/objects/2026-09/0-3/batch/update'), { token: 'tok-77' }), { portalId: 77 });
-  assert.equal(rateKeyFor(u('/crm/objects/2026-09/0-3/batch/update'), { token: 'unknown' }), null);
-  assert.deepEqual(rateKeyFor(u('/anything'), { portalId: 5 }), { portalId: 5 });
-  assert.equal(rateKeyFor(u('/webhooks-journal/journal/2026-09/next'), { rateKey: 'none' }), null);
-});
-
-test('token registry keeps only the last 3 tokens per portal', () => {
-  for (let i = 0; i < 5; i++) registerPortalToken(`p88-${i}`, 88);
-  assert.equal(portalIdForToken('p88-0'), undefined);
-  assert.equal(portalIdForToken('p88-1'), undefined);
-  assert.equal(portalIdForToken('p88-4'), 88);
+test('limiter: app-level buckets are separate from portal buckets', async (t) => {
+  clock(t);
+  const l = new RateLimiter(1);
+  await l.acquire({ portalId: 9 });
+  assert.ok(l.waitMs({ portalId: 9 }) > 0);
+  const granted = track(l, ['journal', 'subscriptions', { portalId: 10 }]);
+  await flush();
+  assert.deepEqual(granted, [0, 1, 2], 'other buckets got a slot at once');
 });
 
 test('parseRetryAfter: seconds and HTTP date', () => {
@@ -95,9 +115,6 @@ test('parseRetryAfter: seconds and HTTP date', () => {
 // ---------------------------------------------------------------- http + limiter
 
 test('429 with Retry-After pauses ONLY that portal; another portal continues; then the call succeeds', async () => {
-  setRateLimiter(new RateLimiter());
-  registerPortalToken('tok-A', 1001);
-  registerPortalToken('tok-B', 1002);
   let aCalls = 0;
   const hs = stubFetch((url, init) => {
     const auth = (init.headers as Record<string, string>).Authorization;
@@ -105,72 +122,57 @@ test('429 with Retry-After pauses ONLY that portal; another portal continues; th
     return json({ ok: auth });
   });
   try {
-    const t0 = Date.now();
-    const pa = hsRequest('/crm/objects/2026-09/0-3/batch/update', { method: 'POST', token: 'tok-A', body: {} });
-    await sleep(30); // A has had its 429 and is paused
-    const tB = Date.now();
-    assert.deepEqual(await hsRequest('/crm/objects/2026-09/0-1/batch/update', { method: 'POST', token: 'tok-B', body: {} }), { ok: 'Bearer tok-B' });
-    assert.ok(Date.now() - tB < 100, 'portal B was not held by portal A');
+    const l = getRateLimiter();
+    const pa = hsRequest('/crm/objects/2026-09/0-3/batch/update', { method: 'POST', token: 'tok-A', portalId: 1001, body: {} });
+    for (let i = 0; i < 200 && l.waitMs({ portalId: 1001 }) === 0; i++) await sleep(5); // wait for A's 429
+    assert.ok(l.waitMs({ portalId: 1001 }) > 0, "A's 429 paused portal A's bucket");
+    assert.equal(l.waitMs({ portalId: 1002 }), 0, 'portal B is not');
+    assert.deepEqual(await hsRequest('/crm/objects/2026-09/0-1/batch/update', { method: 'POST', token: 'tok-B', portalId: 1002, body: {} }), { ok: 'Bearer tok-B' });
     assert.deepEqual(await pa, { ok: 'Bearer tok-A' });
-    assert.ok(Date.now() - t0 >= 240, 'portal A waited for Retry-After');
     assert.equal(aCalls, 2);
   } finally {
     hs.restore();
-    setRateLimiter(new RateLimiter());
   }
 });
 
-test('429 with a long Retry-After on a portal call: RetryLaterError at once, bucket paused, others fine', async () => {
-  const l = new RateLimiter();
-  setRateLimiter(l);
-  registerPortalToken('tok-C', 1003);
+// A 30 s inline sleep would trip the test timeout.
+test('429 with a long Retry-After on a portal call: throttled at once, bucket paused, others fine', { timeout: 10_000 }, async () => {
+  const l = getRateLimiter();
   const hs = stubFetch(() => json({ category: 'RATE_LIMITS' }, 429, { 'retry-after': '30' }));
   try {
-    const t0 = Date.now();
-    const err = await hsRequest('/crm/objects/2026-09/0-3/batch/update', { method: 'POST', token: 'tok-C', body: {} }).catch((e) => e);
-    assert.ok(err instanceof RetryLaterError);
-    assert.ok(err instanceof HttpError && err.status === 429, 'still an HttpError 429 for existing handlers');
+    const err = await hsRequest('/crm/objects/2026-09/0-3/batch/update', { method: 'POST', token: 'tok-C', portalId: 1003, body: {} }).catch((e) => e);
+    assert.ok(err instanceof HubSpotError && err.kind === 'throttled' && err.scope === 'portal' && err.status === 429);
     assert.equal(err.retryAfterMs, 30_000);
-    assert.ok(Date.now() - t0 < 200, 'no inline sleep');
     assert.equal(hs.calls.length, 1);
-    assert.ok(l.waitMs({ portalId: 1003 }) > 29_000, 'portal bucket paused');
-    assert.equal(l.waitMs({ portalId: 1004 }), 0);
+    assert.ok(l.stats().portals[1003].pausedForMs > 29_000, 'portal bucket paused');
+    assert.equal(l.stats().portals[1004], undefined, 'no other portal touched');
     // A second call for the throttled portal fails fast from the limiter, without hitting HubSpot.
-    await assert.rejects(hsRequest('/crm/x', { token: 'tok-C' }), RetryLaterError);
+    await assert.rejects(hsRequest('/crm/x', { token: 'tok-C', portalId: 1003 }), (e) => e instanceof HubSpotError && e.kind === 'throttled' && e.scope === 'limiter');
     assert.equal(hs.calls.length, 1);
   } finally {
     hs.restore();
-    setRateLimiter(new RateLimiter());
   }
 });
 
-test('timeout: a hung request is aborted and retried with backoff', async () => {
+test('timeout: a timed-out request is retried with backoff', async () => {
   let n = 0;
-  const hs = stubFetch((_url, init) => {
-    if (n++ === 0) {
-      // Never answers; only the abort signal ends it.
-      return new Promise<Response>((_res, rej) => init.signal!.addEventListener('abort', () => rej(init.signal!.reason)));
-    }
-    return json({ ok: true });
-  });
+  const hs = stubFetch((_url, init) => (n++ === 0 ? timesOut(init) : json({ ok: true })));
   try {
-    const t0 = Date.now();
-    assert.deepEqual(await hsRequest('/crm/y', { timeoutMs: 50, rateKey: 'none' }), { ok: true });
+    assert.deepEqual(await hsRequest('/crm/y'), { ok: true });
     assert.equal(n, 2);
-    assert.ok(Date.now() - t0 < 2_000);
   } finally {
     hs.restore();
   }
 });
 
 test('retry log: one structured warn per 5xx retry; method + path + status only, no token or query string', async () => {
-  const mem = memoryLogger('http');
-  const restoreLog = setHttpLogger(mem.log);
   let n = 0;
   const hs = stubFetch(() => (n++ === 0 ? json({ message: 'oops' }, 503) : json({ ok: true })));
   const token = 'CJabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH';
   try {
-    assert.deepEqual(await hsRequest('/crm/2026-03/objects/deals', { token, query: { code: 'secret-code' }, rateKey: 'none' }), { ok: true });
+    const mem = await captureStderr(async () => {
+      assert.deepEqual(await hsRequest('/crm/2026-03/objects/deals', { token, query: { code: 'secret-code' } }), { ok: true });
+    });
     assert.equal(mem.records.length, 1);
     const r = mem.records[0];
     assert.equal(r.level, 'warn');
@@ -186,29 +188,75 @@ test('retry log: one structured warn per 5xx retry; method + path + status only,
     assert.ok(!mem.lines[0].includes(token) && !mem.lines[0].includes('secret-code') && !mem.lines[0].includes('?'));
   } finally {
     hs.restore();
-    restoreLog();
   }
 });
 
-test('timeout: after the last retry a TimeoutError is thrown', async () => {
-  const hs = stubFetch((_url, init) => new Promise<Response>((_res, rej) => init.signal!.addEventListener('abort', () => rej(init.signal!.reason))));
+test('timeout: after the last retry a transient error is thrown', async () => {
+  const hs = stubFetch((_url, init) => timesOut(init));
   try {
-    await assert.rejects(hsRequest('/crm/z', { timeoutMs: 30, retries: 0, rateKey: 'none' }), TimeoutError);
+    await assert.rejects(hsRequest('/crm/z', { retries: 0 }), (e) => e instanceof HubSpotError && e.kind === 'transient' && e.status === 0 && /timed out/.test(e.message));
   } finally {
     hs.restore();
   }
 });
 
 test('journal calls use the journal bucket, not a portal bucket', async () => {
-  const l = new RateLimiter({ journal: { limit: 1, windowMs: 10_000 } });
-  setRateLimiter(l);
+  const l = getRateLimiter();
+  const portalKeys = () => Object.keys(l.stats().portals).length;
+  const portalsBefore = portalKeys();
   const hs = stubFetch(() => json({ url: 'x', expiresAt: '', currentOffset: '1' }));
   try {
-    await hsRequest('/webhooks-journal/journal/2026-09/next', { token: 'app' });
-    assert.equal(l.stats().journal.inWindow, 1);
-    assert.equal(Object.keys(l.stats()).filter((k) => k.startsWith('portal:')).length, 0);
+    await hsRequest('/webhooks-journal/journal/2026-09/next', { token: 'app', bucket: 'journal' });
+    assert.equal(l.stats().app.journal.inWindow, 1);
+    assert.equal(portalKeys(), portalsBefore);
   } finally {
     hs.restore();
-    setRateLimiter(new RateLimiter());
   }
+});
+
+test('error kinds: 401 unauthorized, other 4xx refused (status + body kept), 5xx transient after retries', async () => {
+  let code = 401;
+  const hs = stubFetch(() => json({ message: 'x' }, code));
+  try {
+    const kinds: string[] = [];
+    for (const c of [401, 404, 503]) {
+      code = c;
+      const e = await hsRequest('/crm/k', { retries: 0 }).catch((x) => x);
+      assert.ok(e instanceof HubSpotError && e.status === c);
+      assert.deepEqual(e.body, { message: 'x' });
+      kinds.push(e.kind);
+    }
+    assert.deepEqual(kinds, ['unauthorized', 'refused', 'transient']);
+  } finally {
+    hs.restore();
+  }
+});
+
+test('metrics: every attempt counted in http_requests by api; errors by status; 429 and limiter throttles in rate_limited', async () => {
+  const metrics = new ChangeCatchMetrics();
+  configureHttp({ portalRatePer10s: HS_PORTAL_RATE_PER_10S, metrics });
+  const hs = stubFetch((url) => {
+    if (url.pathname === '/crm/throttled') return json({}, 429, { 'retry-after': '60' });
+    if (url.pathname === '/oauth/2026-09/token') return json({}, 401);
+    if (url.pathname === '/crm/network') throw new TypeError('fetch failed');
+    return json({ ok: true });
+  });
+  try {
+    await hsRequest('/webhooks-journal/journal/2026-09/latest', { bucket: 'journal' });
+    await hsRequest('/crm/throttled', { token: 'tok-M', portalId: 111 }).catch(() => {});
+    await hsRequest('/crm/after', { token: 'tok-M', portalId: 111 }).catch(() => {}); // our limiter: portal 111 is paused
+    await hsRequest('https://api.hubspot.com/oauth/2026-09/token', { method: 'POST', retries: 0 }).catch(() => {});
+    await hsRequest('/crm/network', { retries: 0 }).catch(() => {});
+  } finally {
+    hs.restore();
+    configureHttp({ portalRatePer10s: HS_PORTAL_RATE_PER_10S });
+  }
+  const g = (n: string, l: Record<string, string | number>) => metrics.registry.get(n, l);
+  assert.equal(g('http_requests', { api: 'journal' }), 1);
+  assert.equal(g('http_requests', { api: 'crm' }), 2, 'the limiter refusal never reached HubSpot');
+  assert.equal(g('http_requests', { api: 'oauth' }), 1);
+  assert.equal(g('http_errors', { status: '429' }), 1);
+  assert.equal(g('http_errors', { status: '401' }), 1);
+  assert.equal(g('http_errors', { status: 'network' }), 1);
+  assert.equal(g('rate_limited', { portal: 111 }), 2, 'one HubSpot 429 + one limiter refusal');
 });

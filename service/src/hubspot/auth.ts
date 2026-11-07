@@ -7,65 +7,30 @@
 // POST /oauth/2026-09/token (form-encoded), grant_type=client_credentials, space-separated scope.
 // Response: { token_type: "bearer", access_token, expires_in: 1800 }. No refresh token: just request a new one.
 
-import { env, optionalEnv } from '../lib/env.js';
-import { hsRequest } from '../lib/http.js';
+import { HUBSPOT_TOKEN_URL, hsRequest } from '../lib/http.js';
+import { EARLY_REFRESH_MS, type AppClient, type TokenResponse } from './oauth.js';
 
-export const OAUTH_VERSION = '2026-09';
-
-/** Scopes we need for Tests 0-2. Snapshot scopes are left out on purpose (not used yet). */
-export const DEFAULT_JOURNAL_SCOPES = [
+/** Snapshot scopes are left out on purpose (not used). */
+const JOURNAL_SCOPES = [
   'developer.webhooks_journal.read',
   'developer.webhooks_journal.subscriptions.read',
   'developer.webhooks_journal.subscriptions.write',
-];
-
-interface TokenResponse {
-  token_type: string;
-  access_token: string;
-  expires_in: number; // seconds
-}
-
-let cached: { token: string; scope: string; expiresAt: number } | null = null;
-
-/** Refresh this long before HubSpot's expiry, so a token never dies mid-request. */
-const EARLY_REFRESH_MS = 5 * 60 * 1000;
-
-/** Which scopes to request. Override with HUBSPOT_JOURNAL_SCOPES="a b c" if needed. */
-export function journalScopes(): string {
-  return optionalEnv('HUBSPOT_JOURNAL_SCOPES') ?? DEFAULT_JOURNAL_SCOPES.join(' ');
-}
+].join(' ');
 
 /**
- * Get a client credentials token for the app. Cached in memory until 5 min before expiry.
- * Never log the return value.
+ * A client credentials token source for the app, cached in memory until 5 min before expiry.
+ * Never log the returned token.
  */
-export async function getAppToken(opts: { forceRefresh?: boolean; scope?: string } = {}): Promise<string> {
-  const scope = opts.scope ?? journalScopes();
-  const now = Date.now();
-  if (!opts.forceRefresh && cached && cached.scope === scope && cached.expiresAt - EARLY_REFRESH_MS > now) {
-    return cached.token;
-  }
-
-  const res = await hsRequest<TokenResponse>(`/oauth/${OAUTH_VERSION}/token`, {
-    method: 'POST',
-    form: {
-      grant_type: 'client_credentials',
-      client_id: env('HUBSPOT_CLIENT_ID'),
-      client_secret: env('HUBSPOT_CLIENT_SECRET'),
-      scope,
-    },
-  });
-
-  cached = { token: res.access_token, scope, expiresAt: now + res.expires_in * 1000 };
-  return res.access_token;
-}
-
-/** Safe-to-print info about the cached token (no token value). */
-export function appTokenInfo(): { scope: string; expiresAt: string } | null {
-  return cached ? { scope: cached.scope, expiresAt: new Date(cached.expiresAt).toISOString() } : null;
-}
-
-/** Forget the cached token (e.g. after a 401). */
-export function clearAppToken(): void {
-  cached = null;
+export function appTokenSource(app: AppClient): () => Promise<string> {
+  let cached: { token: string; expiresAt: number } | null = null;
+  return async () => {
+    const now = Date.now();
+    if (cached && cached.expiresAt - EARLY_REFRESH_MS > now) return cached.token;
+    const res = await hsRequest<TokenResponse>(HUBSPOT_TOKEN_URL, {
+      method: 'POST',
+      form: { grant_type: 'client_credentials', client_id: app.clientId, client_secret: app.clientSecret, scope: JOURNAL_SCOPES },
+    });
+    cached = { token: res.access_token, expiresAt: now + res.expires_in * 1000 };
+    return res.access_token;
+  };
 }

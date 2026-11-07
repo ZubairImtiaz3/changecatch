@@ -2,17 +2,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildLabelOptions,
-  buildObjectTypeOptions,
   formatLabelValues,
   labelOptionValue,
   mergeOptions,
-  NONE,
   otherTypesFor,
   splitValues,
-  UNKNOWN,
   UNLABELED_KEY,
   type LabelSource,
 } from './label-options.js';
+import { buildObjectTypeOptions, NONE, UNKNOWN } from './contract.js';
 
 const UD = 'USER_DEFINED';
 const HD = 'HUBSPOT_DEFINED';

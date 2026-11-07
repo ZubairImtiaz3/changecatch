@@ -5,6 +5,9 @@
 
 export type AssociationAction = 'ASSOCIATION_ADDED' | 'ASSOCIATION_REMOVED';
 
+/** HubSpot's category for its built-in association types (e.g. the unlabeled Deal->Contact default, typeId 3). */
+export const HUBSPOT_DEFINED = 'HUBSPOT_DEFINED';
+
 /** One association event inside a journal file (docs example "Association added"). */
 export interface JournalAssociationEntry {
   type: 'association';
@@ -16,7 +19,7 @@ export interface JournalAssociationEntry {
   fromObjectTypeId: string; // e.g. "0-3" or "2-134027637"
   toObjectTypeId: string;
   associationTypeId: number;
-  /** Docs show "USER_DEFINED"; HUBSPOT_DEFINED and INTEGRATOR_DEFINED are expected but unconfirmed. */
+  /** Seen in real journal data: HUBSPOT_DEFINED and USER_DEFINED (pairing.ts A2). INTEGRATOR_DEFINED is unconfirmed. */
   associationCategory: string;
   isPrimary?: boolean;
 }
@@ -48,6 +51,20 @@ export interface AssociationEntry {
   occurredAtMs: number;
 }
 
+/**
+ * Row codec for a persisted AssociationEntry (pending_pairs / parked_entries entry_json). Plain JSON of the object
+ * above: rows written by older builds must keep decoding, so a field change here needs a migration of those rows.
+ */
+export const encodeEntry = (e: AssociationEntry): string => JSON.stringify(e);
+export const decodeEntry = (json: string): AssociationEntry => JSON.parse(json) as AssociationEntry;
+
+/** One association type (label) of an object pair, as HubSpot defines it. label null = the unlabeled default type. */
+export interface LabelDefinition {
+  associationTypeId: number;
+  label: string | null;
+  category: string;
+}
+
 /** A label reference keeps its own direction because association type IDs are direction-specific. */
 export interface LabelRef {
   fromObjectTypeId: string;
@@ -73,13 +90,13 @@ export interface PairedChange {
   sourceKeys: string[];
   sourceOffsets: string[];
   /**
-   * 'structural' mode only: net count of structural (unlabeled default) events in the cluster. <0 = the link went
-   * away, >0 = a new link, 0 = labels only. Used by late-half absorption (absorb.ts). Undefined in 'label' mode.
+   * Net count of structural (unlabeled default) events in the cluster. <0 = the link went away, >0 = a new link,
+   * 0 = labels only. Used by late-half absorption (absorb.ts).
    */
-  structuralNet?: number;
+  structuralNet: number;
 }
 
-/** A change with label names resolved; this is what becomes app events. */
+/** A change with its label keys resolved; this is what gets stamped (stamp.ts toChangeRecords). */
 export interface NormalizedChange {
   portalId: number;
   changeType: ChangeType;
@@ -97,36 +114,12 @@ export interface NormalizedChange {
    */
   removedLabels?: string[];
   addedLabels?: string[];
-  /** key -> label name, for logs and the app-event mode. */
-  labelNames?: Record<string, string>;
   /** STAMP_MIRROR only: key (from -> to) -> the same label's key in the to -> from direction. */
   mirrorLabelKeys?: Record<string, string>;
   associationCategory: string;
   occurredAt: string;
   sourceOffsets: string[];
   sourceKeys: string[];
-}
-
-export interface AppEventProperties {
-  change_type: ChangeType;
-  other_object_type: string;
-  other_record_id: string;
-  label_before?: string;
-  label_after?: string;
-  labels_current?: string;
-  association_category: string;
-  /** ISO 8601. */
-  occurred_at: string;
-}
-
-export interface AppEventOccurrence {
-  /** Deterministic id (same journal input -> same id). Used to skip re-sends after a crash. */
-  id: string;
-  portalId: number;
-  objectTypeId: string;
-  objectId: string;
-  occurredAt: string;
-  properties: AppEventProperties;
 }
 
 /** A watched object pair from portal settings. Direction-insensitive. */

@@ -2,20 +2,15 @@
 // Only NAMES are configured; the type IDs are always looked up in the portal at runtime (labels API), so nothing
 // portal-specific is hard-coded.
 //
-// Names: --labels "A,B,C" (comma-separated), else CHANGECATCH_TEST_LABELS, else the three names below.
+// Names: --labels "A,B,C" (comma-separated), else config.tools.testLabels (CHANGECATCH_TEST_LABELS), else the three below.
 // The e2e check uses the first two, the load test all three. They must exist as Deal->Contact labels in the portal.
 
 import { type Args, list } from './cli.js';
 
 export const DEFAULT_TEST_LABELS = ['Influencer', 'Decision maker', 'Billing contact'];
 
-export function testLabelNames(args: Args, needed: number): string[] {
-  const names =
-    list(args, 'labels') ??
-    process.env.CHANGECATCH_TEST_LABELS?.split(',')
-      .map((s) => s.trim())
-      .filter(Boolean) ??
-    DEFAULT_TEST_LABELS;
+export function testLabelNames(args: Args, needed: number, configured: string[] | undefined): string[] {
+  const names = list(args, 'labels') ?? configured ?? DEFAULT_TEST_LABELS;
   if (new Set(names).size < needed) throw new Error(`Need ${needed} different label names (--labels "A,B${needed > 2 ? ',C' : ''}"), got: ${names.join(', ')}`);
   return names.slice(0, needed);
 }

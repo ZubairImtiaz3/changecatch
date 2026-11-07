@@ -8,108 +8,72 @@
 //
 // Loop timing (latency work 2026-10-30, target: stamped ~10 s after occurredAt):
 //  - read the journal every JOURNAL_POLL_MS (3 s); a full batch re-reads at once; failures back off
-//    exponentially (JOURNAL_ERROR_BASE_MS .. JOURNAL_ERROR_MAX_MS), separately from polling.
+//    exponentially (5 s .. 2 min, DEFAULT_DELAY_CONFIG), separately from polling.
 //  - the loop sleeps until the EARLIEST of: next poll, the earliest pairing-hold deadline (runOnce's
 //    nextReleaseAt), and the stamp queue's next due time. A due stamp is sent on that wake-up without a read.
 //
-// Wiring done in createWorkerFromEnv (one source of truth each):
-//  - tokens:        install work's encrypted per-portal tokens (PortalStore + PortalTokenProvider), via
-//                   workerTokenProvider. No .env token fallback.
-//  - watched pairs: portal_settings (written by the settings page / installer; read by Store.getWatchedPairs).
-//  - spacing:       portals.stamp_spacing_seconds (settings page). STAMP_SPACING_MS only for portals without a row.
-//  - label options: onUnknownLabel -> syncLabelOptions (hooks.ts).
-//  - lifecycle:     APP_LIFECYCLE_EVENT -> handleLifecycleEvent (hooks.ts) wrapped in LifecycleRetry: a failure is
-//                   persisted + retried with back-off; it never holds the shared offset (C2).
-//  - parking:       a portal whose label lookup is held is parked (capped per portal, PARK_MAX_PER_PORTAL); the offset
-//                   moves on for the others.
-//  - stamping:      StampQueue: coalescing (COALESCE_MODE), fair round-robin drain across portals (H3), per-record
-//                   retries, dead letters, revoked-token pauses (7 days -> uninstall routine).
-//  - single worker: worker_lock row + heartbeat; a second worker refuses to start (WORKER_LOCK_STALE_MS, 30 s).
-//  - monitoring:    src/obs metrics -> /health (JSON) and /metrics (Prometheus). Per-portal detail needs x-health-token.
-//                   JSON logs (LOG_LEVEL / LOG_FORMAT); `[ALERT]` lines -> level error, event alert, error reporter.
-//                   Heartbeat (HEARTBEAT_URL): ok after successful reads (<= 1/min), /fail while stale.
-//                   Errors (SENTRY_DSN optional): unexpected run failures, alerts, crashes; flushed on shutdown.
-//                   HTTP metrics: instrumentFetch counts every HubSpot request / error / 429.
+// What the worker is wired to (tokens, watched pairs, labels, lifecycle, stamp queue, lock, monitoring): buildWorker
+// and main() below; docs/architecture.md and docs/observability.md.
 
 import type { Server } from 'node:http';
 import { resolve } from 'node:path';
-import { DEFAULT_RESOLVE_CONFIG } from '../core/resolve.js';
 import { pathToFileURL } from 'node:url';
-import { dbPath } from '../lib/env.js';
-import { StoreLabelCache, type LabelCache } from '../core/labels.js';
-import { pairingConfigFromEnv } from '../core/pairing.js';
-import { DEFAULT_STAMP_CONFIG } from '../core/stamp.js';
-import {
-  DEFAULT_DELAY_CONFIG,
-  delayAfter,
-  delayConfigFromEnv,
-  runOnce,
-  STALE_AFTER_MS,
-  type DelayConfig,
-  type RunConfig,
-  type RunDeps,
-  type RunResult,
-} from '../core/poller.js';
-import type { JournalEvent } from '../core/types.js';
+import { DEFAULT_PAIRING_CONFIG } from '../core/pairing.js';
+import { LabelHoldError, type LabelCache, type LabelFetcher } from '../core/labels.js';
+import { runOnce, type RunConfig, type RunDeps, type RunResult } from '../core/poller.js';
 import { listLabels } from '../hubspot/labels.js';
-import { Installer } from '../install/installer.js';
-import { PortalTokenProvider } from '../install/token-provider.js';
-import { HttpError } from '../lib/http.js';
-import { rateLimiterStats } from '../lib/rate-limiter.js';
-import { coalesceOptionsFromEnv } from '../core/coalesce.js';
+import { journalClient } from '../hubspot/journal.js';
+import { refreshAccessToken } from '../hubspot/oauth.js';
+import { PortalTokenProvider, withPortalToken, type TokenProvider } from '../hubspot/portal-tokens.js';
+import { sendStampBatches, type StampSendDeps } from '../hubspot/stamp.js';
+import { createLabelOptionSync, type SyncLabelOptions } from '../hubspot/properties.js';
+import { portalPairs } from '../core/pairs.js';
+import { uninstallPortal } from '../hubspot/app-lifecycle.js';
+import type { SubscriptionApi } from '../hubspot/journal.js';
+import { startProcess } from '../lib/process.js';
+import { getRateLimiter } from '../lib/rate-limiter.js';
+import { loadConfig, type Config, type WorkerConfig } from '../lib/config.js';
 import { ChangeCatchMetrics } from '../obs/metrics.js';
 import { createLogger, type Logger } from '../obs/log.js';
-import { errors as globalErrors, initErrorReporting, installProcessHandlers, type Errors } from '../obs/errors.js';
 import { Heartbeat } from '../obs/heartbeat.js';
-import { instrumentFetch, legacyLog, type LegacyLog } from '../obs/wiring.js';
-import { portalIdForToken } from '../lib/rate-limiter.js';
 import { Store } from '../store/db.js';
 import { PortalStore } from '../store/portals.js';
-import { makeLabelOptionSync, makeLifecycleHook } from './hooks.js';
+import { makeLabelOptionSync } from './hooks.js';
 import { healthSnapshot, registerWorkerGauges, StaleAlerter, startHealthServer } from './health.js';
-import { LifecycleRetry, syntheticUninstall } from './lifecycle-retry.js';
-import { WorkerLockError, WorkerTables } from './worker-tables.js';
-import type { LatencyStats } from './latency.js';
-import { makeJournalReader, realJournalApi, type JournalApi } from './journal-reader.js';
-import { GuardedLabelCache, LabelHoldError, type UnknownLabelHook } from './label-guard.js';
-import { DEFAULT_PAUSE_MAX_MS, DEFAULT_RETRY_WINDOW_MS, StampQueue, StampSendError } from './stamp-queue.js';
-import { workerTokenProvider, type TokenProvider } from './tokens.js';
+import { Lifecycle } from './lifecycle.js';
+import { WorkerLockError } from '../store/worker.js';
+import { journalApiFor, makeJournalReader } from './journal-reader.js';
+import { GuardedLabelCache } from './label-guard.js';
+import { STAMP_PORTAL_CONCURRENCY, StampQueue } from './stamp-queue.js';
+import { DEFAULT_DELAY_CONFIG, errorDelayMs, nextDelayMs, type DelayConfig } from './schedule.js';
 
-/** `(level, msg, event?, fields?)`. Plain `(level, msg)` callbacks (tests) still fit. */
-type Log = LegacyLog;
+/** A second worker refuses to start while the lock heartbeat is newer than this. */
+export const WORKER_LOCK_STALE_MS = 30_000;
+
+/** Longest single sleep, so the stale alert is re-checked even when idle. */
+const MAX_SLEEP_MS = 60_000;
+
 const rootLogger: Logger = createLogger('worker');
-const defaultLog: Log = legacyLog(rootLogger);
 
 export interface WorkerDeps {
   store: Store;
   readJournal: RunDeps['readJournal'];
   /** Label lookups for pairing + names. Use a GuardedLabelCache so failures HOLD the batch. */
   labels: LabelCache;
+  /** RunDeps.watchedPairs: buildWorker passes the ACTIVE pairs (core/pairs.ts portalPairs). */
+  watchedPairs: RunDeps['watchedPairs'];
   queue: StampQueue;
-  now?: () => number;
-  delay?: DelayConfig;
-  runConfig?: Partial<RunConfig>;
-  /** Non-association journal events (e.g. app install/uninstall). Hook for the install work. */
-  onOtherEvent?: RunDeps['onOtherEvent'];
-  /** Per-portal parking (RunDeps.isParkable). createWorkerFromEnv passes `e instanceof LabelHoldError`. */
-  isParkable?: RunDeps['isParkable'];
-  alerter?: StaleAlerter;
-  staleAfterMs?: number;
-  /** Longest single sleep, so the stale alert is re-checked even when idle. */
-  maxSleepMs?: number;
-  log?: Log;
-  verbose?: boolean;
-  /** Injected for fake-clock tests. Default: a real, stop()-interruptible setTimeout sleep. */
+  now: () => number;
+  delay: DelayConfig;
+  runConfig: Partial<RunConfig>;
+  log: Logger;
+  /** Injected for fake-clock tests. Unset: a real, stop()-interruptible setTimeout sleep. */
   sleep?: (ms: number) => Promise<void>;
-  /** Persisted lifecycle retries. When set, onOtherEvent is wrapped so a lifecycle failure never holds the offset. */
-  lifecycleRetry?: LifecycleRetry;
-  metrics?: ChangeCatchMetrics;
-  /** Worker lock heartbeat (set when main() holds the lock). Returns false if another worker took over. */
-  heartbeat?: () => boolean;
+  /** App install/uninstall events from the journal, and retries of failed uninstall cleanups. */
+  lifecycle: Pick<Lifecycle, 'onOtherEvent' | 'runDue' | 'nextDueAt'>;
+  metrics: ChangeCatchMetrics;
   /** External dead-man's switch (HEARTBEAT_URL): ok() after each successful read, fail() while stale. */
   pulse?: Pick<Heartbeat, 'ok' | 'fail'>;
-  /** Error reporter for unexpected failures. Default: the process-wide `errors` (log backend unless Sentry is on). */
-  errors?: Pick<Errors, 'capture'>;
 }
 
 export class Worker {
@@ -118,21 +82,22 @@ export class Worker {
   private wake: (() => void) | null = null;
   private loop: Promise<void> | null = null;
   private nextReadAt = 0;
+  /** Failed journal runs in a row (error back-off). In memory: a restart starts the back-off afresh. */
+  private failedRuns = 0;
   private readonly now: () => number;
-  private readonly log: Log;
+  private readonly log: Logger;
   private readonly alerter: StaleAlerter;
-  private readonly errors: Pick<Errors, 'capture'>;
 
   constructor(private deps: WorkerDeps) {
-    this.now = deps.now ?? Date.now;
-    this.log = deps.log ?? defaultLog;
-    this.errors = deps.errors ?? globalErrors;
-    this.alerter = deps.alerter ?? new StaleAlerter(undefined, (m) => this.log('error', m));
+    this.now = deps.now;
+    this.log = deps.log;
+    this.alerter = new StaleAlerter(this.log.child({ component: 'health' }));
     this.startedAt = this.now();
   }
 
-  get isStopping(): boolean {
-    return this.stopping;
+  /** Failed journal runs in a row (error back-off, /health). In memory: a restart starts the back-off afresh. */
+  get consecutiveErrors(): number {
+    return this.failedRuns;
   }
 
   /** One journal iteration (read -> ... -> stamp -> persist offset). Returns null if it failed. */
@@ -142,28 +107,26 @@ export class Worker {
     try {
       result = await runOnce({
         readJournal: this.deps.readJournal,
-        sendStamps: (updates, onDelivered) => this.deps.queue.sendStamps(updates, onDelivered),
+        enqueueStamps: (updates) => this.deps.queue.enqueue(updates),
         store,
         labels: this.deps.labels,
+        watchedPairs: this.deps.watchedPairs,
         now: this.now,
-        onOtherEvent: this.deps.lifecycleRetry?.onOtherEvent ?? this.deps.onOtherEvent,
-        isParkable: this.deps.isParkable,
-        log: (msg) => this.log('info', msg, 'poller'),
-        alert: (msg) => this.log('error', msg, 'alert'),
-        config: { ...this.deps.runConfig, deliveryMode: 'stamp' },
+        onOtherEvent: this.deps.lifecycle.onOtherEvent,
+        log: this.log.child({ component: 'poller' }),
+        config: this.deps.runConfig,
       });
-      if (result.eventsRead > 0 || this.deps.verbose) {
-        const queued = store.queueSize();
-        this.log(
-          'info',
-          `read ${result.eventsRead} event(s) -> ${result.changesEmitted} change(s), ${result.occurrencesSent} stamped now, ` +
-            `${queued} queued, ${result.pending} event(s) held for pairing (saved with the offset); offset ${result.offset ?? '(none)'}`,
+      if (result.eventsRead > 0) {
+        const queued = store.stamps.queueSize();
+        this.log.info(
           'journal_read',
+          `read ${result.eventsRead} event(s) -> ${result.changesEmitted} change(s), ${result.delivered} settled now (sent or coalesced), ` +
+            `${queued} queued, ${result.pending} event(s) held for pairing (saved with the offset); offset ${result.offset ?? '(none)'}`,
           {
             files: result.filesRead,
             events: result.eventsRead,
             changes: result.changesEmitted,
-            stampedNow: result.occurrencesSent,
+            delivered: result.delivered,
             queued,
             pending: result.pending,
             offset: result.offset ?? null,
@@ -171,38 +134,42 @@ export class Worker {
         );
       }
       const m = this.deps.metrics;
-      if (m) {
-        m.journalRunOk({
-          files: result.filesRead,
-          events: result.eventsRead,
-          newestOccurredAtMs: result.newestOccurredAtMs,
-          caughtUp: !result.batchFull,
-          offset: result.offset ?? null,
-          offsetSaved: result.offset != null,
+      if (result.coalesced) {
+        this.log.child({ component: 'stamp' }).info('stamps_coalesced', `coalesced ${result.coalesced} stamp(s) into later ones (bursts on the same record; all kept in change_log)`, {
+          n: result.coalesced,
         });
-        for (const [p, n] of result.changesByPortal) m.changesProcessed(p, n);
-        for (const [p, n] of result.parkDroppedByPortal) m.dataLoss('park_dropped', n, p);
+        m.stampsCoalesced(result.coalesced);
       }
+      m.journalRunOk({
+        files: result.filesRead,
+        events: result.eventsRead,
+        newestOccurredAtMs: result.newestOccurredAtMs,
+        caughtUp: !result.batchFull,
+        offset: result.offset ?? null,
+        offsetSaved: result.offset != null,
+      });
+      for (const [p, n] of result.changesByPortal) m.changesProcessed(p, n);
+      for (const [p, n] of result.parkDroppedByPortal) m.dataLoss('park_dropped', n, p);
+      this.failedRuns = 0;
       void this.deps.pulse?.ok();
       if (result.parkedPortals.length)
-        this.log('warn', `${result.parked} entries PARKED for portal(s) ${result.parkedPortals.join(', ')} (label lookup held; retried every run)`, 'entries_parked', {
+        this.log.warn('entries_parked', `${result.parked} entries PARKED for portal(s) ${result.parkedPortals.join(', ')} (label lookup held; retried every run)`, {
           parked: result.parked,
           portals: result.parkedPortals,
         });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      // http_errors is counted per HTTP response by instrumentFetch, so not here (no double counting).
-      this.deps.metrics?.journalRunFailed();
-      // Held labels and unfinished stamp batches are expected states: log them, don't report them.
-      if (e instanceof LabelHoldError) this.log('warn', `batch HELD (offset not saved): ${msg}`, 'batch_held');
-      else if (e instanceof StampSendError) this.log('warn', `batch not finished (offset not saved): ${msg}`, 'batch_unfinished');
-      else {
-        this.log('error', `journal run failed (offset not saved): ${msg}`, 'journal_run_failed', { error: e });
-        this.errors.capture(e, { component: 'worker', op: 'journal_run' });
-      }
+      this.failedRuns++;
+      store.journal.recordError(msg, this.now());
+      // http_errors is counted per HTTP response in src/lib/http.ts, so not here (no double counting).
+      this.deps.metrics.journalRunFailed();
+      // Held labels are an expected state: log them, don't report them.
+      if (e instanceof LabelHoldError) this.log.warn('batch_held', `batch HELD (offset not saved): ${msg}`);
+      else this.log.error('journal_run_failed', `journal run failed (offset not saved): ${msg}`, { error: e });
     }
     const t = this.now();
-    this.nextReadAt = t + delayAfter(store, result, this.deps.delay ?? DEFAULT_DELAY_CONFIG);
+    const delay = this.deps.delay;
+    this.nextReadAt = t + (result ? nextDelayMs(result.batchFull, delay) : errorDelayMs(this.failedRuns, delay));
     // Wake up exactly when a held pairing cluster can be released (never on a failed run: error back-off wins).
     if (result?.nextReleaseAt != null) this.nextReadAt = Math.min(this.nextReadAt, Math.max(t, result.nextReleaseAt));
     return result;
@@ -213,40 +180,28 @@ export class Worker {
     try {
       const r = await this.deps.queue.drain();
       if (r.sent.length || r.dropped.length || r.failed.length)
-        this.log('info', `queue: ${r.sent.length} stamped, ${r.dropped.length} dropped, ${r.failed.length} to retry`, 'queue_drain', {
+        this.log.info('queue_drain', `queue: ${r.sent.length} stamped, ${r.dropped.length} dropped, ${r.failed.length} to retry`, {
           sent: r.sent.length,
           dropped: r.dropped.length,
           failed: r.failed.length,
         });
     } catch (e) {
-      this.log('error', `queue drain failed: ${(e as Error).message}`, 'queue_drain_failed', { error: e });
-      this.errors.capture(e, { component: 'worker', op: 'stamp_drain' });
+      this.log.error('queue_drain_failed', `queue drain failed: ${(e as Error).message}`, { error: e });
     }
-  }
-
-  /** When the next journal read is planned (wall-clock ms). */
-  get nextReadTime(): number {
-    return this.nextReadAt;
   }
 
   /** Retry failed install/uninstall handling that is due. Never throws. */
   async retryLifecycle(): Promise<void> {
     try {
-      await this.deps.lifecycleRetry?.runDue();
+      await this.deps.lifecycle.runDue();
     } catch (e) {
-      this.log('error', `lifecycle retry failed: ${(e as Error).message}`, 'lifecycle_retry_failed', { error: e });
-      this.errors.capture(e, { component: 'worker', op: 'lifecycle_retry' });
+      this.log.error('lifecycle_retry_failed', `lifecycle retry failed: ${(e as Error).message}`, { error: e });
     }
   }
 
   /** When the loop wakes next: min(next read / hold deadline, stamp queue due time, lifecycle retry). */
   nextWakeAt(): number {
-    return Math.min(this.nextReadAt, this.deps.queue.nextDueAt() ?? Infinity, this.deps.lifecycleRetry?.nextDueAt() ?? Infinity);
-  }
-
-  /** p50/p95 end-to-end latency (occurredAt -> stamped) of recent stamps, for /health. */
-  latencyStats(): LatencyStats {
-    return this.deps.queue.latency.stats();
+    return Math.min(this.nextReadAt, this.deps.store.stamps.nextDueAt() ?? Infinity, this.deps.lifecycle.nextDueAt() ?? Infinity);
   }
 
   /** Main loop. Resolves after stop() once the current batch is finished. */
@@ -257,32 +212,25 @@ export class Worker {
 
   private async loopBody(): Promise<void> {
     const { store } = this.deps;
-    const staleAfter = this.deps.staleAfterMs ?? STALE_AFTER_MS;
-    const maxSleep = this.deps.maxSleepMs ?? 60_000;
-    this.log('info', `started; offset ${store.getOffset() ?? '(none: will start from latest)'}, ${store.queueSize()} stamp(s) queued`, 'worker_started', {
-      offset: store.getOffset(),
-      queued: store.queueSize(),
+    this.log.info('worker_started', `started; offset ${store.journal.getOffset() ?? '(none: will start from latest)'}, ${store.stamps.queueSize()} stamp(s) queued`, {
+      offset: store.journal.getOffset(),
+      queued: store.stamps.queueSize(),
     });
     while (!this.stopping) {
-      if (this.deps.heartbeat && !this.deps.heartbeat()) {
-        this.log('error', '[ALERT] another worker took over the worker lock; stopping this one');
-        this.stopping = true;
-        break;
-      }
       if (this.now() >= this.nextReadAt) await this.readOnce();
       if (this.stopping) break;
       await this.drainQueue();
       await this.retryLifecycle();
-      // Stale (no successful read for STALE_AFTER_MS): the alerter logs the [ALERT] (-> error reporter) every 15 min;
+      // Stale (no successful read for 1 h, worker/health.ts STALE_AFTER_MS): the alerter sends alert "worker_stale" every 15 min;
       // the heartbeat /fail ping is throttled by Heartbeat itself (state changes at once, repeats <= 1/min).
-      if (this.alerter.check(store, this.now(), staleAfter)) void this.deps.pulse?.fail('no successful journal read for 1 h');
+      if (this.alerter.check(store, this.now())) void this.deps.pulse?.fail('no successful journal read for 1 h');
       if (this.stopping) break;
-      const ms = Math.max(0, Math.min(maxSleep, this.nextWakeAt() - this.now()));
+      const ms = Math.max(0, Math.min(MAX_SLEEP_MS, this.nextWakeAt() - this.now()));
       if (ms > 0) await (this.deps.sleep ? this.deps.sleep(ms) : this.sleep(ms));
     }
-    this.log('info', `stopped; offset ${store.getOffset() ?? '(none)'}, ${store.queueSize()} stamp(s) left in the queue for next start`, 'worker_stopped', {
-      offset: store.getOffset(),
-      queued: store.queueSize(),
+    this.log.info('worker_stopped', `stopped; offset ${store.journal.getOffset() ?? '(none)'}, ${store.stamps.queueSize()} stamp(s) left in the queue for next start`, {
+      offset: store.journal.getOffset(),
+      queued: store.stamps.queueSize(),
     });
   }
 
@@ -308,225 +256,197 @@ export class Worker {
   }
 }
 
-// ---------------------------------------------------------------- wiring from env
+// ---------------------------------------------------------------- wiring
 
-export interface WorkerFromEnvOptions {
-  env?: NodeJS.ProcessEnv;
-  store?: Store;
-  /** Install state + encrypted tokens + spacing. Default: new PortalStore on the same DB_PATH. */
-  portals?: PortalStore;
-  /** Per-portal OAuth tokens. Default: workerTokenProvider (encrypted per-portal tokens from the install flow). */
-  tokens?: TokenProvider;
-  /** Used by the lifecycle hook. Default: new Installer on `portals`. */
-  installer?: Pick<Installer, 'uninstall' | 'provision'>;
-  /** Called when a new association label shows up, BEFORE it is stamped. Default: syncLabelOptions (hooks.ts). */
-  onUnknownLabel?: UnknownLabelHook;
-  onOtherEvent?: (event: JournalEvent, fileOffset: string) => Promise<void> | void;
-  journalApi?: JournalApi;
-  metrics?: ChangeCatchMetrics;
-  /** Legacy callback for all components (tests). Default: structured JSON logger children per component. */
-  log?: Log;
-  /** Root structured logger. Default: createLogger('worker'). Ignored when `log` is set. */
-  logger?: Logger;
-  /** Error reporter. Default: the process-wide `errors`. */
-  errors?: Errors;
-  /** Heartbeat (HEARTBEAT_URL). Default: none here; main() creates one. */
+/** What the worker talks to. createWorker passes the real ones; tests pass fakes for HubSpot and the clock. */
+export interface WorkerParts {
+  store: Store;
+  /** Install state, watched pairs, spacing (same database file as `store`). */
+  portals: PortalStore;
+  tokens: TokenProvider;
+  /** Journal subscriptions, for the uninstall cleanup in HubSpot. */
+  subscriptions: Pick<SubscriptionApi, 'deletePortalSubscriptions'>;
+  readJournal: RunDeps['readJournal'];
+  /** Label definitions of one pair (createWorker: HubSpot, with the portal's token). */
+  fetchLabels: LabelFetcher;
+  /** Dropdown option sync (hooks.ts makeLabelOptionSync runs it). Production: createLabelOptionSync(). */
+  syncLabels: SyncLabelOptions;
+  /** CRM batch update. Default: the real HubSpot call. */
+  batchUpdate?: StampSendDeps['batchUpdate'];
+  metrics: ChangeCatchMetrics;
+  /** Root logger; each component gets a child. */
+  log: Logger;
   pulse?: Pick<Heartbeat, 'ok' | 'fail'>;
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
 }
 
-export function createWorkerFromEnv(opts: WorkerFromEnvOptions = {}): {
-  worker: Worker;
-  store: Store;
-  portals: PortalStore;
-  tables: WorkerTables;
-  metrics: ChangeCatchMetrics;
-} {
-  const env = opts.env ?? process.env;
-  const errs = opts.errors ?? globalErrors;
-  const root = opts.logger ?? rootLogger;
-  // One structured child logger per component; a caller-supplied legacy callback gets the old "[component] " prefix.
-  const logFor = (component: string): Log =>
-    opts.log ? (level, msg, event, fields) => opts.log!(level, `[${component}] ${msg}`, event, fields) : legacyLog(root.child({ component }), { errors: errs });
-  const log: Log = opts.log ?? legacyLog(root, { errors: errs });
-  for (const k of ['HUBSPOT_CLIENT_ID', 'HUBSPOT_CLIENT_SECRET']) if (!env[k]) throw new Error(`Missing env var ${k}. See .env.example.`);
-  if (!opts.portals && !env.TOKEN_ENC_KEYS && !env.TOKEN_ENC_KEY)
-    throw new Error('Missing env var TOKEN_ENC_KEYS (or legacy TOKEN_ENC_KEY); same value as the app server. See .env.example.');
+/** The worker's wiring: production (createWorker) and the tests both build the worker here. */
+export function buildWorker(
+  config: WorkerConfig,
+  parts: WorkerParts,
+): { worker: Worker; queue: StampQueue; lifecycle: Lifecycle; labels: GuardedLabelCache } {
+  const { store, portals, tokens, metrics, now } = parts;
+  const logFor = (component: string): Logger => parts.log.child({ component });
+  const mirror = config.stampMirror;
+  // Saved pairs minus custom ones the portal has no custom write for (settings page shows those as inactive).
+  const watchedPairs = (p: number) => portalPairs(portals, p).active;
 
-  const db = dbPath(env.DB_PATH);
-  const store = opts.store ?? new Store(db);
-  const portals = opts.portals ?? new PortalStore({ path: db });
-  const metrics = opts.metrics ?? new ChangeCatchMetrics();
-  const realTokens = new PortalTokenProvider({ store: portals, logger: root.child({ component: 'oauth' }), metrics });
-  const tokens = opts.tokens ?? workerTokenProvider({ portals, real: realTokens });
-  const installer = opts.installer ?? new Installer({ portals, tokens: realTokens, log: (m) => logFor('install')('info', m) });
-
-  const mirror = env.STAMP_MIRROR === '1';
-
-  // Label definitions with the PORTAL's OAuth token (one refresh on 401).
-  const fetchLabels = async (portalId: number, from: string, to: string) => {
-    try {
-      return await listLabels(await tokens.getAccessToken(portalId), from, to);
-    } catch (e) {
-      if (e instanceof HttpError && e.status === 401) return listLabels(await tokens.getAccessToken(portalId, { forceRefresh: true }), from, to);
-      throw e;
-    }
-  };
-  const labels = new GuardedLabelCache(new StoreLabelCache(store, fetchLabels), {
-    store,
-    onUnknownLabel:
-      opts.onUnknownLabel ?? makeLabelOptionSync({ tokens, watchedPairs: (p) => store.getWatchedPairs(p), mirror, log: logFor('labels') }),
-    // Switching mirroring on means the other object type needs options too: announce every label once more.
-    syncScope: mirror ? 'mirror' : undefined,
-    maxHoldMs: numEnv(env.LABEL_MAX_HOLD_MS),
+  const optionSync = makeLabelOptionSync({ tokens, watchedPairs, mirror, sync: parts.syncLabels, log: logFor('labels') });
+  const labels = new GuardedLabelCache({
+    store: store.labels,
+    fetch: parts.fetchLabels,
+    onUnknownLabel: optionSync.onUnknownLabel,
+    mirror,
+    now,
     log: logFor('labels'),
   });
-  const tables = new WorkerTables(store);
-  registerWorkerGauges(metrics, store, tables);
-  const coalesce = coalesceOptionsFromEnv(env);
-  const innerHook =
-    opts.onOtherEvent ??
-    makeLifecycleHook({ installer, portals, store, tables, log: (m) => logFor('lifecycle')('info', m), onPurged: (p) => metrics.forgetPortal(p) });
-  const lifecycleRetry = new LifecycleRetry({
-    tables,
-    store,
-    hook: innerHook,
-    portals,
-    baseMs: numEnv(env.LIFECYCLE_RETRY_BASE_MS),
-    maxMs: numEnv(env.LIFECYCLE_RETRY_MAX_MS),
-    installGraceMs: numEnv(env.LIFECYCLE_INSTALL_GRACE_MS),
-    log: logFor('lifecycle'),
-    onLocalPurge: (p) => {
-      tables.purgePortal(p);
-      metrics.forgetPortal(p);
-    },
-  });
-  // Revocations (src/install/token-provider.ts, table token_revocations): pause the portal; purge after 7 days.
-  const revokedSource = realTokens as unknown as {
-    isRevoked?: (p: number) => boolean;
-    revokedPortals?: () => { portalId: number; revokedAt: number }[];
-  };
+  registerWorkerGauges(metrics, store);
+  const uninstallDeps = { subscriptions: parts.subscriptions, portals, tokens, now: now ?? Date.now, log: logFor('lifecycle') };
+  const lifecycle = new Lifecycle({ uninstall: (p) => uninstallPortal(uninstallDeps, p), portals, store, metrics, now, log: logFor('lifecycle') });
   const queue = new StampQueue({
     store,
-    tokens,
-    tables,
+    revoked: portals,
     metrics,
-    coalesceFor: () => coalesce,
-    drainInline: false, // the loop drains right after each read; a journal read never waits on CRM writes (H3)
-    portalConcurrency: numEnv(env.STAMP_PORTAL_CONCURRENCY),
-    retryWindowMs: numEnv(env.STAMP_RETRY_MAX_MS) ?? DEFAULT_RETRY_WINDOW_MS,
-    pauseMaxMs: numEnv(env.PORTAL_PAUSE_MAX_MS) ?? DEFAULT_PAUSE_MAX_MS,
-    isRevoked: typeof revokedSource.isRevoked === 'function' ? (p) => revokedSource.isRevoked!.call(revokedSource, p) : undefined,
-    revokedPortals:
-      typeof revokedSource.revokedPortals === 'function' ? () => revokedSource.revokedPortals!.call(revokedSource) : undefined,
+    retryWindowMs: config.stampRetryMaxMs,
     // 7 days paused without a reinstall: same routine as an uninstall (HubSpot cleanup + data purge).
-    onPauseExpired: async (p) => {
-      await lifecycleRetry.onOtherEvent(syntheticUninstall(p, Date.now()), 'pause-expired');
+    onPauseExpired: (p) => lifecycle.handleUninstall(p, 'pause expired'),
+    // A stamp refused because a value is not an option: the "announced" markers were wrong. Forget them (the next
+    // event of that object type announces again) and re-sync now, before the retry.
+    onInvalidOption: async (p, objectTypeId) => {
+      store.labels.clearSyncedFor(p, objectTypeId);
+      await optionSync.resync(p, objectTypeId);
     },
-    // Settings page value (portals.stamp_spacing_seconds). Portals without a row use STAMP_SPACING_MS / 3 s.
-    spacingFor: (p) => (portals.getPortal(p) ? portals.getStampSpacingMs(p) : undefined),
-    defaultSpacingMs: numEnv(env.STAMP_SPACING_MS),
+    // Settings page value (portals.stamp_spacing_seconds); its default for portals without a row.
+    spacingFor: (p) => portals.getStampSpacingMs(p),
+    sendBatches: (updates) =>
+      sendStampBatches(updates, { tokens, log: logFor('stamp'), batchUpdate: parts.batchUpdate, concurrency: STAMP_PORTAL_CONCURRENCY }),
+    now,
     log: logFor('stamp'),
-    errors: errs,
-  });
-  const readJournal = makeJournalReader(opts.journalApi ?? realJournalApi, {
-    store,
-    batchSize: numEnv(env.JOURNAL_BATCH_SIZE),
-    skipAfterMs: numEnv(env.JOURNAL_SKIP_FAILED_AFTER_MS),
-    downloadConcurrency: numEnv(env.JOURNAL_DOWNLOAD_CONCURRENCY),
-    offsetMaxAgeMs: numEnv(env.JOURNAL_OFFSET_MAX_AGE_MS),
-    metrics,
-    log: logFor('journal'),
   });
 
   const worker = new Worker({
     store,
-    readJournal,
+    readJournal: parts.readJournal,
     labels,
+    watchedPairs,
     queue,
-    lifecycleRetry,
+    lifecycle,
     metrics,
-    isParkable: (e) => e instanceof LabelHoldError,
-    log,
-    errors: errs,
-    pulse: opts.pulse,
-    verbose: env.WORKER_VERBOSE === '1',
-    delay: delayConfigFromEnv(env),
-    // Spacing is done by the StampQueue (per portal); STAMP_MIRROR=1 also stamps the other record.
+    log: parts.log,
+    pulse: parts.pulse,
+    now: now ?? Date.now,
+    sleep: parts.sleep,
+    delay: { ...DEFAULT_DELAY_CONFIG, pollMs: config.journalPollMs ?? DEFAULT_DELAY_CONFIG.pollMs },
+    // Spacing is done by the StampQueue (per portal).
     runConfig: {
-      stamp: { ...DEFAULT_STAMP_CONFIG, mirrorOnOtherRecord: mirror },
-      // Mirror stamps need each label translated to the other direction's type id (resolve.ts mirrorKeysOf).
-      resolve: { ...DEFAULT_RESOLVE_CONFIG, mirror },
-      pairing: pairingConfigFromEnv(env),
-      ...(numEnv(env.PARK_MAX_PER_PORTAL) !== undefined ? { maxParkedPerPortal: numEnv(env.PARK_MAX_PER_PORTAL) } : {}),
+      mirror,
+      pairing: {
+        ...DEFAULT_PAIRING_CONFIG,
+        windowMs: config.pairingWindowMs ?? DEFAULT_PAIRING_CONFIG.windowMs,
+        splitHoldMs: config.pairingSplitHoldMs ?? DEFAULT_PAIRING_CONFIG.splitHoldMs,
+      },
     },
   });
-  return { worker, store, portals, tables, metrics };
+  return { worker, queue, lifecycle, labels };
 }
 
-function numEnv(v: string | undefined): number | undefined {
-  if (v === undefined || v.trim() === '') return undefined;
-  const n = Number(v);
-  if (!Number.isFinite(n) || n < 0) throw new Error(`Expected a non-negative number, got "${v}"`);
-  return n;
+export interface WorkerOptions {
+  metrics?: ChangeCatchMetrics;
+  /** Root logger; each component gets a child. Default: createLogger('worker'). */
+  log?: Logger;
+  /** Heartbeat (HEARTBEAT_URL). Default: none here; main() creates one. */
+  pulse?: Pick<Heartbeat, 'ok' | 'fail'>;
+}
+
+/** The production worker: the real database, tokens, journal and HubSpot calls, wired by buildWorker. */
+export function createWorker(config: Config, opts: WorkerOptions = {}): {
+  worker: Worker;
+  store: Store;
+  portals: PortalStore;
+  metrics: ChangeCatchMetrics;
+} {
+  const root = opts.log ?? rootLogger;
+  const store = new Store(config.dbPath);
+  const portals = new PortalStore({ db: store.conn, key: config.tokenKey });
+  const metrics = opts.metrics ?? new ChangeCatchMetrics();
+  const journal = journalClient(config.hubspot);
+  const tokens = new PortalTokenProvider({
+    store: portals,
+    refresh: (rt) => refreshAccessToken(config.hubspot, rt),
+    logger: root.child({ component: 'oauth' }),
+    metrics,
+  });
+  const { worker } = buildWorker(config.worker, {
+    store,
+    portals,
+    tokens,
+    subscriptions: journal,
+    readJournal: makeJournalReader(journalApiFor(journal), { store, metrics, log: root.child({ component: 'journal' }) }),
+    // Label definitions with the PORTAL's OAuth token (one refresh on 401).
+    fetchLabels: (portalId, from, to) => withPortalToken(tokens, portalId, (auth) => listLabels(auth, from, to)),
+    syncLabels: createLabelOptionSync(),
+    metrics,
+    log: root,
+    pulse: opts.pulse,
+  });
+  return { worker, store, portals, metrics };
 }
 
 /** Process entry (see the guard at the bottom of this file): health server + signals + loop. */
-export async function main(opts: WorkerFromEnvOptions = {}): Promise<void> {
-  const env = opts.env ?? process.env;
-  const log = opts.log ?? defaultLog;
-  // Errors first, so a crash during start-up is reported too. SENTRY_DSN set but @sentry/node missing = one warning.
-  await initErrorReporting({ env, log: rootLogger.child({ component: 'errors' }) });
-  installProcessHandlers();
-  const pulse = opts.pulse ?? new Heartbeat({ url: env.HEARTBEAT_URL ?? null, log: rootLogger.child({ component: 'heartbeat' }) });
+export async function main(config: Config, opts: WorkerOptions = {}): Promise<void> {
+  const log = opts.log ?? rootLogger;
   const metrics = opts.metrics ?? new ChangeCatchMetrics();
-  // Counts every HubSpot request / error / 429 (http_requests, http_errors, rate_limited) without touching lib/http.
-  const uninstrument = instrumentFetch(metrics, { portalForToken: portalIdForToken });
-  const { worker, store, portals, tables } = createWorkerFromEnv({ ...opts, metrics, pulse });
+  startProcess(config, { log, metrics });
+  const pulse = opts.pulse ?? new Heartbeat({ url: config.worker.heartbeatUrl, log: log.child({ component: 'heartbeat' }) });
+  const { worker, store, portals } = createWorker(config, { ...opts, metrics, pulse });
 
   // Only ONE worker may read the shared journal offset. Refuse to start if another one heartbeated recently.
-  const lockStaleMs = numEnv(env.WORKER_LOCK_STALE_MS) ?? 30_000;
   try {
-    tables.acquireLock(Date.now(), lockStaleMs);
+    store.worker.acquireLock(Date.now(), WORKER_LOCK_STALE_MS);
   } catch (e) {
-    if (e instanceof WorkerLockError) log('error', `[ALERT] refusing to start: ${e.message}`);
+    if (e instanceof WorkerLockError) log.alert('worker_lock_refused', `refusing to start: ${e.message}`);
     store.close();
     portals.close();
-    uninstrument();
-    await globalErrors.flush();
     throw e;
   }
-  metrics.restore({ lastSuccessfulReadAt: store.getLastSuccessfulReadAt(), offset: store.getOffset() });
+  metrics.restore({ lastSuccessfulReadAt: store.journal.getLastSuccessfulReadAt(), offset: store.journal.getOffset() });
   const beat = setInterval(() => {
-    if (!tables.heartbeat(Date.now())) {
-      log('error', '[ALERT] worker lock lost (another worker took over); stopping');
+    if (!store.worker.heartbeat(Date.now())) {
+      log.alert('worker_lock_lost', 'worker lock lost (another worker took over); stopping');
       void worker.stop();
     }
-  }, Math.max(1_000, Math.floor(lockStaleMs / 3)));
+  }, Math.max(1_000, Math.floor(WORKER_LOCK_STALE_MS / 3)));
   beat.unref();
 
-  const port = numEnv(env.WORKER_HEALTH_PORT) ?? 3002;
+  const port = config.worker.healthPort;
   let server: Server | null = null;
   try {
     server = await startHealthServer({
       port,
       metrics,
+      healthToken: config.worker.healthToken,
       snapshot: () =>
-        healthSnapshot(store, Date.now(), worker.startedAt, undefined, worker.latencyStats(), { tables, metrics, rateLimiter: rateLimiterStats }),
+        healthSnapshot(store, Date.now(), {
+          startedAt: worker.startedAt,
+          consecutiveErrors: worker.consecutiveErrors,
+          metrics,
+          rateLimiter: () => getRateLimiter().stats(),
+        }),
     });
-    log('info', `health: http://localhost:${port}/health`, 'health_server', { port });
+    log.info('health_server', `health: http://localhost:${port}/health`, { port });
   } catch (e) {
-    log('error', `health server could not start on port ${port}: ${(e as Error).message} (worker keeps running)`, 'health_server_failed', { port });
+    log.error('health_server_failed', `health server could not start on port ${port}: ${(e as Error).message} (worker keeps running)`, { port });
   }
 
   let signals = 0;
   const onSignal = (sig: string) => {
     signals++;
     if (signals > 1) {
-      log('warn', `${sig} again: exiting now (the offset of an unfinished batch is NOT saved; it will be re-read)`, 'shutdown_forced');
-      void globalErrors.flush(1000).finally(() => process.exit(130));
-      return;
+      log.warn('shutdown_forced', `${sig} again: exiting now (the offset of an unfinished batch is NOT saved; it will be re-read)`);
+      process.exit(130);
     }
-    log('info', `${sig}: finishing the current batch, then stopping (press again to force)`, 'shutdown');
+    log.info('shutdown', `${sig}: finishing the current batch, then stopping (press again to force)`);
     void worker.stop();
   };
   process.on('SIGINT', () => onSignal('SIGINT'));
@@ -534,21 +454,22 @@ export async function main(opts: WorkerFromEnvOptions = {}): Promise<void> {
 
   await worker.run();
   clearInterval(beat);
-  tables.releaseLock();
+  store.worker.releaseLock();
   await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
   store.close();
   portals.close();
-  uninstrument();
-  await globalErrors.flush();
 }
 
 // Run as the process entry point (pnpm start:worker -> tsx src/worker/main.ts). Importing this module (tests, other
 // code) does NOT start the worker.
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  main().catch(async (e) => {
-    rootLogger.error('fatal', `fatal: ${e instanceof Error ? e.message : String(e)}`, { error: e });
-    globalErrors.capture(e, { component: 'worker', op: 'fatal', level: 'fatal' });
-    await globalErrors.flush();
-    process.exit(1);
-  });
+  // Config first: a missing or bad variable exits with one clear error.
+  Promise.resolve()
+    .then(() => {
+      return main(loadConfig('worker'));
+    })
+    .catch(async (e) => {
+      rootLogger.error('fatal', `fatal: ${e instanceof Error ? e.message : String(e)}`, { error: e });
+      process.exit(1);
+    });
 }

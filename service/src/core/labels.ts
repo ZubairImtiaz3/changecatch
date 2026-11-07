@@ -1,6 +1,6 @@
-import type { LabelDefinition, Store } from '../store/db.js';
+import { labelPairKey } from './keys.js';
 import { categoryIsStructural, type StructuralCheck } from './pairing.js';
-import type { AssociationEntry, LabelRef } from './types.js';
+import type { AssociationEntry, LabelDefinition, LabelRef } from './types.js';
 
 /** Fetches all label definitions for one direction of an object pair (e.g. 0-3 -> 0-1). Injected; does HTTP elsewhere. */
 export type LabelFetcher = (portalId: number, fromObjectTypeId: string, toObjectTypeId: string) => Promise<LabelDefinition[]>;
@@ -11,80 +11,26 @@ export interface LabelLookup {
   category: string;
 }
 
+/** Label lookups. The worker's implementation is src/worker/label-guard.ts (store-backed, holds instead of guessing). */
 export interface LabelCache {
-  /** Returns undefined only if the type id is still unknown after a refresh. */
+  /**
+   * undefined = give up on this type id (the caller stamps it as unresolved). Throws LabelHoldError while the name
+   * cannot be known yet: the poller then parks that portal's entries and retries them on the next run.
+   */
   get(portalId: number, fromObjectTypeId: string, toObjectTypeId: string, associationTypeId: number): Promise<LabelLookup | undefined>;
   /**
    * The type id of the label named `label` in the direction from -> to (refreshing once if not cached). Used only to
    * translate a label to the other direction for mirror stamps (type ids are per direction). undefined = no unique match
    * (e.g. a paired label like "Manager"/"Employee", whose two sides have different names).
    */
-  findByName?(portalId: number, fromObjectTypeId: string, toObjectTypeId: string, label: string): Promise<number | undefined>;
+  findByName(portalId: number, fromObjectTypeId: string, toObjectTypeId: string, label: string): Promise<number | undefined>;
 }
 
-export interface LabelCacheConfig {
-  /** Cached rows older than this are refreshed on next use. */
-  ttlMs: number;
-  /** Don't refetch the same pair more often than this when a type id is missing (avoids hammering on deleted labels). */
-  minRefetchMs: number;
-}
-
-export const DEFAULT_LABEL_CACHE_CONFIG: LabelCacheConfig = {
-  ttlMs: 24 * 60 * 60 * 1000,
-  minRefetchMs: 60_000,
-};
-
-/** Label names compared for the mirror translation: trimmed, inner whitespace collapsed (case kept). */
-export const normLabelName = (s: string) => s.trim().replace(/\s+/g, ' ');
-
-export class StoreLabelCache implements LabelCache {
-  private inflight = new Map<string, Promise<void>>();
-
-  constructor(
-    private store: Store,
-    private fetcher: LabelFetcher,
-    private config: LabelCacheConfig = DEFAULT_LABEL_CACHE_CONFIG,
-    private now: () => number = Date.now,
-  ) {}
-
-  async get(portalId: number, fromType: string, toType: string, typeId: number): Promise<LabelLookup | undefined> {
-    const row = this.store.getLabel(portalId, fromType, toType, typeId);
-    const t = this.now();
-    if (row && t - row.fetchedAt < this.config.ttlMs) return { label: row.label, category: row.category };
-
-    const lastFetch = this.store.getLabelsFetchedAt(portalId, fromType, toType);
-    const mayFetch = lastFetch === null || t - lastFetch >= this.config.minRefetchMs;
-    if (mayFetch) await this.refresh(portalId, fromType, toType);
-
-    const fresh = this.store.getLabel(portalId, fromType, toType, typeId);
-    return fresh && { label: fresh.label, category: fresh.category };
-  }
-
-  async findByName(portalId: number, fromType: string, toType: string, label: string): Promise<number | undefined> {
-    const want = normLabelName(label);
-    const match = () => {
-      const hits = this.store.listLabels(portalId, fromType, toType).filter((d) => d.label !== null && normLabelName(d.label) === want);
-      return hits.length === 1 ? hits[0].associationTypeId : undefined;
-    };
-    const hit = match();
-    if (hit !== undefined) return hit;
-    const lastFetch = this.store.getLabelsFetchedAt(portalId, fromType, toType);
-    if (lastFetch !== null && this.now() - lastFetch < this.config.minRefetchMs) return undefined;
-    await this.refresh(portalId, fromType, toType);
-    return match();
-  }
-
-  /** One fetch per pair at a time, even with concurrent callers. */
-  refresh(portalId: number, fromType: string, toType: string): Promise<void> {
-    const k = `${portalId}|${fromType}|${toType}`;
-    let p = this.inflight.get(k);
-    if (!p) {
-      p = this.fetcher(portalId, fromType, toType)
-        .then((defs) => this.store.replaceLabels(portalId, fromType, toType, defs, this.now()))
-        .finally(() => this.inflight.delete(k));
-      this.inflight.set(k, p);
-    }
-    return p;
+/** A label lookup that cannot be answered yet (fetch failed, type id not visible yet, option sync failed). */
+export class LabelHoldError extends Error {
+  constructor(public holdKey: string, detail: string) {
+    super(`Label lookup held (${holdKey}): ${detail}`);
+    this.name = 'LabelHoldError';
   }
 }
 
@@ -95,7 +41,7 @@ export class StoreLabelCache implements LabelCache {
  * use USER_DEFINED for their unlabeled default). Unknown type -> fall back to HUBSPOT_DEFINED.
  */
 export async function buildStructuralCheck(entries: AssociationEntry[], labels: LabelCache): Promise<StructuralCheck> {
-  const keyOf = (portalId: number, r: LabelRef) => `${portalId}|${r.fromObjectTypeId}|${r.toObjectTypeId}|${r.associationTypeId}`;
+  const keyOf = (portalId: number, r: LabelRef) => labelPairKey(portalId, r.fromObjectTypeId, r.toObjectTypeId, r.associationTypeId);
   const known = new Map<string, boolean>();
   const todo = new Map<string, { portalId: number; ref: LabelRef }>();
   for (const { event: e } of entries) {

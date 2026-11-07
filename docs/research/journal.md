@@ -32,7 +32,7 @@ The OpenAPI JSON files listed in `llms.txt` (`/docs/specs/2026-09/webhooks-journ
 - **Current: `2026-09`.** The `latest` docs pages are 2026-09. A `2026-03` copy also exists with the same paths, just with `2026-03` in them. [ENTRIES], https://developers.hubspot.com/docs/api-reference/2026-03/webhooks-journal/journal-entries/guide
 - **`v4` is legacy.** `/webhooks-journal/journal/v4/...` lives under `api-reference/legacy/`. Our rule: no v4 APIs. [LEGACY-V4]
 - The spring 2026 changelog still shows `/webhooks/v4/journal/batch/...` paths. Ignore those; they are the old beta names. [CHANGELOG]
-- Our code uses one constant `JOURNAL_VERSION = '2026-09'` in `service/src/hubspot/journal.ts`, so we can switch it in one place.
+- Our code uses one constant `HUBSPOT_API_VERSION = '2026-09'` in `service/src/lib/http.ts` for every HubSpot API, so we can switch it in one place.
 
 ## 2. Auth: client credentials token
 

@@ -92,7 +92,7 @@ This is the reasoning behind decision D3 (custom-object scopes). Summary of the 
 ]
 ```
 
-### 4.2 Install flow (`CUSTOM_WRITE_MODE`, default `conditional`)
+### 4.2 Install flow
 
 1. **Normal install** (Marketplace "Seamless install" or our own `/install` link). The URL has `scope` = required and `optional_scope` = the 2 custom read scopes.
    - On **Pro or free**, the read scopes are dropped and the install succeeds. The app works for Contacts, Companies and Deals.
@@ -103,9 +103,9 @@ This is the reasoning behind decision D3 (custom-object scopes). Summary of the 
 3. The new token is saved, replacing the old refresh token. We then create the `changecatch_*` properties on the chosen custom objects.
 4. **If the portal can't grant custom write** (app governance, or the user lacks permission), the custom-object pairs stay disabled with a clear message, including the super-admin approval steps. Standard objects keep working.
 
-`CUSTOM_WRITE_MODE=optional` puts the custom write scopes in `optional_scope` on the first screen instead. It is kept for testing on portals without app governance. See [../configuration.md](../configuration.md) and [../install-flow.md](../install-flow.md).
+Putting the custom write scopes in `optional_scope` on the first screen was tested and dropped (HubSpot never granted them). See [../install-flow.md](../install-flow.md).
 
-Code: `service/src/hubspot/oauth.ts` (authorize URL), `service/src/install/scopes.ts` (which list each scope goes in), `service/src/install/installer.ts` (only creates custom-object properties when the custom write scopes are in `portals.scopes`). Token calls use the date-based endpoint `/oauth/2026-09/token`, not OAuth v1.
+Code: `service/src/install/oauth-flow.ts` (authorize URL), `service/src/install/scopes.ts` (which list each scope goes in), `service/src/install/installer.ts` (only creates custom-object properties when the custom write scopes are in `portals.scopes`). Token calls use the date-based endpoint `/oauth/2026-09/token`, not OAuth v1.
 
 ### 4.3 Why not the other options
 

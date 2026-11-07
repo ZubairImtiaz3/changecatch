@@ -1,15 +1,16 @@
 // Typed client for the Webhooks Journal + journal subscription APIs.
 // All calls use the APP-LEVEL client credentials token (see auth.ts), never a customer token.
 //
-// Version: 2026-09 (current "latest" docs as of 2026-10-30). v4 paths are legacy; do not use.
+// Version: HUBSPOT_API_VERSION (2026-09, current "latest" docs as of 2026-10-30). v4 paths are legacy; do not use.
 
-import type { JournalFile } from '../core/types.js';
-import { hsRequest, HttpError } from '../lib/http.js';
-import { getAppToken } from './auth.js';
+import { backoffMs } from '../lib/backoff.js';
+import { HUBSPOT_API_VERSION, hsFetch, hsRequest, HubSpotError } from '../lib/http.js';
+import type { AppBucket } from '../lib/rate-limiter.js';
+import { appTokenSource } from './auth.js';
+import type { AppClient } from './oauth.js';
 
-export const JOURNAL_VERSION = '2026-09';
-const SUBS = `/webhooks-journal/subscriptions/${JOURNAL_VERSION}`;
-const JOURNAL = `/webhooks-journal/journal/${JOURNAL_VERSION}`;
+const SUBS = `/webhooks-journal/subscriptions/${HUBSPOT_API_VERSION}`;
+const JOURNAL = `/webhooks-journal/journal/${HUBSPOT_API_VERSION}`;
 
 /** Max entries per batch call. More returns 400 VALIDATION_ERROR. */
 export const MAX_BATCH = 100;
@@ -38,22 +39,19 @@ export interface AssociationSubscriptionRequest {
 /** AppLifecycleEventSubscriptionUpsertRequest. App-level: no portalId. */
 export interface AppLifecycleSubscriptionRequest {
   subscriptionType: 'APP_LIFECYCLE_EVENT';
-  eventTypeId: string; // see APP_EVENT_TYPE
+  eventTypeId: string; // see app-lifecycle.ts APP_EVENT_TYPE
   properties: string[];
 }
 
 export type SubscriptionRequest = AssociationSubscriptionRequest | AppLifecycleSubscriptionRequest;
-
-export const APP_EVENT_TYPE = {
-  INSTALL: '4-1909196',
-  UNINSTALL: '4-1916193',
-} as const;
 
 export interface Subscription {
   id: number;
   appId: number;
   subscriptionType: SubscriptionType;
   objectTypeId?: string;
+  /** APP_LIFECYCLE_EVENT subscriptions: the event type (app-lifecycle.ts APP_EVENT_TYPE), set by normaliseSubscription. */
+  eventTypeId?: string;
   portalId?: number;
   actions: JournalAction[];
   associatedObjectTypeIds?: string[];
@@ -65,6 +63,23 @@ export interface Subscription {
   updatedAt: string;
   deletedAt?: string | null;
   [k: string]: unknown;
+}
+
+/** The subscription part of the journal client (journalClient below), or a test fake. */
+export interface SubscriptionApi {
+  listSubscriptions(): Promise<Subscription[]>;
+  createSubscription(body: SubscriptionRequest): Promise<Subscription>;
+  deleteSubscription(id: number): Promise<void>;
+  deletePortalSubscriptions(portalId: number): Promise<void>;
+}
+
+/**
+ * HubSpot's list returns a lifecycle subscription's event type in `objectTypeId` (e.g. "4-1909196", seen live), even
+ * though the create request calls it `eventTypeId`. We always expose it as `eventTypeId`.
+ */
+export function normaliseSubscription(s: Subscription): Subscription {
+  if (s.subscriptionType !== 'APP_LIFECYCLE_EVENT' || s.eventTypeId) return s;
+  return { ...s, eventTypeId: s.objectTypeId };
 }
 
 /** What every journal read returns: a pre-signed file URL, not the events. */
@@ -91,192 +106,152 @@ export interface JournalBatchResponse {
   errors?: JournalBatchError[];
 }
 
-// ---------------------------------------------------------------- helpers
-
-async function call<T>(path: string, opts: { method?: string; body?: unknown; query?: Record<string, string | number | undefined> } = {}): Promise<T> {
-  const token = await getAppToken();
-  return hsRequest<T>(path, { ...opts, token });
-}
-
-function portalQuery(installPortalId?: number) {
-  return installPortalId === undefined ? undefined : { installPortalId };
-}
+// ---------------------------------------------------------------- client
 
 function clampCount(count: number): number {
   return Math.max(1, Math.min(MAX_BATCH, Math.floor(count)));
 }
 
-/**
- * The docs do not say how "nothing new" is signalled for single reads.
- * We treat 204 / empty body / 404 as "no entry".
- */
-async function single(path: string, installPortalId?: number): Promise<JournalFetchResponse | null> {
-  try {
-    const res = await call<JournalFetchResponse | undefined>(path, { query: portalQuery(installPortalId) });
-    return res && typeof res === 'object' && res.url ? res : null;
-  } catch (e) {
-    if (e instanceof HttpError && e.status === 404) return null;
-    throw e;
+export type JournalClient = ReturnType<typeof journalClient>;
+
+export function journalClient(app: AppClient) {
+  const appToken = appTokenSource(app);
+  async function call<T>(bucket: AppBucket, path: string, opts: { method?: string; body?: unknown } = {}): Promise<T> {
+    return hsRequest<T>(path, { ...opts, bucket, token: await appToken() });
   }
-}
+  /**
+   * The docs do not say how "nothing new" is signalled for single reads.
+   * We treat 204 / empty body / 404 as "no entry".
+   */
+  async function single(path: string): Promise<JournalFetchResponse | null> {
+    try {
+      const res = await call<JournalFetchResponse | undefined>('journal', path);
+      return res && typeof res === 'object' && res.url ? res : null;
+    } catch (e) {
+      if (e instanceof HubSpotError && e.status === 404) return null;
+      throw e;
+    }
+  }
 
-// ---------------------------------------------------------------- subscriptions
+  return {
+    // ------------------------------------------------------------ subscriptions
 
-// Docs: https://developers.hubspot.com/docs/api-reference/latest/webhooks-journal/subscriptions/create-subscription
-// POST /webhooks-journal/subscriptions/2026-09  (upsert)  scope: developer.webhooks_journal.subscriptions.write
-export function createSubscription(body: SubscriptionRequest): Promise<Subscription> {
-  return call<Subscription>(SUBS, { method: 'POST', body });
-}
+    // Docs: https://developers.hubspot.com/docs/api-reference/latest/webhooks-journal/subscriptions/create-subscription
+    // POST /webhooks-journal/subscriptions/2026-09  (upsert)  scope: developer.webhooks_journal.subscriptions.write
+    createSubscription(body: SubscriptionRequest): Promise<Subscription> {
+      return call<Subscription>('subscriptions', SUBS, { method: 'POST', body });
+    },
 
-/** Convenience: an ASSOCIATION subscription for one portal and one object pair. */
-export function createAssociationSubscription(args: {
-  portalId: number;
-  objectTypeId: string;
-  associatedObjectTypeIds: string[];
-  actions?: ('ASSOCIATION_ADDED' | 'ASSOCIATION_REMOVED')[];
-  objectIds?: number[];
-}): Promise<Subscription> {
-  return createSubscription({
-    subscriptionType: 'ASSOCIATION',
-    portalId: args.portalId,
-    objectTypeId: args.objectTypeId,
-    associatedObjectTypeIds: args.associatedObjectTypeIds,
-    actions: args.actions ?? ['ASSOCIATION_ADDED', 'ASSOCIATION_REMOVED'],
-    objectIds: args.objectIds ?? [],
-  });
-}
+    // Docs: https://developers.hubspot.com/docs/api-reference/latest/webhooks-journal/subscriptions/get-subscriptions
+    // GET /webhooks-journal/subscriptions/2026-09  (no paging)  scope: developer.webhooks_journal.subscriptions.read
+    async listSubscriptions(): Promise<Subscription[]> {
+      const res = await call<{ results: Subscription[] }>('subscriptions', SUBS);
+      return (res?.results ?? []).map(normaliseSubscription);
+    },
 
-// Docs: https://developers.hubspot.com/docs/api-reference/latest/webhooks-journal/subscriptions/get-subscriptions
-// GET /webhooks-journal/subscriptions/2026-09  (no paging)  scope: developer.webhooks_journal.subscriptions.read
-export async function listSubscriptions(): Promise<Subscription[]> {
-  const res = await call<{ results: Subscription[] }>(SUBS);
-  return res?.results ?? [];
-}
+    // Docs: https://developers.hubspot.com/docs/api-reference/latest/webhooks-journal/subscriptions/delete-subscription
+    // DELETE /webhooks-journal/subscriptions/2026-09/{subscriptionId} -> 204  scope: ...subscriptions.write
+    async deleteSubscription(subscriptionId: number | string): Promise<void> {
+      await call<void>('subscriptions', `${SUBS}/${encodeURIComponent(String(subscriptionId))}`, { method: 'DELETE' });
+    },
 
-// Docs: https://developers.hubspot.com/docs/api-reference/latest/webhooks-journal/subscriptions/delete-subscription
-// DELETE /webhooks-journal/subscriptions/2026-09/{subscriptionId} -> 204  scope: ...subscriptions.write
-export async function deleteSubscription(subscriptionId: number | string): Promise<void> {
-  await call<void>(`${SUBS}/${encodeURIComponent(String(subscriptionId))}`, { method: 'DELETE' });
-}
+    // Docs: https://developers.hubspot.com/docs/api-reference/latest/webhooks-journal/subscriptions/delete-subscriptions-by-portal
+    // DELETE /webhooks-journal/subscriptions/2026-09/portals/{portalId} -> 204  scope: ...subscriptions.write
+    async deletePortalSubscriptions(portalId: number): Promise<void> {
+      await call<void>('subscriptions', `${SUBS}/portals/${portalId}`, { method: 'DELETE' });
+    },
 
-// Docs: https://developers.hubspot.com/docs/api-reference/latest/webhooks-journal/subscriptions/delete-subscriptions-by-portal
-// DELETE /webhooks-journal/subscriptions/2026-09/portals/{portalId} -> 204  scope: ...subscriptions.write
-export async function deletePortalSubscriptions(portalId: number): Promise<void> {
-  await call<void>(`${SUBS}/portals/${portalId}`, { method: 'DELETE' });
-}
+    // ------------------------------------------------------------ journal: single reads (global)
+    // Docs: https://developers.hubspot.com/docs/api-reference/latest/webhooks-journal/journal-entries/guide#retrieve-journal-data
+    // scope: developer.webhooks_journal.read.
 
-// ---------------------------------------------------------------- journal: single reads (global)
-// Docs: https://developers.hubspot.com/docs/api-reference/latest/webhooks-journal/journal-entries/guide#retrieve-journal-data
-// scope: developer.webhooks_journal.read. Optional installPortalId filters to one account.
+    /** GET /webhooks-journal/journal/2026-09/earliest */
+    getEarliest: () => single(`${JOURNAL}/earliest`),
 
-/** GET /webhooks-journal/journal/2026-09/earliest */
-export function getEarliest(installPortalId?: number) {
-  return single(`${JOURNAL}/earliest`, installPortalId);
-}
+    /** GET /webhooks-journal/journal/2026-09/latest */
+    getLatest: () => single(`${JOURNAL}/latest`),
 
-/** GET /webhooks-journal/journal/2026-09/latest */
-export function getLatest(installPortalId?: number) {
-  return single(`${JOURNAL}/latest`, installPortalId);
-}
+    // ------------------------------------------------------------ journal: batch reads (global, max 100)
+    // Docs: https://developers.hubspot.com/docs/api-reference/latest/webhooks-journal/journal-entries/guide#batch-journal-operations
+    // Path note: the guide's prose says /webhooks/2026-09/journal/batch/..., but its curl examples and the
+    // OpenAPI reference use /webhooks-journal/journal/2026-09/batch/... We use the latter.
 
-/** GET /webhooks-journal/journal/2026-09/offset/{offset}/next. null = nothing newer (assumed, see single()). */
-export function getNext(offset: string, installPortalId?: number) {
-  return single(`${JOURNAL}/offset/${encodeURIComponent(offset)}/next`, installPortalId);
-}
+    /** GET /webhooks-journal/journal/2026-09/batch/{offset}/next/{count}: entries AFTER offset, in order. */
+    batchNext: (offset: string, count = MAX_BATCH) =>
+      call<JournalBatchResponse>('journal', `${JOURNAL}/batch/${encodeURIComponent(offset)}/next/${clampCount(count)}`),
 
-// ---------------------------------------------------------------- journal: batch reads (global, max 100)
-// Docs: https://developers.hubspot.com/docs/api-reference/latest/webhooks-journal/journal-entries/guide#batch-journal-operations
-// Path note: the guide's prose says /webhooks/2026-09/journal/batch/..., but its curl examples and the
-// OpenAPI reference use /webhooks-journal/journal/2026-09/batch/... We use the latter.
-
-/** GET /webhooks-journal/journal/2026-09/batch/{offset}/next/{count}: entries AFTER offset, in order. */
-export function batchNext(offset: string, count = MAX_BATCH, installPortalId?: number) {
-  return call<JournalBatchResponse>(`${JOURNAL}/batch/${encodeURIComponent(offset)}/next/${clampCount(count)}`, {
-    query: portalQuery(installPortalId),
-  });
-}
-
-/** GET /webhooks-journal/journal/2026-09/batch/earliest/{count} */
-export function batchEarliest(count = MAX_BATCH, installPortalId?: number) {
-  return call<JournalBatchResponse>(`${JOURNAL}/batch/earliest/${clampCount(count)}`, { query: portalQuery(installPortalId) });
-}
-
-/** GET /webhooks-journal/journal/2026-09/batch/latest/{count} */
-export function batchLatest(count = MAX_BATCH, installPortalId?: number) {
-  return call<JournalBatchResponse>(`${JOURNAL}/batch/latest/${clampCount(count)}`, { query: portalQuery(installPortalId) });
-}
-
-// Docs: https://developers.hubspot.com/docs/api-reference/latest/webhooks-journal/journal-entries/aggregate/get-read
-/** POST /webhooks-journal/journal/2026-09/batch/read { inputs: [offset...] }. 207 = partial (see errors[]). */
-export function batchRead(offsets: string[], installPortalId?: number) {
-  if (offsets.length > MAX_BATCH) throw new Error(`batchRead: max ${MAX_BATCH} offsets, got ${offsets.length}`);
-  return call<JournalBatchResponse>(`${JOURNAL}/batch/read`, {
-    method: 'POST',
-    body: { inputs: offsets },
-    query: portalQuery(installPortalId),
-  });
+    /** GET /webhooks-journal/journal/2026-09/batch/earliest/{count} */
+    batchEarliest: (count = MAX_BATCH) => call<JournalBatchResponse>('journal', `${JOURNAL}/batch/earliest/${clampCount(count)}`),
+  };
 }
 
 // ---------------------------------------------------------------- journal file download
+// The presigned URL comes from HubSpot's API, but we still fetch only HubSpot's journal bucket on S3 over https,
+// capped at JOURNAL_MAX_FILE_BYTES. Anything else is a DownloadRejectedError: the reader alerts
+// "journal_file_rejected" and holds the offset (it never skips past a file it did not read).
 
-/**
- * Download the journal file behind a pre-signed URL. No Authorization header: it's a signed S3 link.
- * Docs: https://developers.hubspot.com/docs/api-reference/latest/webhooks-journal/guide#event-data-format
- */
-export async function downloadJournalFile(urlOrFetch: string | JournalFetchResponse): Promise<JournalFile> {
-  const url = typeof urlOrFetch === 'string' ? urlOrFetch : urlOrFetch.url;
-  if (typeof urlOrFetch !== 'string' && Date.parse(urlOrFetch.expiresAt) < Date.now()) {
-    throw new Error(`Journal URL already expired at ${urlOrFetch.expiresAt}; read the offset again.`);
+export const JOURNAL_MAX_FILE_BYTES = 20 * 1024 * 1024;
+const JOURNAL_DOWNLOAD_TIMEOUT_MS = 15_000;
+const DOWNLOAD_RETRIES = 3;
+
+/** A journal file download we refuse: not HubSpot's journal bucket, or over the size cap. Never retried. */
+export class DownloadRejectedError extends Error {
+  constructor(msg: string) {
+    super(msg);
+    this.name = 'DownloadRejectedError';
   }
-  const data = await hsRequest<JournalFile | string>(url);
-  if (typeof data === 'string') throw new Error('Journal file was not JSON');
-  return data;
 }
 
-// ---------------------------------------------------------------- worker-friendly read
-
-export interface JournalReadResult {
-  /** Downloaded files strictly after afterOffset, in the order HubSpot returned them (oldest first). */
-  files: JournalFile[];
-  /** Offset to store once these files are processed (last file's offset). null = nothing new. */
-  nextOffset: string | null;
-  /** True if the batch was full, so more is probably waiting. */
-  full: boolean;
-  /** Raw batch response, for debugging. */
-  raw: JournalBatchResponse;
+/** HubSpot's S3 journal bucket over https, no user info (seen live: hubspot-webhooks-journal-na1.s3.amazonaws.com). */
+function isJournalFileUrl(url: URL): boolean {
+  const host = url.hostname.toLowerCase();
+  return url.protocol === 'https:' && host.startsWith('hubspot-webhooks-journal') && host.endsWith('.amazonaws.com') && !url.username && !url.password;
 }
 
 /**
- * Read up to `count` entries after `afterOffset` (or from the earliest if null) and download each file.
- * Matches the RunDeps.readJournal shape in src/core/poller.ts.
- * Throws if the batch had any per-entry error, so the caller retries instead of skipping data.
+ * Download a presigned journal file as text. Not the journal bucket, or a body over the cap -> DownloadRejectedError.
+ * 5xx / network / timeout (a redirect counts as a network error) are retried with back-off. Presigned S3 URLs are
+ * not rate limited by HubSpot.
  */
-export async function readJournalAfter(afterOffset: string | null, count = MAX_BATCH, installPortalId?: number): Promise<JournalReadResult> {
-  const n = clampCount(count);
-  let raw: JournalBatchResponse;
+export async function downloadJournalFile(raw: string): Promise<string> {
+  let url: URL;
   try {
-    raw = afterOffset ? await batchNext(afterOffset, n, installPortalId) : await batchEarliest(n, installPortalId);
-  } catch (e) {
-    // Assumed "empty" signal for a fresh/quiet journal .
-    if (e instanceof HttpError && e.status === 404) {
-      return { files: [], nextOffset: null, full: false, raw: { status: 'COMPLETE', startedAt: '', completedAt: '', results: [] } };
+    url = new URL(raw);
+  } catch {
+    throw new DownloadRejectedError('journal file URL is not a valid URL; refusing to download');
+  }
+  if (!isJournalFileUrl(url))
+    throw new DownloadRejectedError(`journal file URL host "${url.hostname.toLowerCase()}" (${url.protocol}) is not HubSpot's journal bucket; refusing to download`);
+  const read = async (res: Response): Promise<string> => {
+    if (!res.ok) return '';
+    const declared = Number(res.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > JOURNAL_MAX_FILE_BYTES)
+      throw new DownloadRejectedError(`journal file is ${declared} bytes, over the ${JOURNAL_MAX_FILE_BYTES} byte cap`);
+    return readCapped(res);
+  };
+  for (let n = 0; ; n++) {
+    const a = await hsFetch(url, { method: 'GET', redirect: 'error' }, { api: 'journal_file', timeoutMs: JOURNAL_DOWNLOAD_TIMEOUT_MS, read });
+    if (a.ok && a.res.ok) return a.data;
+    const error = a.ok ? HubSpotError.fromStatus(a.res.status, undefined, `journal file download failed with ${a.res.status}`) : a.error;
+    if (error.kind !== 'transient' || n >= DOWNLOAD_RETRIES) throw error;
+    await new Promise((r) => setTimeout(r, backoffMs(n, 250, 5_000)));
+  }
+}
+
+async function readCapped(res: Response): Promise<string> {
+  if (!res.body) return await res.text();
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > JOURNAL_MAX_FILE_BYTES) {
+      await reader.cancel().catch(() => {});
+      throw new DownloadRejectedError(`journal file is over the ${JOURNAL_MAX_FILE_BYTES} byte cap`);
     }
-    throw e;
+    chunks.push(value);
   }
-  raw = raw ?? { status: 'COMPLETE', startedAt: '', completedAt: '', results: [] };
-
-  if ((raw.numErrors ?? 0) > 0 || (raw.errors?.length ?? 0) > 0) {
-    const bad = (raw.errors ?? []).map((er) => `${er.status}:${er.context?.offset?.[0] ?? '?'}`).join(', ');
-    throw new Error(`Journal batch had ${raw.numErrors ?? raw.errors?.length} error(s): ${bad}`);
-  }
-
-  const results = raw.results ?? [];
-  const files: JournalFile[] = [];
-  for (const r of results) {
-    const file = await downloadJournalFile(r);
-    if (!file.offset) file.offset = r.currentOffset;
-    files.push(file);
-  }
-  const last = files.at(-1);
-  return { files, nextOffset: last ? last.offset : null, full: results.length >= n, raw };
+  return Buffer.concat(chunks).toString('utf8');
 }

@@ -22,7 +22,7 @@ Details: [docs/architecture.md](docs/architecture.md).
 changecatch/
 ├── service/        @changecatch/service     API server (OAuth install, settings API) + worker (journal → stamps)
 ├── hubspot-app/    @changecatch/hubspot-app HubSpot developer-platform project (app config, scopes, settings page)
-├── tools/          @changecatch/tools       Operator and developer CLIs (journal inspection, subscriptions, load test, key rotation)
+├── tools/          @changecatch/tools       Developer CLIs against a test portal: load test and end-to-end check
 ├── docs/           Architecture, configuration, development
 ├── .env.example    Every environment variable, with defaults
 └── pnpm-workspace.yaml

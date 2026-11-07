@@ -6,15 +6,17 @@
 // 01a18af2-d82a (seen +13.6 s) -> was REMOVED + LABEL_CHANGED "(unknown)".
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Store } from '../../src/store/db.js';
-import { StoreLabelCache } from '../../src/core/labels.js';
-import { DEFAULT_PAIRING_CONFIG, mayBeHalf, offsetTimeMs, pairAssociations, categoryIsStructural, type PairingConfig } from '../../src/core/pairing.js';
-import { runOnce, type JournalReadResult } from '../../src/core/poller.js';
+import { DEFAULT_PAIRING_CONFIG, mayBeHalf, pairAssociations, categoryIsStructural, type PairingConfig, type PairingInput } from '../../src/core/pairing.js';
+import type { JournalReadResult } from '../../src/core/poller.js';
 import type { AssociationAction, AssociationEntry, JournalFile } from '../../src/core/types.js';
-import type { StampUpdate } from '../../src/core/stamp.js';
 import { entryKey } from '../../src/core/dedupe.js';
-import { ADD, CONTACT, DEAL, ev, REM, T0, UD } from '../../src/core/testutil.js';
-import { DEAL_CONTACT_LABELS, HD } from '../fixtures/deal-contact-labels.js';
+import { ADD, CONTACT, DEAL, ev, HD, REM, T0, UD, uuid7 } from '../fixtures/journal.js';
+import { DEAL_CONTACT_LABELS } from '../fixtures/labels.js';
+import { replayRig } from '../fixtures/replay.js';
+
+/** pairAssociations with the test defaults: default config, category-only structural check, caught up. */
+const pair = (i: Omit<PairingInput, 'config' | 'isStructural' | 'caughtUp'> & Partial<PairingInput>) =>
+  pairAssociations({ config: DEFAULT_PAIRING_CONFIG, isStructural: categoryIsStructural, caughtUp: true, ...i });
 
 const PORTAL = 1000001;
 // These tests pin the split-hold MECHANISM at the 15 s it had when they were written (default is now 4 s; later halves
@@ -22,16 +24,7 @@ const PORTAL = 1000001;
 const CFG: PairingConfig = { ...DEFAULT_PAIRING_CONFIG, splitHoldMs: 15_000 };
 const SPLIT = CFG.splitHoldMs;
 
-const DEFS = DEAL_CONTACT_LABELS;
 const structural = (_p: number, r: { associationTypeId: number }) => r.associationTypeId === 3;
-
-/** A UUIDv7 journal offset whose time part is `ms` (like HubSpot's). */
-let seq = 0;
-function uuid7(ms: number): string {
-  const h = ms.toString(16).padStart(12, '0');
-  const s = (++seq).toString(16).padStart(3, '0');
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-7${s}-8000-000000000000`;
-}
 
 const dealEv = (action: AssociationAction, typeId: number, at: number, dealId = 6180121709, contactId = 182106) =>
   ev({ portalId: PORTAL, action, typeId, category: typeId === 3 ? HD : UD, from: [DEAL, dealId], to: [CONTACT, contactId], at });
@@ -42,11 +35,6 @@ function entryIn(fileOffset: string, action: AssociationAction, typeId: number, 
 }
 
 // ---------- pure pairing ----------
-
-test('offsetTimeMs reads the publish time from a real journal offset; NaN for non-UUIDv7', () => {
-  assert.equal(new Date(offsetTimeMs('01a18af2-c8d9-747f-b864-1d114b2ad220')).toISOString(), '2026-10-30T03:55:29.369Z');
-  assert.ok(Number.isNaN(offsetTimeMs('file-000001')));
-});
 
 test('mayBeHalf: only structural, or only one label action, may be half; structural+label or a swap is whole', () => {
   const f = uuid7(T0);
@@ -66,11 +54,11 @@ for (const order of ['structural first', 'label first'] as const) {
     const fileB = uuid7(T0 + 5_415);
     const [typeA, typeB] = order === 'structural first' ? [3, 251] : [251, 3];
     // Read 1 at +7.6 s (deadline = +6 s already passed): only file A is visible.
-    const r1 = pairAssociations([entryIn(fileA, REM, typeA, 0)], [], T0 + 7_600, CFG, -Infinity, structural);
+    const r1 = pair({ entries: [entryIn(fileA, REM, typeA, 0)], pending: [], now: T0 + 7_600, config: CFG, isStructural: structural });
     assert.equal(r1.changes.length, 0, 'half cluster is held, not released alone');
     assert.equal(r1.nextReleaseAt, T0 + 1_494 + SPLIT);
     // Read 2 at +13.6 s: the partner arrives.
-    const r2 = pairAssociations([entryIn(fileB, REM, typeB, 0)], r1.stillPending, T0 + 13_600, CFG, -Infinity, structural);
+    const r2 = pair({ entries: [entryIn(fileB, REM, typeB, 0)], pending: r1.stillPending, now: T0 + 13_600, config: CFG, isStructural: structural });
     assert.equal(r2.changes.length, 1);
     assert.equal(r2.changes[0].changeType, 'REMOVED');
     assert.deepEqual(r2.changes[0].removed.map((r) => r.associationTypeId), [251]);
@@ -79,9 +67,9 @@ for (const order of ['structural first', 'label first'] as const) {
 }
 
 test('labeled link split over two files -> one ADDED', () => {
-  const r1 = pairAssociations([entryIn(uuid7(T0 + 1_400), ADD, 3, 0)], [], T0 + 7_600, CFG, -Infinity, structural);
+  const r1 = pair({ entries: [entryIn(uuid7(T0 + 1_400), ADD, 3, 0)], pending: [], now: T0 + 7_600, config: CFG, isStructural: structural });
   assert.equal(r1.changes.length, 0);
-  const r2 = pairAssociations([entryIn(uuid7(T0 + 4_900), ADD, 249, 0)], r1.stillPending, T0 + 13_600, CFG, -Infinity, structural);
+  const r2 = pair({ entries: [entryIn(uuid7(T0 + 4_900), ADD, 249, 0)], pending: r1.stillPending, now: T0 + 13_600, config: CFG, isStructural: structural });
   assert.equal(r2.changes.length, 1);
   assert.equal(r2.changes[0].changeType, 'ADDED');
   assert.deepEqual(r2.changes[0].added.map((r) => r.associationTypeId), [249]);
@@ -89,46 +77,42 @@ test('labeled link split over two files -> one ADDED', () => {
 
 test('whole cluster (structural + label in one file) is NOT delayed by the split hold', () => {
   const f = uuid7(T0 + 1_500);
-  const r = pairAssociations([entryIn(f, REM, 3, 0), entryIn(f, REM, 251, 0)], [], T0 + 6_000, CFG, -Infinity, structural);
+  const r = pair({ entries: [entryIn(f, REM, 3, 0), entryIn(f, REM, 251, 0)], pending: [], now: T0 + 6_000, config: CFG, isStructural: structural });
   assert.equal(r.changes.length, 1);
   assert.equal(r.changes[0].changeType, 'REMOVED');
 });
 
 test('unlabeled unlink with no partner is released at file publish time + splitHoldMs', () => {
   const pub = T0 + 1_500;
-  const r1 = pairAssociations([entryIn(uuid7(pub), REM, 3, 0)], [], T0 + 7_000, CFG, -Infinity, structural);
+  const r1 = pair({ entries: [entryIn(uuid7(pub), REM, 3, 0)], pending: [], now: T0 + 7_000, config: CFG, isStructural: structural });
   assert.equal(r1.nextReleaseAt, pub + SPLIT);
-  assert.equal(pairAssociations([], r1.stillPending, pub + SPLIT - 1, CFG, -Infinity, structural).changes.length, 0);
-  const r2 = pairAssociations([], r1.stillPending, pub + SPLIT, CFG, -Infinity, structural);
+  assert.equal(pair({ entries: [], pending: r1.stillPending, now: pub + SPLIT - 1, config: CFG, isStructural: structural }).changes.length, 0);
+  const r2 = pair({ entries: [], pending: r1.stillPending, now: pub + SPLIT, config: CFG, isStructural: structural });
   assert.equal(r2.changes.length, 1);
   assert.equal(r2.changes[0].changeType, 'REMOVED');
 });
 
 test('backlog (caughtUp=false): a half cluster is released once a file splitHoldMs newer has been read', () => {
-  const backlog = { caughtUp: false };
   const far = T0 + 3_600_000; // wall clock says nothing while catching up
   const half = entryIn(uuid7(T0 + 1_500), REM, 3, 0);
   const near = { ...entryIn(uuid7(T0 + 1_500 + SPLIT - 1), ADD, 3, 30_000), event: { ...dealEv(ADD, 3, 30_000, 1, 2) } };
-  const r1 = pairAssociations([half, near], [], far, CFG, -Infinity, structural, backlog);
+  const r1 = pair({ entries: [half, near], pending: [], now: far, config: CFG, isStructural: structural, caughtUp: false });
   assert.equal(r1.changes.length, 0, 'newest file read is not yet splitHoldMs past');
   const later = { ...entryIn(uuid7(T0 + 1_500 + SPLIT), ADD, 3, 31_000), event: { ...dealEv(ADD, 3, 31_000, 1, 3) } };
-  const r2 = pairAssociations([later], r1.stillPending, far, CFG, -Infinity, structural, backlog);
+  const r2 = pair({ entries: [later], pending: r1.stillPending, now: far, config: CFG, isStructural: structural, caughtUp: false });
   assert.ok(r2.changes.some((c) => c.fromObjectId === '6180121709' && c.changeType === 'REMOVED'));
 });
 
 test('splitHoldMs = 0 turns the split hold off (old behaviour: split unlink -> REMOVED + LABEL_CHANGED)', () => {
   const cfg: PairingConfig = { ...DEFAULT_PAIRING_CONFIG, splitHoldMs: 0 };
-  const r1 = pairAssociations([entryIn(uuid7(T0 + 1_494), REM, 3, 0)], [], T0 + 7_600, cfg, -Infinity, categoryIsStructural);
+  const r1 = pair({ entries: [entryIn(uuid7(T0 + 1_494), REM, 3, 0)], pending: [], now: T0 + 7_600, config: cfg, isStructural: categoryIsStructural });
   assert.equal(r1.changes.length, 1, 'released alone: this is the bug the default prevents');
 });
 
 // ---------- end to end: runOnce + label state + stamps ----------
 
 async function e2e(unlinkOrder: 'structural first' | 'label first') {
-  const store = new Store(':memory:');
-  store.setWatchedPairs(PORTAL, [{ objectTypeId: DEAL, associatedObjectTypeId: CONTACT }]);
-  let now = T0 - 60_000;
-  const labels = new StoreLabelCache(store, async (_p, f, t) => (f === DEAL && t === CONTACT ? DEFS : []), undefined, () => now);
+  const rig = replayRig({ portal: PORTAL, labels: DEAL_CONTACT_LABELS, delivery: 'immediate', env: { PAIRING_SPLIT_HOLD_MS: String(CFG.splitHoldMs) } });
   const mk = (pub: number, evs: ReturnType<typeof dealEv>[]): JournalFile => ({ offset: uuid7(pub), journalEvents: evs });
   const [first, second] = unlinkOrder === 'structural first' ? [3, 251] : [251, 3];
   // Each read returns the next scripted batch; reads that HubSpot has nothing for return [].
@@ -145,22 +129,11 @@ async function e2e(unlinkOrder: 'structural first' | 'label first') {
     const files = reads[i++].files;
     return { files, nextOffset: files.at(-1)?.offset ?? null, full: false };
   };
-  const stamps: StampUpdate[] = [];
   for (const r of reads) {
-    now = r.at;
-    await runOnce({
-      readJournal,
-      sendStamps: async (u, onDelivered) => {
-        stamps.push(...u);
-        onDelivered(u);
-      },
-      store,
-      labels,
-      now: () => now,
-      config: { pairing: CFG },
-    });
+    rig.clock.t = r.at;
+    await rig.run(readJournal);
   }
-  return { stamps: stamps.map((s) => [s.properties.changecatch_change_type, s.properties.changecatch_labels_current]), store };
+  return { stamps: rig.sent.map((s) => [s.properties.changecatch_change_type, s.properties.changecatch_labels_current]), store: rig.store };
 }
 
 for (const order of ['structural first', 'label first'] as const) {
@@ -170,6 +143,6 @@ for (const order of ['structural first', 'label first'] as const) {
       ['ADDED', '0-1:251'], // Billing contact = type 251
       ['REMOVED', 'none'],
     ]);
-    assert.equal(store.loadPending().length, 0);
+    assert.equal(store.entries.loadPending().length, 0);
   });
 }

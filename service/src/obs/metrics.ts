@@ -1,7 +1,11 @@
 // In-process metrics: counters, gauges and histograms (p50/p95/p99), keyed by name + labels.
-// No dependencies. Two outputs:
+// Two outputs:
 //   - toPrometheus(): Prometheus text format, for a GET /metrics endpoint (Fly.io scrapes it for free).
-//   - snapshot(): plain JSON, to embed in /health.
+//   - toJSON(): plain JSON, to embed in /health.
+// This registry is the ONLY place counters live (nothing is counted again in SQLite).
+//
+// Privacy: a metric declared { perPortal: true } has a `portal` label. The public views (toJSON / toPrometheus with
+// { publicView: true }) sum it over that label, so no portal id leaves the process without x-health-token.
 //
 // Cardinality is bounded: each metric keeps at most `maxSeriesPerMetric` label sets. Past that, new
 // label sets are folded into one series whose label values are all "_other", and
@@ -9,7 +13,12 @@
 // memory or the metrics bill.
 //
 // The ChangeCatch metric names are standardised in `M` and wrapped by `ChangeCatchMetrics` below.
-// See docs/observability.md for where each one is recorded.
+// docs/observability.md lists each one (obs.test.ts checks the list matches M).
+
+import { offsetTimeMs } from '../core/journal-offset.js';
+
+/** The `api` label of http_requests (lib/http.ts picks it per call). */
+export type ApiFamily = 'journal' | 'journal_file' | 'subscriptions' | 'oauth' | 'crm' | 'other';
 
 export type Labels = Record<string, string | number>;
 export type MetricKind = 'counter' | 'gauge' | 'histogram';
@@ -37,7 +46,13 @@ export interface MetricSnapshot {
   name: string;
   kind: MetricKind;
   help: string;
+  perPortal: boolean;
   series: SeriesSnapshot[];
+}
+
+export interface MetricOptions {
+  /** The metric has a `portal` label (portal id). Public views sum it over that label. */
+  perPortal?: boolean;
 }
 
 export interface RegistryOptions {
@@ -48,6 +63,9 @@ export interface RegistryOptions {
 }
 
 export const OVERFLOW_VALUE = '_other';
+/** Series per metric in the /health JSON (the biggest ones). */
+const JSON_SERIES_PER_METRIC = 20;
+const PROMETHEUS_PREFIX = 'changecatch_';
 
 /** Nearest-rank percentile of a sorted array. */
 export function percentile(sorted: number[], p: number): number | null {
@@ -98,6 +116,8 @@ interface MetricDef {
   name: string;
   kind: MetricKind;
   help: string;
+  /** Has a `portal` label: summed over it in the public views. */
+  perPortal: boolean;
   series: Map<string, Series>;
   /** Computed at read time (e.g. "seconds since X"). Overrides stored series when set. */
   collect?: () => number | { labels: Labels; value: number }[] | null;
@@ -124,26 +144,27 @@ export class MetricsRegistry {
     this.define('metrics_series_overflow', 'counter', 'Label sets folded into "_other" because a metric hit its series cap');
   }
 
-  /** Declare a metric (idempotent). Using an undeclared name auto-declares it with empty help. */
-  define(name: string, kind: MetricKind, help = ''): this {
+  /** Declare a metric (idempotent). Recording an undeclared name throws (a typo must fail loudly in tests). */
+  define(name: string, kind: MetricKind, help = '', opts: MetricOptions = {}): this {
     if (!NAME_RE.test(name)) throw new Error(`bad metric name: ${name}`);
     const m = this.metrics.get(name);
     if (m && m.kind !== kind) throw new Error(`metric ${name} is a ${m.kind}, not a ${kind}`);
-    if (!m) this.metrics.set(name, { name, kind, help, series: new Map() });
+    if (!m) this.metrics.set(name, { name, kind, help, perPortal: !!opts.perPortal, series: new Map() });
     else if (help && !m.help) m.help = help;
     return this;
   }
 
   /** Gauge whose value is computed when read (snapshot/export). Return null to emit nothing. */
-  defineComputedGauge(name: string, help: string, collect: NonNullable<MetricDef['collect']>): this {
-    this.define(name, 'gauge', help);
+  defineComputedGauge(name: string, help: string, collect: NonNullable<MetricDef['collect']>, opts: MetricOptions = {}): this {
+    this.define(name, 'gauge', help, opts);
     this.metrics.get(name)!.collect = collect;
     return this;
   }
 
   private series(name: string, kind: MetricKind, labels: Labels): Series {
-    this.define(name, kind);
-    const m = this.metrics.get(name)!;
+    const m = this.metrics.get(name);
+    if (!m) throw new Error(`metric ${name} is not defined`);
+    if (m.kind !== kind) throw new Error(`metric ${name} is a ${m.kind}, not a ${kind}`);
     for (const k of Object.keys(labels)) if (!LABEL_RE.test(k)) throw new Error(`bad label name: ${k}`);
     let key = labelKey(labels);
     let s = m.series.get(key);
@@ -172,19 +193,9 @@ export class MetricsRegistry {
     this.series(name, 'gauge', labels).value = value;
   }
 
-  add(name: string, by: number, labels: Labels = {}): void {
-    if (!Number.isFinite(by)) return;
-    this.series(name, 'gauge', labels).value += by;
-  }
-
   observe(name: string, value: number, labels: Labels = {}): void {
     if (!Number.isFinite(value)) return;
     this.series(name, 'histogram', labels).hist!.observe(value);
-  }
-
-  /** Remove one label set (e.g. a portal that uninstalled). */
-  remove(name: string, labels: Labels): void {
-    this.metrics.get(name)?.series.delete(labelKey(labels));
   }
 
   /** Remove every series that has this label value (e.g. all `portal=123` series on uninstall). */
@@ -218,18 +229,35 @@ export class MetricsRegistry {
       } else {
         series = [...m.series.values()].map((s) => (s.hist ? { labels: { ...s.labels }, stats: s.hist.stats() } : { labels: { ...s.labels }, value: s.value }));
       }
-      out.push({ name: m.name, kind: m.kind, help: m.help, series });
+      out.push({ name: m.name, kind: m.kind, help: m.help, perPortal: m.perPortal, series });
     }
     return out;
   }
 
+  /** snapshot(), with per-portal metrics summed over the `portal` label (histograms with it are left out). */
+  publicSnapshot(): MetricSnapshot[] {
+    return this.snapshot().map((m) => {
+      if (!m.perPortal) return m;
+      const agg = new Map<string, { labels: Labels; value: number }>();
+      for (const s of m.series) {
+        if (s.stats) continue;
+        const { portal: _p, ...rest } = s.labels;
+        const key = labelKey(rest);
+        const a = agg.get(key) ?? agg.set(key, { labels: rest, value: 0 }).get(key)!;
+        a.value += s.value ?? 0;
+      }
+      return { ...m, series: [...agg.values()] };
+    });
+  }
+
   /**
    * Compact JSON for /health: { name: value } when unlabelled, { name: { "portal=1": value } } when labelled,
-   * histograms as their stats. `perLabelLimit` keeps only the biggest N series per metric (by value / count).
+   * histograms as their stats. Keeps only the biggest JSON_SERIES_PER_METRIC series per metric (by value / count).
    */
-  toJSON(perLabelLimit = 20): Record<string, unknown> {
+  toJSON(opts: { publicView?: boolean } = {}): Record<string, unknown> {
+    const perLabelLimit = JSON_SERIES_PER_METRIC;
     const out: Record<string, unknown> = {};
-    for (const m of this.snapshot()) {
+    for (const m of opts.publicView ? this.publicSnapshot() : this.snapshot()) {
       if (!m.series.length) continue;
       const unlabelled = m.series.length === 1 && Object.keys(m.series[0].labels).length === 0;
       if (unlabelled) {
@@ -250,11 +278,11 @@ export class MetricsRegistry {
    * Prometheus text exposition format (version 0.0.4).
    * Counters get a `_total` suffix; histograms are exported as `summary` (quantiles computed here).
    */
-  toPrometheus(prefix = 'changecatch_'): string {
+  toPrometheus(opts: { publicView?: boolean } = {}): string {
     const lines: string[] = [];
-    for (const m of this.snapshot()) {
+    for (const m of opts.publicView ? this.publicSnapshot() : this.snapshot()) {
       if (!m.series.length) continue;
-      const base = prefix + m.name;
+      const base = PROMETHEUS_PREFIX + m.name;
       const name = m.kind === 'counter' && !base.endsWith('_total') ? `${base}_total` : base;
       if (m.help) lines.push(`# HELP ${name} ${escapeHelp(m.help)}`);
       lines.push(`# TYPE ${name} ${m.kind === 'histogram' ? 'summary' : m.kind}`);
@@ -270,10 +298,6 @@ export class MetricsRegistry {
       }
     }
     return lines.join('\n') + '\n';
-  }
-
-  reset(): void {
-    for (const m of this.metrics.values()) m.series.clear();
   }
 }
 
@@ -311,39 +335,28 @@ export const M = {
   changesProcessed: 'changes_processed', // {portal}
   stampsSent: 'stamps_sent', // {portal}
   stampsFailed: 'stamps_failed', // {portal, reason="retry"|"gave_up"|"dropped"}
+  stampsCoalesced: 'stamps_coalesced',
   stampQueueDepth: 'stamp_queue_depth', // {portal}
   e2eLatencyMs: 'e2e_latency_ms',
   httpRequests: 'http_requests', // {api}
   httpErrors: 'http_errors', // {status}
   rateLimited: 'rate_limited', // {portal}
   tokenRefreshes: 'token_refreshes', // {result="ok"|"revoked"|"error"}
-  dataLoss: 'data_loss', // {reason="dead_letter"|"skipped_entries"|"stamp_dropped"|"journal_gap"|"offset_expired"|"park_dropped"}
+  dataLoss: 'data_loss', // {reason="dead_letter"|"skipped_entries"|"stamp_dropped"|"offset_expired"|"park_dropped"}
+  // Worker gauges, computed from the DB at scrape time (worker/health.ts registerWorkerGauges).
+  deadLetters: 'dead_letters', // {portal}
+  portalsPaused: 'portals_paused',
+  lifecycleRetriesPending: 'lifecycle_retries_pending',
+  parkedEntries: 'parked_entries',
 } as const;
 
-/**
- * Journal offsets are UUIDv7 (e.g. 01a18abd-74f4-7…), whose first 48 bits are a Unix ms
- * timestamp: the time HubSpot wrote that entry. Returns null for anything else.
- */
-export function offsetTimeMs(offset: string): number | null {
-  const m = /^([0-9a-f]{8})-([0-9a-f]{4})-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.exec(offset.trim());
-  if (!m) return null;
-  const t = parseInt(m[1] + m[2], 16);
-  return t > 1_500_000_000_000 && t < 4_000_000_000_000 ? t : null;
-}
-
-/** HTTP statuses kept as their own label value; everything else is bucketed ("4xx", "5xx", "network"). */
+/** HTTP statuses kept as their own label value (http_errors); others are bucketed ("4xx", "5xx"). */
 const KNOWN_STATUSES = new Set([400, 401, 403, 404, 409, 423, 429, 500, 502, 503, 504]);
 
-export function statusLabel(status: number | string | undefined): string {
-  if (typeof status === 'string') return status === 'timeout' || status === 'network' ? status : 'other';
-  if (status === undefined || !Number.isFinite(status) || status === 0) return 'network';
-  if (KNOWN_STATUSES.has(status)) return String(status);
-  return `${Math.floor(status / 100)}xx`;
-}
 
 /**
- * Typed wrapper so the worker and the app server record the same names with the same labels.
- * Create one per process (`const metrics = new ChangeCatchMetrics()`), pass it down as a dep.
+ * Typed wrapper so every caller records the same names with the same labels. Only the worker creates one
+ * (worker/main.ts) and passes it down as a dep; the API server records no metrics.
  */
 export class ChangeCatchMetrics {
   readonly registry: MetricsRegistry;
@@ -366,16 +379,18 @@ export class ChangeCatchMetrics {
     r.define(M.journalReads, 'counter', 'Journal read runs by result');
     r.define(M.filesRead, 'counter', 'Journal files downloaded');
     r.define(M.eventsRead, 'counter', 'Journal events read');
-    r.define(M.changesProcessed, 'counter', 'Association changes produced, per portal');
-    r.define(M.stampsSent, 'counter', 'Records stamped (CRM batch update accepted), per portal');
-    r.define(M.stampsFailed, 'counter', 'Stamps that failed, per portal and reason');
-    r.define(M.stampQueueDepth, 'gauge', 'Stamps waiting in the queue, per portal');
+    const pp = { perPortal: true };
+    r.define(M.changesProcessed, 'counter', 'Association changes produced, per portal', pp);
+    r.define(M.stampsSent, 'counter', 'Records stamped (CRM batch update accepted), per portal', pp);
+    r.define(M.stampsFailed, 'counter', 'Stamps that failed, per portal and reason', pp);
+    r.define(M.stampsCoalesced, 'counter', 'Stamps folded into a later stamp on the same record');
+    r.define(M.stampQueueDepth, 'gauge', 'Stamps waiting in the queue, per portal', pp);
     r.define(M.e2eLatencyMs, 'histogram', 'occurredAt -> stamp accepted, milliseconds');
     r.define(M.httpRequests, 'counter', 'HubSpot HTTP requests by API family');
     r.define(M.httpErrors, 'counter', 'HubSpot HTTP errors by status');
-    r.define(M.rateLimited, 'counter', '429s or local rate-limiter waits, per portal');
+    r.define(M.rateLimited, 'counter', '429s or local rate-limiter waits, per portal', pp);
     r.define(M.tokenRefreshes, 'counter', 'Customer OAuth access-token refresh calls to HubSpot, by result (ok | revoked | error)');
-    r.define(M.dataLoss, 'counter', 'Changes that will never be stamped (dead-lettered, skipped journal entries, dropped stamps, journal gaps, dropped parked entries)');
+    r.define(M.dataLoss, 'counter', 'Changes that will never be stamped (dead-lettered, skipped journal entries, dropped stamps, journal gaps, dropped parked entries)', pp);
   }
 
   /**
@@ -427,6 +442,10 @@ export class ChangeCatchMetrics {
     this.registry.inc(M.stampsFailed, n, { portal: portalId, reason });
   }
 
+  stampsCoalesced(n: number): void {
+    this.registry.inc(M.stampsCoalesced, n);
+  }
+
   /** Replace all per-portal queue depths (call after each drain with the store's per-portal counts). */
   setStampQueueDepth(depths: Map<number, number> | Record<number, number>): void {
     const entries = depths instanceof Map ? [...depths] : Object.entries(depths).map(([k, v]) => [Number(k), v] as const);
@@ -436,13 +455,27 @@ export class ChangeCatchMetrics {
     for (const [p, v] of entries) this.registry.set(M.stampQueueDepth, v, { portal: p });
   }
 
-  httpRequest(api: 'journal' | 'crm' | 'oauth' | 'subscriptions' | 'other'): void {
+  httpRequest(api: ApiFamily): void {
     this.registry.inc(M.httpRequests, 1, { api });
   }
 
-  httpError(status: number | 'timeout' | 'network' | undefined): void {
-    this.registry.inc(M.httpErrors, 1, { status: statusLabel(status) });
+  /** A known status keeps its own label value; other statuses are bucketed ("4xx", "5xx"). */
+  httpError(status: number | 'timeout' | 'network'): void {
+    const label = typeof status === 'string' ? status : KNOWN_STATUSES.has(status) ? String(status) : `${Math.floor(status / 100)}xx`;
+    this.registry.inc(M.httpErrors, 1, { status: label });
   }
+
+  /** HubSpot 429 and 5xx responses counted since the process started (http_errors, all portals). */
+  httpErrorCounts(): { status429: number; status5xx: number } {
+    const out = { status429: 0, status5xx: 0 };
+    for (const sr of this.registry.snapshot().find((x) => x.name === M.httpErrors)?.series ?? []) {
+      const st = String(sr.labels.status);
+      if (st === '429') out.status429 += sr.value ?? 0;
+      else if (st.startsWith('5')) out.status5xx += sr.value ?? 0;
+    }
+    return out;
+  }
+
 
   /** One customer access-token refresh call to HubSpot (callers that joined it via single-flight are not counted). */
   tokenRefresh(result: 'ok' | 'revoked' | 'error'): void {
@@ -457,10 +490,11 @@ export class ChangeCatchMetrics {
   /**
    * Something that should have become a stamp never will. Any increase should page someone.
    * reason: dead_letter (gave up after retries), skipped_entries (journal entries we could not parse/process),
-   * stamp_dropped (CRM rejected the record, e.g. deleted), journal_gap (offset expired: >3 days behind, HTTP 404),
-   * offset_expired (offset expired but HubSpot returned an EMPTY read; detected via earliest).
+   * stamp_dropped (CRM rejected the record, e.g. deleted), offset_expired (stored journal offset is older than the
+   * ~3 day retention: HTTP 404, or an EMPTY read detected via earliest; restarted from earliest), park_dropped
+   * (parked entries of a portal dropped, see src/worker/main.ts).
    */
-  dataLoss(reason: 'dead_letter' | 'skipped_entries' | 'stamp_dropped' | 'journal_gap' | 'offset_expired' | 'park_dropped', n = 1, portalId?: number): void {
+  dataLoss(reason: 'dead_letter' | 'skipped_entries' | 'stamp_dropped' | 'offset_expired' | 'park_dropped', n = 1, portalId?: number): void {
     if (n > 0) this.registry.inc(M.dataLoss, n, { reason, portal: portalId ?? 'app' });
   }
 
@@ -469,13 +503,33 @@ export class ChangeCatchMetrics {
     this.registry.removeWhere('portal', portalId);
   }
 
-  /** JSON for /health. */
-  toJSON(): Record<string, unknown> {
-    return this.registry.toJSON();
+  /** Counters per portal for /health: changes produced, stamps sent, stamps dead-lettered (refused + gave up). */
+  portalCounts(): Map<number, { changes: number; stampsSent: number; stampsDropped: number }> {
+    const out = new Map<number, { changes: number; stampsSent: number; stampsDropped: number }>();
+    const row = (p: number) => out.get(p) ?? out.set(p, { changes: 0, stampsSent: 0, stampsDropped: 0 }).get(p)!;
+    for (const m of this.registry.snapshot())
+      for (const s of m.series) {
+        const p = Number(s.labels.portal);
+        if (!Number.isSafeInteger(p)) continue;
+        if (m.name === M.changesProcessed) row(p).changes += s.value ?? 0;
+        else if (m.name === M.stampsSent) row(p).stampsSent += s.value ?? 0;
+        else if (m.name === M.stampsFailed && s.labels.reason !== 'retry') row(p).stampsDropped += s.value ?? 0;
+      }
+    return out;
   }
 
-  toPrometheus(): string {
-    return this.registry.toPrometheus();
+  /** occurredAt -> stamp accepted, over the most recent stamps of this process (e2e_latency_ms). */
+  latency(): HistogramStats | undefined {
+    return this.registry.histogram(M.e2eLatencyMs);
+  }
+
+  /** JSON for /health. publicView = per-portal metrics summed (no portal ids). */
+  toJSON(publicView = false): Record<string, unknown> {
+    return this.registry.toJSON({ publicView });
+  }
+
+  toPrometheus(publicView = false): string {
+    return this.registry.toPrometheus({ publicView });
   }
 }
 

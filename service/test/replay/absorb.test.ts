@@ -9,29 +9,17 @@
 // publish time) and becomes readable 2 s later; the worker reads every 3 s with the DEFAULT pairing config.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Store } from '../../src/store/db.js';
-import { StampQueue } from '../../src/worker/stamp-queue.js';
-import type { TokenProvider } from '../../src/worker/tokens.js';
-import { StoreLabelCache } from '../../src/core/labels.js';
 import { DEFAULT_PAIRING_CONFIG } from '../../src/core/pairing.js';
-import { runOnce, type JournalReadResult } from '../../src/core/poller.js';
-import { recordKey, SENT_PREFIX, stampIdOf, type StampUpdate } from '../../src/core/stamp.js';
-import { ADD, CONTACT, DEAL, ev, REM, T0, UD } from '../../src/core/testutil.js';
-import { DEAL_CONTACT_LABELS, HD } from '../fixtures/deal-contact-labels.js';
-import type { AssociationAction, JournalAssociationEntry, JournalFile } from '../../src/core/types.js';
+import { recordKey } from '../../src/core/keys.js';
+import type { AssociationAction, JournalAssociationEntry } from '../../src/core/types.js';
+import { ADD, CONTACT, DEAL, ev, HD, REM, T0, UD, uuid7, type TimedFile } from '../fixtures/journal.js';
+import { DEAL_CONTACT_LABELS } from '../fixtures/labels.js';
+import { replay, type Rig } from '../fixtures/replay.js';
 
 const PORTAL = 1000001;
-const DEFS = DEAL_CONTACT_LABELS;
 const NAME: Record<number, string> = { 247: 'Decision maker', 249: 'Influencer', 251: 'Billing contact' };
 const PUBLISH_DELAY = 1_500;
-const VISIBLE_DELAY = 2_000;
 const POLL = 3_000;
-
-let seq = 0;
-function uuid7(ms: number): string {
-  const h = ms.toString(16).padStart(12, '0');
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-7000-8000-${(++seq).toString(16).padStart(12, '0')}`;
-}
 
 type Order = 'structural first' | 'label first';
 interface Action {
@@ -49,15 +37,10 @@ interface Action {
 const dealEv = (a: Pick<Action, 'dealId' | 'contactId'>, action: AssociationAction, typeId: number, at: number): JournalAssociationEntry =>
   ev({ portalId: PORTAL, action, typeId, category: typeId === 3 ? HD : UD, from: [DEAL, a.dealId], to: [CONTACT, a.contactId], at });
 
-interface SimFile {
-  pub: number;
-  file: JournalFile;
-}
-
-function filesFor(a: Action): SimFile[] {
+function filesFor(a: Action): TimedFile[] {
   const action = a.kind === 'unlink' ? REM : ADD;
   const [first, second] = a.order === 'structural first' ? [3, a.label] : [a.label, 3];
-  const out: SimFile[] = [];
+  const out: TimedFile[] = [];
   const mk = (pub: number, evs: JournalAssociationEntry[]) => out.push({ pub, file: { offset: uuid7(pub), journalEvents: evs } });
   if (a.kind === 'unlink') {
     // The pair was linked with the label two minutes earlier (one whole file), so its label state is known.
@@ -69,73 +52,22 @@ function filesFor(a: Action): SimFile[] {
   return out;
 }
 
-interface SimResult {
-  sent: StampUpdate[];
-  /** Simulated HubSpot record properties after all stamps, per record key. */
-  props: Map<string, Record<string, string>>;
-  store: Store;
-}
+type SimResult = Rig & { props: Map<string, Record<string, string>> };
 
 /**
- * Runs the worker over the simulated journal. 'immediate' = every stamp is sent at once (so a late half always finds
- * its change already stamped). 'deferred' = real StampQueue, drained only after the journal is done (so a late half
- * always finds its change still queued).
+ * Runs the worker over the simulated journal (read every 3 s, DEFAULT pairing config). 'immediate' = every stamp is
+ * sent at once (so a late half always finds its change already stamped). 'deferred' = real StampQueue, drained only
+ * after the journal is done (so a late half always finds its change still queued).
  */
 async function simulate(actions: Action[], delivery: 'immediate' | 'deferred'): Promise<SimResult> {
-  const store = new Store(':memory:');
-  store.setWatchedPairs(PORTAL, [{ objectTypeId: DEAL, associatedObjectTypeId: CONTACT }]);
   const files = actions.flatMap(filesFor).sort((x, y) => x.pub - y.pub || (x.file.offset < y.file.offset ? -1 : 1));
   const start = Math.min(...files.map((f) => f.pub));
   const end = Math.max(...files.map((f) => f.pub)) + 60_000;
-  let now = start - 10_000;
-  const labels = new StoreLabelCache(store, async (_p, f, t) => (f === DEAL && t === CONTACT ? DEFS : []), undefined, () => now);
-  let next = 0;
-  const readJournal = async (): Promise<JournalReadResult> => {
-    const out: JournalFile[] = [];
-    while (next < files.length && files[next].pub + VISIBLE_DELAY <= now) out.push(files[next++].file);
-    return { files: out, nextOffset: out.at(-1)?.offset ?? null, full: false };
-  };
-  const sent: StampUpdate[] = [];
-  const queue = new StampQueue({
-    store,
-    tokens: {} as TokenProvider,
-    now: () => now,
-    log: () => {},
-    defaultSpacingMs: 3_000,
-    drainInline: false,
-    sendBatches: async (us) => {
-      sent.push(...us);
-      return us.map((update) => ({ update, ok: true as const }));
-    },
+  const rig = await replay({
+    portal: PORTAL, labels: DEAL_CONTACT_LABELS, files, start, end, tickMs: POLL,
+    delivery: delivery === 'immediate' ? 'immediate' : 'queue-at-end',
   });
-  const sendStamps =
-    delivery === 'immediate'
-      ? async (u: StampUpdate[], onDelivered: (d: StampUpdate[]) => void) => {
-          sent.push(...u);
-          // What the StampQueue does on success: remember which change each record shows.
-          const normal = u.filter((x) => x.amendOf === undefined);
-          store.setLastStampedChange(normal.map((x) => ({ recordKey: recordKey(x), changeId: stampIdOf(x) })), now);
-          store.markSeen(normal.map((x) => SENT_PREFIX + stampIdOf(x)), now);
-          onDelivered(u);
-        }
-      : (u: StampUpdate[], onDelivered: (d: StampUpdate[]) => void) => queue.sendStamps(u, onDelivered);
-  for (now = start; now <= end; now += POLL) {
-    await runOnce({ readJournal, sendStamps, store, labels, now: () => now });
-  }
-  assert.equal(store.loadPending().length, 0, 'nothing left on hold');
-  if (delivery === 'deferred') {
-    for (let i = 0; store.queueSize() > 0 && i < 10_000; i++) {
-      now += 1_000;
-      await queue.drain();
-    }
-    assert.equal(store.queueSize(), 0, 'queue drained');
-  }
-  const props = new Map<string, Record<string, string>>();
-  for (const u of sent) {
-    const k = recordKey(u);
-    props.set(k, { ...(props.get(k) ?? {}), ...(u.properties as Record<string, string>) });
-  }
-  return { sent, props, store };
+  return Object.assign(rig, { props: rig.props() });
 }
 
 const dealKey = (a: Action) => `${PORTAL}|${DEAL}|${a.dealId}`;
@@ -145,9 +77,10 @@ const triggersFor = (r: SimResult, a: Action) =>
   r.sent.filter((u) => u.amendOf === undefined && recordKey(u) === dealKey(a) && u.occurredAtMs === T0 + a.at);
 const amendsFor = (r: SimResult, a: Action) => r.sent.filter((u) => u.amendOf !== undefined && recordKey(u) === dealKey(a));
 const logRows = (r: SimResult, a: Action) =>
-  r.store.db
-    .prepare('SELECT change_id, change_type, labels_current, superseded_by FROM change_log WHERE object_id = ? AND occurred_at = ? ORDER BY created_at, change_id')
-    .all(String(a.dealId), atIso(a)) as { change_id: string; change_type: string; labels_current: string; superseded_by: string | null }[];
+  r.store.changes
+    .changesForRecords(PORTAL, DEAL, [String(a.dealId)], 0)
+    .filter((x) => x.occurredAt === atIso(a))
+    .sort((x, y) => x.createdAt - y.createdAt || x.changeId.localeCompare(y.changeId));
 // Option values key labels by type id (`0-1:<typeId>`); NAME documents which label each id is.
 const finalLabels = (a: Action) => (a.kind === 'unlink' ? 'none' : `0-1:${a.label}`);
 const finalType = (a: Action) => (a.kind === 'unlink' ? 'REMOVED' : 'ADDED');
@@ -163,9 +96,9 @@ function check(r: SimResult, a: Action, delivery: 'immediate' | 'deferred'): num
   assert.equal(p.changecatch_last_change_id, trig.at(-1)?.properties.changecatch_last_change_id, `last_change_id: ${what}`);
   assert.equal(p.changecatch_change_type, finalType(a), `final change type: ${what}`);
   // One change_log row per trigger: late halves never add rows of their own.
-  assert.deepEqual(rows.map((x) => x.change_id), trig.map((u) => u.properties.changecatch_last_change_id), `change_log rows = triggers: ${what}`);
-  assert.equal(rows.at(-1)?.change_type, finalType(a), `last change_log type: ${what}`);
-  assert.equal(rows.at(-1)?.labels_current, finalLabels(a), `last change_log labels_current: ${what}`);
+  assert.deepEqual(rows.map((x) => x.changeId), trig.map((u) => u.properties.changecatch_last_change_id), `change_log rows = triggers: ${what}`);
+  assert.equal(rows.at(-1)?.changeType, finalType(a), `last change_log type: ${what}`);
+  assert.equal(rows.at(-1)?.labelsCurrent, finalLabels(a), `last change_log labels_current: ${what}`);
   // A REMOVED never says "(unknown)": an unlinked pair has no labels.
   for (const u of trig) if (u.properties.changecatch_change_type === 'REMOVED') assert.equal(u.properties.changecatch_labels_current, 'none', what);
   // Amend stamps only touch the label properties: never a new change id (no extra enrollment), never the type.
@@ -181,10 +114,10 @@ function check(r: SimResult, a: Action, delivery: 'immediate' | 'deferred'): num
     assert.equal(trig.length, 2, `label-first after stamp -> LABEL_CHANGED then ${finalType(a)}: ${what}`);
     assert.equal(trig[0].properties.changecatch_change_type, 'LABEL_CHANGED', what);
     assert.notEqual(trig[1].properties.changecatch_last_change_id, trig[0].properties.changecatch_last_change_id, what);
-    assert.equal(rows[0].superseded_by, trig[1].properties.changecatch_last_change_id, `earlier row superseded: ${what}`);
+    assert.equal(rows[0].supersededBy, trig[1].properties.changecatch_last_change_id, `earlier row superseded: ${what}`);
   } else {
     assert.equal(trig.length, 1, `exactly one trigger: ${what}`);
-    for (const x of rows) assert.equal(x.superseded_by, null, what);
+    for (const x of rows) assert.equal(x.supersededBy, null, what);
   }
   return trig.length;
 }
@@ -216,7 +149,7 @@ test('real case deal 6212410158: unlink, REMOVED 3 first, label half 7.7 s later
   const r = await simulate([a], 'immediate');
   assert.equal(check(r, a, 'immediate'), 1);
   assert.deepEqual(
-    logRows(r, a).map((x) => [x.change_type, x.labels_current]),
+    logRows(r, a).map((x) => [x.changeType, x.labelsCurrent]),
     [['REMOVED', 'none']],
   );
   r.store.close();
@@ -252,7 +185,7 @@ for (const delivery of ['immediate', 'deferred'] as const) {
     const doubles = actions.filter((a) => delivery === 'immediate' && a.order === 'label first' && a.gap > DEFAULT_PAIRING_CONFIG.splitHoldMs).length;
     assert.equal(triggers, actions.length + doubles);
     const prior = actions.filter((a) => a.kind === 'unlink').length; // the earlier labeled links of the unlinked pairs
-    const total = Number((r.store.db.prepare('SELECT COUNT(*) AS n FROM change_log').get() as { n: number }).n);
+    const total = r.loggedChanges([...new Set(actions.map((a) => a.dealId))]).length;
     assert.equal(total, prior + triggers, 'change_log has no rows for late halves');
     r.store.close();
   });

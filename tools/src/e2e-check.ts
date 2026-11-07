@@ -12,7 +12,7 @@
 // Tokens (never printed):
 //   - app client credentials token (journal subscriptions)       -> service/src/hubspot/journal.ts
 //   - HUBSPOT_SETUP_TOKEN service key (makes the association changes)
-//   - portal OAuth token (reads the deal's changecatch_* properties) -> getToolPortalToken() (lib/portal-token.ts)
+//   - portal OAuth token (reads the deal's changecatch_* properties) -> toolTokens() (lib/portal-token.ts)
 //
 // Endpoints (docs checked 2026-10-30):
 //   Labels:  GET  /crm/associations/2026-09/0-3/0-1/labels
@@ -24,48 +24,43 @@
 //            https://developers.hubspot.com/docs/api-reference/latest/crm/associations/associate-records/guide.md
 //   Read:    GET  /crm/objects/2026-09/0-3/{dealId}?properties=...
 //
-// The worker DB (DB_PATH, see lib/paths.ts) is opened READ-ONLY. Creates and deletes NO records.
+// The worker DB (DB_PATH) is opened READ-ONLY. Creates and deletes NO records.
 
-import { env, optionalEnv } from './lib/env.js'; // must stay first
 import { writeFileSync, existsSync } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
+import { loadConfig } from '@changecatch/service/lib/config.js';
 import { hsRequest } from '@changecatch/service/lib/http.js';
-import { listSubscriptions, type Subscription } from '@changecatch/service/hubspot/journal.js';
-import { STAMP_PROPS } from '@changecatch/service/core/stamp.js';
+import { listLabelsRaw } from '@changecatch/service/hubspot/labels.js';
+import { journalClient, type Subscription } from '@changecatch/service/hubspot/journal.js';
+import { STAMP_PROPS } from '@changecatch/service/core/contract.js';
 import { labelOptionValue, splitValues } from '@changecatch/service/core/label-options.js';
-import { parseArgs, portalIdFrom } from './lib/cli.js';
-import { dbPath, samplePath } from './lib/paths.js';
-import { getToolPortalToken } from './lib/portal-token.js';
+import { flag, num, parseArgs, portalIdFrom, setupTokenOf, str } from './lib/cli.js';
+import { samplePath } from './lib/paths.js';
+import { toolTokens } from './lib/portal-token.js';
+import { withPortalToken } from '@changecatch/service/hubspot/portal-tokens.js';
 import { labelByName, testLabelNames } from './lib/test-labels.js';
+import type { ChangeType } from '@changecatch/service/core/types.js';
+import { CONTACT, DEAL, V, WorkerDb, readHealth, sleep, startTool, type Label } from './load-test-lib.js';
 
-const V = '2026-09';
-const DEAL = '0-3';
-const CONTACT = '0-1';
-const args = process.argv.slice(2);
-const flag = (n: string) => args.includes(n);
-const opt = (n: string) => (args.includes(n) ? args[args.indexOf(n) + 1] : undefined);
-
-const yes = flag('--yes');
-const parsed = parseArgs(args);
-const PORTAL_ID = portalIdFrom(parsed);
-const DEAL_ARG = opt('--deal');
+const config = loadConfig('tool');
+const parsed = parseArgs(process.argv.slice(2), ['yes']);
+const yes = flag(parsed, 'yes');
+const PORTAL_ID = portalIdFrom(parsed, config.tools.testPortalId);
+const DEAL_ARG = str(parsed, 'deal');
 if (!DEAL_ARG || !/^\d+$/.test(DEAL_ARG)) {
   console.error('Usage: tsx src/e2e-check.ts --portal <portalId> --deal <dealId> [--yes] [--contact <id>] [--labels "A,B"] [--gap 30] [--timeout 120]');
   process.exit(1);
 }
 const DEAL_ID: string = DEAL_ARG;
-const [LABEL_A, LABEL_B] = testLabelNames(parsed, 2);
-const gapSec = Number(opt('--gap')) || 30;
-const timeoutSec = Number(opt('--timeout')) || 120;
-const forcedContact = opt('--contact');
-const DB_PATH = dbPath();
-const HEALTH_PORT = Number(optionalEnv('WORKER_HEALTH_PORT') ?? 3002);
+const [LABEL_A, LABEL_B] = testLabelNames(parsed, 2, config.tools.testLabels);
+const gapSec = num(parsed, 'gap') ?? 30;
+const timeoutSec = num(parsed, 'timeout') ?? 120;
+const forcedContact = str(parsed, 'contact');
+const DB_PATH = config.dbPath;
+const HEALTH_PORT = config.worker.healthPort;
 const POLL_MS = 2_000;
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const now = () => new Date().toISOString();
 
-type Label = { category: string; typeId: number; label: string | null };
 type Props = Record<string, string | null>;
 
 interface CheckRow {
@@ -83,15 +78,13 @@ const record = (r: CheckRow) => {
 
 // ------------------------------------------------------------------ HubSpot helpers
 
-const setupToken = () => env('HUBSPOT_SETUP_TOKEN');
-
-const listLabels = async () =>
-  (await hsRequest<{ results: Label[] }>(`/crm/associations/${V}/${DEAL}/${CONTACT}/labels`, { token: setupToken() })).results;
+// The service key is for the test portal: its calls share that portal's rate-limit bucket (startTool).
+const setupAuth = () => ({ portalId: PORTAL_ID, token: setupTokenOf(config.tools) });
 
 async function linkTypes(dealId: string, contactId: string): Promise<unknown[]> {
   const r = await hsRequest<{ results: { toObjectId: number | string; associationTypes: unknown[] }[] }>(
     `/crm/objects/${V}/${DEAL}/${dealId}/associations/${CONTACT}`,
-    { token: setupToken(), query: { limit: 500 } },
+    { ...setupAuth(), query: { limit: 500 } },
   );
   return r.results.find((x) => String(x.toObjectId) === String(contactId))?.associationTypes ?? [];
 }
@@ -99,10 +92,10 @@ async function linkTypes(dealId: string, contactId: string): Promise<unknown[]> 
 async function freeContact(dealId: string): Promise<string> {
   const linked = await hsRequest<{ results: { toObjectId: number | string }[] }>(
     `/crm/objects/${V}/${DEAL}/${dealId}/associations/${CONTACT}`,
-    { token: setupToken(), query: { limit: 500 } },
+    { ...setupAuth(), query: { limit: 500 } },
   );
   const taken = new Set(linked.results.map((x) => String(x.toObjectId)));
-  const contacts = await hsRequest<{ results: { id: string }[] }>(`/crm/objects/${V}/${CONTACT}`, { token: setupToken(), query: { limit: 50 } });
+  const contacts = await hsRequest<{ results: { id: string }[] }>(`/crm/objects/${V}/${CONTACT}`, { ...setupAuth(), query: { limit: 50 } });
   const free = contacts.results.map((c) => c.id).find((id) => !taken.has(id));
   if (!free) throw new Error(`No contact among the first 50 is free (all linked to deal ${dealId}). Pass --contact <id>.`);
   return free;
@@ -110,50 +103,34 @@ async function freeContact(dealId: string): Promise<string> {
 
 const spec = (l: Label) => ({ associationCategory: l.category, associationTypeId: l.typeId });
 const putLabels = (d: string, c: string, labels: Label[]) =>
-  hsRequest(`/crm/objects/${V}/${DEAL}/${d}/associations/${CONTACT}/${c}`, { method: 'PUT', token: setupToken(), body: labels.map(spec) });
+  hsRequest(`/crm/objects/${V}/${DEAL}/${d}/associations/${CONTACT}/${c}`, { method: 'PUT', ...setupAuth(), body: labels.map(spec) });
 const archiveLabels = (d: string, c: string, labels: Label[]) =>
   hsRequest(`/crm/associations/${V}/${DEAL}/${CONTACT}/batch/labels/archive`, {
     method: 'POST',
-    token: setupToken(),
+    ...setupAuth(),
     body: { inputs: [{ from: { id: d }, to: { id: c }, types: labels.map(spec) }] },
   });
 const unlink = (d: string, c: string) =>
-  hsRequest(`/crm/objects/${V}/${DEAL}/${d}/associations/${CONTACT}/${c}`, { method: 'DELETE', token: setupToken() });
+  hsRequest(`/crm/objects/${V}/${DEAL}/${d}/associations/${CONTACT}/${c}`, { method: 'DELETE', ...setupAuth() });
 
 const PROP_LIST = Object.values(STAMP_PROPS);
 async function dealProps(): Promise<Props> {
-  const token = await getToolPortalToken({ portalId: PORTAL_ID });
-  const r = await hsRequest<{ properties: Props }>(`/crm/objects/${V}/${DEAL}/${DEAL_ID}`, {
-    token,
-    query: { properties: PROP_LIST.join(',') },
-  });
+  const r = await withPortalToken(toolTokens(config), PORTAL_ID, (auth) =>
+    hsRequest<{ properties: Props }>(`/crm/objects/${V}/${DEAL}/${DEAL_ID}`, { ...auth, query: { properties: PROP_LIST.join(',') } }),
+  );
   return r.properties ?? {};
 }
 
 // ------------------------------------------------------------------ local DB (read-only)
 
-function openDb(): DatabaseSync | null {
+function openDb(): WorkerDb | null {
   if (!existsSync(DB_PATH)) return null;
   try {
-    return new DatabaseSync(DB_PATH, { readOnly: true });
+    return new WorkerDb(DB_PATH, PORTAL_ID, config.tokenKey);
   } catch (e) {
     console.warn(`  could not open ${DB_PATH} read-only: ${(e as Error).message}`);
     return null;
   }
-}
-
-function changeRow(db: DatabaseSync | null, changeId: string): Record<string, unknown> | undefined {
-  if (!db) return undefined;
-  // Same lookup as Store.getChange (portal_id is part of the key).
-  return db.prepare('SELECT * FROM change_log WHERE change_id = ? AND portal_id = ?').get(changeId, PORTAL_ID) as Record<string, unknown> | undefined;
-}
-
-function watchedPairs(db: DatabaseSync | null): { object_type_id: string; associated_object_type_id: string }[] {
-  if (!db) return [];
-  return db.prepare('SELECT object_type_id, associated_object_type_id FROM portal_settings WHERE portal_id = ?').all(PORTAL_ID) as {
-    object_type_id: string;
-    associated_object_type_id: string;
-  }[];
 }
 
 // ------------------------------------------------------------------ pre-checks (read-only)
@@ -167,13 +144,13 @@ function coversDealContact(s: Subscription): 'deal-side' | 'contact-side' | null
   return null;
 }
 
-async function preChecks(db: DatabaseSync | null): Promise<boolean> {
+async function preChecks(db: WorkerDb | null): Promise<boolean> {
   console.log('\n== Pre-checks (read-only)');
   let ok = true;
 
   // (a) journal subscriptions
   try {
-    const subs = await listSubscriptions();
+    const subs = await journalClient(config.hubspot).listSubscriptions();
     const hits = subs.map((s) => ({ s, side: coversDealContact(s) })).filter((x) => x.side);
     out.subscriptions = hits.map((h) => ({ id: h.s.id, objectTypeId: h.s.objectTypeId, associatedObjectTypeIds: h.s.associatedObjectTypeIds, actions: h.s.actions, objectIds: h.s.objectIds }));
     const dealSide = hits.find((h) => h.side === 'deal-side');
@@ -192,22 +169,18 @@ async function preChecks(db: DatabaseSync | null): Promise<boolean> {
     record({ check: 'local DB', pass: false, detail: `${DB_PATH} not found / not readable. Is the worker using the same DB_PATH?` });
     ok = false;
   } else {
-    const pairs = watchedPairs(db);
-    const has = pairs.some(
-      (p) => (p.object_type_id === DEAL && p.associated_object_type_id === CONTACT) || (p.object_type_id === CONTACT && p.associated_object_type_id === DEAL),
-    );
-    record({ check: 'watched pair 0-3:0-1 in DB', pass: has, detail: has ? 'present' : `missing (have: ${pairs.map((p) => `${p.object_type_id}:${p.associated_object_type_id}`).join(', ') || 'none'}). Set WORKER_SEED_WATCHED_PAIRS=0-3:0-1` });
+    // The pairs the worker processes: the same rule as buildWorker (saved pairs minus inactive custom ones).
+    const has = db.watches(DEAL, CONTACT);
+    record({ check: 'watched pair 0-3:0-1 in DB', pass: has, detail: has ? 'present' : `missing (have: ${db.watchedPairs().join(', ') || 'none'}). Watch Deal<->Contact on the settings page` });
     ok &&= has;
   }
 
-  // worker health endpoint (informational only: a FAIL here does not block)
-  try {
-    const res = await fetch(`http://localhost:${HEALTH_PORT}/health`);
-    const body = (await res.json()) as Record<string, unknown>;
-    out.healthBefore = body;
-    record({ check: 'worker /health', pass: res.ok, detail: `HTTP ${res.status}, lastSuccessfulReadAt ${String(body.lastSuccessfulReadAt)}` });
-  } catch (e) {
-    record({ check: 'worker /health', pass: false, detail: `not reachable on :${HEALTH_PORT} (${(e as Error).message}). Is the worker running?` });
+  // worker health endpoint
+  const health = await readHealth(config.worker);
+  out.healthBefore = health;
+  if (health) record({ check: 'worker /health', pass: health.status === 'ok', detail: `status ${health.status}, lastSuccessfulReadAt ${health.lastSuccessfulReadAt}` });
+  else {
+    record({ check: 'worker /health', pass: false, detail: `not reachable on :${HEALTH_PORT}. Is the worker running?` });
     ok = false;
   }
 
@@ -228,7 +201,7 @@ async function preChecks(db: DatabaseSync | null): Promise<boolean> {
 // ------------------------------------------------------------------ steps
 
 interface Expect {
-  changeType: 'ADDED' | 'LABEL_CHANGED' | 'REMOVED';
+  changeType: ChangeType;
   beforeHas?: string; // option value that must be in changecatch_labels_before
   afterHas?: string; // option value that must be in changecatch_labels_after
 }
@@ -242,7 +215,7 @@ function matches(p: Props, contactId: string, e: Expect, baselineChangeId: strin
   return null;
 }
 
-async function runStep(db: DatabaseSync | null, name: string, contactId: string, action: () => Promise<unknown>, e: Expect) {
+async function runStep(db: WorkerDb | null, name: string, contactId: string, action: () => Promise<unknown>, e: Expect) {
   console.log(`\n== [${now()}] ${name}`);
   const baseline = (await dealProps())[STAMP_PROPS.changeId] ?? null;
   const t0 = Date.now();
@@ -296,16 +269,15 @@ async function runStep(db: DatabaseSync | null, name: string, contactId: string,
   }
   const latencyMs = stampedAt - tAction;
   step.latencyMs = latencyMs;
-  // Change ids start with the change's occurredAt in epoch ms ("<ms>-<hex>"); changecatch_last_change_at was cut (D5).
-  const changeAt = Number(String(last[STAMP_PROPS.changeId] ?? '').split('-')[0]);
-  if (Number.isFinite(changeAt) && changeAt > 0) step.occurredToStampMs = stampedAt - changeAt;
   record({ check: `${name}: deal stamped`, pass: true, detail: `${e.changeType}, id ${last[STAMP_PROPS.changeId]}, before ${last[STAMP_PROPS.labelBefore]}, after ${last[STAMP_PROPS.labelAfter]}`, latencyMs });
 
-  // (d) change_log row
-  const row = changeRow(db, String(last[STAMP_PROPS.changeId]));
+  // (d) change_log row; its occurredAt gives occurredAt -> stamped
+  const row = db?.store.changes.getChange(PORTAL_ID, String(last[STAMP_PROPS.changeId]));
   step.changeLogRow = row ?? null;
-  const rowOk = !!row && String(row.object_id) === DEAL_ID && row.change_type === e.changeType && String(row.other_record_id) === contactId;
-  record({ check: `${name}: change_log row`, pass: rowOk, detail: row ? `${row.change_type} ${row.object_type_id}/${row.object_id} -> ${row.other_record_id}` : db ? 'not found' : 'DB not readable' });
+  const changeAt = row ? Date.parse(row.occurredAt) : NaN;
+  if (Number.isFinite(changeAt)) step.occurredToStampMs = stampedAt - changeAt;
+  const rowOk = !!row && row.objectId === DEAL_ID && row.changeType === e.changeType && row.otherRecordId === contactId;
+  record({ check: `${name}: change_log row`, pass: rowOk, detail: row ? `${row.changeType} ${row.objectTypeId}/${row.objectId} -> ${row.otherRecordId}` : db ? 'not found' : 'DB not readable' });
   return true;
 }
 
@@ -336,13 +308,14 @@ function printTable() {
 function save(kind: string) {
   out.endedAt = now();
   out.checks = rows;
-  const file = samplePath(`e2e-${kind}`);
+  const file = samplePath(config.tools.samplesDir, `e2e-${kind}`);
   writeFileSync(file, JSON.stringify(out, null, 2));
   console.log(`Saved: ${file}`);
 }
 
 async function main() {
   console.log(PLAN);
+  startTool(config);
   const db = openDb();
   const ready = await preChecks(db);
 
@@ -359,7 +332,7 @@ async function main() {
     return;
   }
 
-  const labels = await listLabels();
+  const labels = (await listLabelsRaw(setupAuth(), DEAL, CONTACT)).results;
   const inf = labelByName(labels, LABEL_A);
   const dm = labelByName(labels, LABEL_B);
   const C = forcedContact ?? (await freeContact(DEAL_ID));

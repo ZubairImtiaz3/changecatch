@@ -3,14 +3,39 @@
 // Everything goes through redact() first, so tokens never reach the log.
 //
 // Usage:
-//   const log = createLogger('worker');
+//   const log = createLogger('worker');   // a process's root logger; children inherit its options
 //   log.info('journal_read', 'read 3 files', { files: 3, offset });
 //   log.child({ portalId: 123 }).warn('stamp_retry', 'retry in 30s', { attempts: 2 });
+//   log.alert('worker_stale', 'no successful journal read for 1 h');
 //
-// Env: LOG_LEVEL = debug | info | warn | error (default info). LOG_FORMAT = json (default) | pretty.
-// No dependencies on purpose.
+// Alerts: log.alert(name, msg) writes ONE line { level: "error", event: "alert", alert: name }. log.alertCleared(name,
+// msg) writes { level: "info", event: "alert_cleared", alert: name }. Search logs by event=alert, then alert=<name>
+// (docs/observability.md). Callers throttle repeated alerts themselves (obs/alerts.ts AlertThrottle).
+// Every alert name is in ALERTS (below); docs/runbook.md lists exactly these (obs.test.ts).
+//
+// Level and format: each entry point calls configureLogging(config.log) once (LOG_LEVEL / LOG_FORMAT, lib/config.ts).
 
-export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+/** Every alert name log.alert accepts. docs/runbook.md "Log strings to know" lists exactly these (obs.test.ts). */
+export const ALERTS = [
+  'worker_stale',
+  'offset_expired',
+  'journal_entries_skipped',
+  'journal_file_rejected',
+  'stamps_refused',
+  'portal_paused',
+  'pause_expired',
+  'uninstall_retry_failing',
+  'provisioning_failing',
+  'parked_entries_dropped',
+  'worker_lock_lost',
+  'worker_lock_refused',
+] as const;
+export type AlertName = (typeof ALERTS)[number];
+
+export const LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const;
+export type LogLevel = (typeof LOG_LEVELS)[number];
+export const LOG_FORMATS = ['json', 'pretty'] as const;
+export type LogFormat = (typeof LOG_FORMATS)[number];
 
 const LEVEL_RANK: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 
@@ -29,7 +54,7 @@ export type LogSink = (rec: LogRecord, line: string) => void;
 
 export interface LoggerOptions {
   level?: LogLevel;
-  format?: 'json' | 'pretty';
+  format?: LogFormat;
   sink?: LogSink;
   now?: () => number;
 }
@@ -68,7 +93,7 @@ const SECRET_KEYS = new Set([
 
 const normKey = (k: string) => k.toLowerCase().replace(/[_-]/g, '');
 
-export function isSecretKey(key: string): boolean {
+function isSecretKey(key: string): boolean {
   const k = normKey(key);
   if (SECRET_KEYS.has(k)) return true;
   // e.g. HUBSPOT_CLIENT_SECRET, changecatchRefreshToken, x-api-key
@@ -79,14 +104,16 @@ export function isSecretKey(key: string): boolean {
 const STRING_PATTERNS: { re: RegExp; replace: string | ((m: string, ...g: string[]) => string) }[] = [
   // Authorization: Bearer xxx / Basic xxx
   { re: /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, replace: (_m, scheme) => `${scheme} ${REDACTED}` },
+  // Signed URLs (journal file downloads): the whole query string is the credential.
+  { re: /(\bhttps?:\/\/[^\s?"']+)\?[^\s"']*(?:X-Amz-|\bsig=|\bsignature=)[^\s"']*/gi, replace: (_m, base) => `${base}?${REDACTED}` },
   // key=value in URLs, form bodies, or messages
   {
-    re: /\b(access_token|refresh_token|id_token|client_secret|hapikey|api_key|apikey|code|token|password|signature|X-Amz-Signature|X-Amz-Credential|sig)=([^&\s"']+)/gi,
+    re: /\b(access_token|refresh_token|id_token|client_secret|hapikey|api_key|apikey|code|state|token|password|signature|X-Amz-Signature|X-Amz-Credential|sig)=([^&\s"']+)/gi,
     replace: (_m, k) => `${k}=${REDACTED}`,
   },
   // "refresh_token": "..." inside JSON text that was logged as a string
   {
-    re: /("(?:access_token|refresh_token|id_token|client_secret|token|password)"\s*:\s*")[^"]*"/gi,
+    re: /("(?:access_token|refresh_token|id_token|client_secret|code|state|token|password|signature)"\s*:\s*")[^"]*"/gi,
     replace: (_m, prefix) => `${prefix}${REDACTED}"`,
   },
   // HubSpot private app / service keys / personal access keys: pat-na1-xxxxxxxx-xxxx-...
@@ -95,7 +122,7 @@ const STRING_PATTERNS: { re: RegExp; replace: string | ((m: string, ...g: string
   { re: /\b(?:na|eu|ap)\d-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f-]{8,}\b/gi, replace: REDACTED },
   // JWTs
   { re: /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*/g, replace: REDACTED },
-  // Sentry DSN / any URL with user:pass@ credentials
+  // Any URL with user:pass@ credentials (DSNs, connection strings)
   { re: /(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+(?::[^\s/@]*)?@/gi, replace: (_m, scheme) => `${scheme}${REDACTED}@` },
   // Long hex secrets (32+ hex chars, no dashes; UUIDs and journal offsets have dashes, so they survive)
   { re: /\b[0-9a-f]{32,}\b/gi, replace: REDACTED },
@@ -152,9 +179,12 @@ export function redact(value: unknown, depth = 0, seen: WeakSet<object> = new We
 // Logger
 // ---------------------------------------------------------------------------------------------
 
-function parseLevel(v: string | undefined): LogLevel | undefined {
-  const l = v?.toLowerCase();
-  return l === 'debug' || l === 'info' || l === 'warn' || l === 'error' ? l : undefined;
+/** Process-wide level and format for loggers without their own; read at log time, so module-level loggers follow. */
+let processDefaults: { level: LogLevel; format: LogFormat } = { level: 'info', format: 'json' };
+
+/** Called once by each entry point with config.log. */
+export function configureLogging(o: { level: LogLevel; format: LogFormat }): void {
+  processDefaults = { ...o };
 }
 
 const defaultSink: LogSink = (rec, line) => {
@@ -172,8 +202,6 @@ function formatPretty(r: LogRecord): string {
 const RESERVED = new Set(['level', 'ts', 'component', 'msg']);
 
 export class Logger {
-  private readonly minRank: number;
-  private readonly format: 'json' | 'pretty';
   private readonly sink: LogSink;
   private readonly now: () => number;
 
@@ -182,8 +210,6 @@ export class Logger {
     private readonly base: { portalId?: number; [k: string]: unknown } = {},
     private readonly opts: LoggerOptions = {},
   ) {
-    this.minRank = LEVEL_RANK[opts.level ?? parseLevel(process.env.LOG_LEVEL) ?? 'info'];
-    this.format = opts.format ?? (process.env.LOG_FORMAT === 'pretty' ? 'pretty' : 'json');
     this.sink = opts.sink ?? defaultSink;
     this.now = opts.now ?? Date.now;
   }
@@ -195,13 +221,14 @@ export class Logger {
   }
 
   enabled(level: LogLevel): boolean {
-    return LEVEL_RANK[level] >= this.minRank;
+    return LEVEL_RANK[level] >= LEVEL_RANK[this.opts.level ?? processDefaults.level];
   }
 
   log(level: LogLevel, event: string | undefined, msg: string, fields: Record<string, unknown> = {}): void {
     if (!this.enabled(level)) return;
     const merged = redact({ ...this.base, ...fields }) as Record<string, unknown>;
-    const rec: LogRecord = { level, ts: new Date(this.now()).toISOString(), component: this.component, msg: redactString(msg) };
+    // No CR/LF inside a message: one record = one line, also in the pretty format (log injection).
+    const rec: LogRecord = { level, ts: new Date(this.now()).toISOString(), component: this.component, msg: redactString(msg).replace(/[\r\n]+/g, ' ') };
     if (merged.portalId !== undefined) rec.portalId = merged.portalId as number;
     if (event) rec.event = event;
     for (const [k, v] of Object.entries(merged)) {
@@ -210,7 +237,7 @@ export class Logger {
     }
     let line: string;
     try {
-      line = this.format === 'pretty' ? formatPretty(rec) : JSON.stringify(rec);
+      line = (this.opts.format ?? processDefaults.format) === 'pretty' ? formatPretty(rec) : JSON.stringify(rec);
     } catch {
       line = JSON.stringify({ level, ts: rec.ts, component: this.component, msg: rec.msg, logError: 'fields not serialisable' });
     }
@@ -234,28 +261,17 @@ export class Logger {
     this.log('error', event, msg, fields);
   }
 
-  /**
-   * Adapter for the existing `(level, msg) => void` callbacks in src/worker and src/install,
-   * so they can switch to JSON logs without changing their signatures.
-   */
-  asLegacy(event?: string): (level: 'info' | 'warn' | 'error', msg: string) => void {
-    return (level, msg) => this.log(level, event, msg);
+  /** Something a human must act on: one line, level error, event "alert", field alert = `name`. */
+  alert(name: AlertName, msg: string, fields: Record<string, unknown> = {}): void {
+    this.log('error', 'alert', msg, { ...fields, alert: name });
   }
 
-  /** Adapter for `(msg) => void` callbacks (installer, lifecycle, app server). */
-  asLegacyInfo(event?: string): (msg: string) => void {
-    return (msg) => this.log('info', event, msg);
+  /** The condition behind alert `name` is gone: level info, event "alert_cleared". */
+  alertCleared(name: AlertName, msg: string, fields: Record<string, unknown> = {}): void {
+    this.log('info', 'alert_cleared', msg, { ...fields, alert: name });
   }
 }
 
 export function createLogger(component: string, opts?: LoggerOptions): Logger {
   return new Logger(component, {}, opts);
-}
-
-/** Test helper: a logger that collects records in memory. */
-export function memoryLogger(component = 'test', level: LogLevel = 'debug'): { log: Logger; records: LogRecord[]; lines: string[] } {
-  const records: LogRecord[] = [];
-  const lines: string[] = [];
-  const log = new Logger(component, {}, { level, format: 'json', sink: (r, l) => (records.push(r), lines.push(l)) });
-  return { log, records, lines };
 }

@@ -27,6 +27,16 @@ pnpm --filter @changecatch/service start:worker   # worker only (/health on port
 
 Both processes use `DB_PATH` (default `data/changecatch.db`). The `data/` folder and every `*.db` file are git-ignored.
 
+### Recreate the dev DB
+
+Needed once after the pre-launch squash ([decisions.md](decisions.md) D8): a DB file from before it is refused at start with "dev DB predates the squash". Also the way to start clean at any time.
+
+1. Stop the API server and the worker.
+2. Delete `service/data/changecatch.db` and its `-wal` / `-shm` files (or the file `DB_PATH` points to).
+3. In `.env`, set `TOKEN_ENC_KEYS` (for example `k1:<32-byte base64 key>`; an old `TOKEN_ENC_KEY` value can be reused as `k1:<that value>`). `TOKEN_ENC_KEY` is no longer read; delete it.
+4. Start both processes. The schema is created on first open.
+5. Reinstall the app on the test portal (open the API server's `/install`), then pick the watched pairs again on the settings page. Stored tokens, settings and history are gone with the old file; the properties and journal subscriptions in HubSpot are reused.
+
 ## Tests
 
 Tests use Node's built-in test runner through `tsx`. They run against in-memory SQLite and fake HubSpot clients, so they need no network and no `.env`.
@@ -38,7 +48,7 @@ pnpm --filter @changecatch/service test          # service only
 cd service && node --import tsx --test src/core/pairing.test.ts   # one file
 ```
 
-Where tests live: small unit tests sit next to the code they test (`service/src/**/foo.test.ts`). Large tests go in `service/test/`: real-data replays and load-test regressions in `test/replay/`, burst/scale and worker robustness in `test/scale/`, and fixtures shared by more than one of them in `test/fixtures/`. `pnpm test` runs both folders.
+Where tests live: small unit tests sit next to the code they test (`service/src/**/foo.test.ts`). Large tests go in `service/test/`: real-data replays and load-test regressions in `test/replay/`, burst/scale and worker robustness in `test/scale/`, and the shared test toolkit in `test/fixtures/` (used by both folders): journal events/files/offsets and fake journals (`journal.ts`), label fixtures (`labels.ts`), `memoryLogger` (`log.ts`), fake subscriptions (`subscriptions.ts`), the app-server fixture (`app-server.ts`), the replay driver (`replay.ts`), and `workerHarness` (`worker.ts`): the worker built by the production wiring (`buildWorker` in `src/worker/main.ts`) with HubSpot and the clock faked. `pnpm test` runs both folders.
 
 Areas with dedicated tests: pairing (including recorded journal payloads and split files), late-half absorption (including bursts), coalescing and stamp planning, the stamp queue and fair drain, the poller, label options, install and scopes, request-signature security, storage migrations, the HTTP client and rate limiter, and observability. CI runs `pnpm typecheck` and `pnpm test` on every push.
 
@@ -148,7 +158,7 @@ Main options: `--n` (100), `--relabel` (20), `--max-ops` (500, hard cap per run)
 - It creates and deletes **no records**. It only uses record pairs that are not linked today, so there are no existing labels to restore.
 - Every link it creates is removed in a `finally` block and re-read to confirm. Ctrl+C also cleans up; a second Ctrl+C quits without cleanup, and leftover pairs are saved to the result JSON.
 - The `--max-ops` cap is checked on the plan and again on every write. Cleanup unlinks are never blocked.
-- The tool sends at most 80 requests per 10 s, leaving room for the worker inside the account's 110 / 10 s limit.
+- The tool sends at most 80 requests per 10 s (`TOOL_RATE_PER_10S`). HubSpot counts burst limits per app, so the service key does not use the worker's 110 / 10 s; 80 stays under the lowest private-app tier (100 / 10 s). See the comment in `tools/src/load-test-lib.ts`.
 
 ### Output
 

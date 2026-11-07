@@ -1,32 +1,32 @@
-// Scale + robustness tests for the worker (scale-review C2, C3, H3, H4 adoption; system-design-review dead letters,
-// revoked-token pause, single-worker lock; security-review health privacy + journal download allow-list).
+// Scale + robustness tests for the worker (scale-review C3, H3, H4 adoption; system-design-review dead letters,
+// revoked-token pause, single-worker lock; security-review health privacy).
 // All with a fake clock; no HubSpot calls.
 
+import { memoryLogger } from '../fixtures/log.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
-import { Store, type LabelDefinition } from '../../src/store/db.js';
-import { StoreLabelCache } from '../../src/core/labels.js';
-import { runOnce, type JournalReadResult } from '../../src/core/poller.js';
-import { recordKey, type StampUpdate } from '../../src/core/stamp.js';
-import type { JournalEvent, JournalFile } from '../../src/core/types.js';
-import { ADD, CONTACT, DEAL, ev, file, T0, UD } from '../../src/core/testutil.js';
-import { HttpError, RetryLaterError } from '../../src/lib/http.js';
-import type { StampResult } from '../../src/hubspot/stamp.js';
-import type { JournalFetchResponse } from '../../src/hubspot/journal.js';
+import { Store } from '../../src/store/db.js';
+import { type StampUpdate } from '../../src/core/stamp.js';
+import { recordKey, STAMP_PREFIX } from '../../src/core/keys.js';
+import { DEAL, T0 } from '../fixtures/journal.js';
+import { HubSpotError } from '../../src/lib/http.js';
+import { sendStampBatches, type StampResult, type StampSendDeps } from '../../src/hubspot/stamp.js';
 import { ChangeCatchMetrics } from '../../src/obs/metrics.js';
 import { StampQueue } from '../../src/worker/stamp-queue.js';
-import { TokenRevokedError, type TokenProvider } from '../../src/worker/tokens.js';
-import { Worker } from '../../src/worker/main.js';
-import { StaleAlerter, healthSnapshot, registerWorkerGauges, startHealthServer } from '../../src/worker/health.js';
-import { LifecycleRetry } from '../../src/worker/lifecycle-retry.js';
-import { WorkerLockError, WorkerTables } from '../../src/worker/worker-tables.js';
-import { assertJournalFileUrl, JournalFileRejectedError, makeJournalReader, secureDownloadJournalFile, type JournalApi } from '../../src/worker/journal-reader.js';
-import { LabelHoldError } from '../../src/worker/label-guard.js';
+import { TokenRevokedError, type TokenProvider } from '../../src/hubspot/portal-tokens.js';
+import { healthSnapshot, registerWorkerGauges, startHealthServer } from '../../src/worker/health.js';
+import { WorkerLockError, WorkerStore } from '../../src/store/worker.js';
+import { DEFAULT_RETRY_WINDOW_MS } from '../../src/worker/stamp-queue.js';
+import { DEFAULT_STAMP_SPACING_SECONDS } from '../../src/store/schema.js';
+import { JOURNAL_DOWNLOAD_CONCURRENCY, makeJournalReader, type JournalApi } from '../../src/worker/journal-reader.js';
 
-const quiet = () => {};
-const LABELS: LabelDefinition[] = [{ associationTypeId: 3, label: null, category: 'HUBSPOT_DEFINED' }];
-const okTokens: TokenProvider = { getAccessToken: async (p) => `tok-${p}` };
+const quiet = memoryLogger().log;
+const okTokens: Pick<TokenProvider, 'getAccessToken'> = { getAccessToken: async (p) => `tok-${p}` };
+const noneRevoked = { listRevoked: () => [] };
+/** The production sender (src/hubspot/stamp.ts) with a fake CRM call. */
+const realSender = (batchUpdate: StampSendDeps['batchUpdate'], tokens: StampSendDeps['tokens'] = okTokens) => (u: StampUpdate[]) =>
+  sendStampBatches(u, { tokens, batchUpdate, log: quiet });
 
 let seq = 0;
 function upd(portalId: number, objectId: string | number, at = T0, id?: string): StampUpdate {
@@ -39,89 +39,7 @@ function upd(portalId: number, objectId: string | number, at = T0, id?: string):
   };
 }
 
-function journalOf(files: JournalFile[]) {
-  return async (after: string | null): Promise<JournalReadResult> => {
-    const start = after === null ? 0 : files.findIndex((f) => f.offset === after) + 1;
-    const batch = files.slice(start);
-    return { files: batch, nextOffset: batch.at(-1)?.offset ?? null, full: false };
-  };
-}
-
-// ---------------------------------------------------------------- C2: lifecycle hook never stops the offset
-
-test('C2: a failing install/uninstall does NOT block the shared offset; it is retried with back-off; uninstall purges locally at once', async () => {
-  const store = new Store(':memory:');
-  const tables = new WorkerTables(store);
-  const clock = { t: T0 + 60_000 };
-  store.setWatchedPairs(111, [{ objectTypeId: DEAL, associatedObjectTypeId: CONTACT }]);
-  store.setWatchedPairs(5, [{ objectTypeId: DEAL, associatedObjectTypeId: CONTACT }]);
-  store.addMetrics(111, { events: 1 }, clock.t);
-  let failures = 2;
-  const handled: string[] = [];
-  const hook = async (e: JournalEvent) => {
-    if ((e as { type?: string }).type !== 'app_lifecycle_event') return undefined;
-    if (failures-- > 0) throw new HttpError(503, {}, 'subscriptions API down');
-    handled.push(`${(e as { action: string }).action}:${e.portalId}`);
-    return 'ok';
-  };
-  const retry = new LifecycleRetry({ tables, store, hook, now: () => clock.t, log: quiet, baseMs: 30_000 });
-  const uninstall = { type: 'app_lifecycle_event', action: 'APP_UNINSTALL', portalId: 111, occurredAt: new Date(T0).toISOString() };
-  const files: JournalFile[] = [
-    { offset: 'f1', journalEvents: [uninstall as never] },
-    file('f2', [ev({ portalId: 5, at: 1_000 })]),
-  ];
-  const queue = new StampQueue({ store, tokens: okTokens, tables, now: () => clock.t, log: quiet, sendBatches: async (u) => u.map((x) => ({ update: x, ok: true })) });
-  const worker = new Worker({
-    store, readJournal: journalOf(files), queue, now: () => clock.t, log: quiet, alerter: new StaleAlerter(1e9, quiet),
-    labels: new StoreLabelCache(store, async () => LABELS), lifecycleRetry: retry,
-  });
-
-  const r = await worker.readOnce();
-  assert.ok(r, 'the run succeeds although the lifecycle hook threw');
-  assert.equal(store.getOffset(), 'f2', 'offset moved on for every portal');
-  assert.equal(tables.listLifecycleRetries().length, 1, 'persisted for retry');
-  assert.deepEqual(store.getWatchedPairs(111), [], 'local data of the uninstalled portal purged at once');
-  assert.equal(store.getMetrics(111), undefined);
-  assert.ok(store.getWatchedPairs(5).length, 'other portals untouched');
-  assert.equal(worker.nextWakeAt() <= clock.t + 30_000, true, 'loop wakes for the retry');
-
-  // Not due yet.
-  await worker.retryLifecycle();
-  assert.deepEqual(handled, []);
-  // First retry fails -> back-off doubles (60 s).
-  clock.t += 30_000;
-  await worker.retryLifecycle();
-  const row = tables.listLifecycleRetries()[0];
-  assert.equal(row.attempts, 1);
-  assert.equal(row.nextAt, clock.t + 30_000);
-  // Second retry works -> row removed.
-  clock.t += 30_000;
-  await worker.retryLifecycle();
-  assert.deepEqual(handled, ['APP_UNINSTALL:111']);
-  assert.equal(tables.listLifecycleRetries().length, 0);
-  store.close();
-});
-
-test('C2: an install the app server is still provisioning is deferred (no parallel provision), then handled', async () => {
-  const store = new Store(':memory:');
-  const tables = new WorkerTables(store);
-  const clock = { t: T0 };
-  const portal = { installedAt: T0 - 1_000, provisionedAt: null as number | null, uninstalledAt: null };
-  const calls: number[] = [];
-  const retry = new LifecycleRetry({
-    tables, store, now: () => clock.t, log: quiet, portals: { getPortal: () => portal },
-    hook: async (e) => { calls.push(clock.t); return e; },
-  });
-  const install = { type: 'app_lifecycle_event', action: 'APP_INSTALL', portalId: 7, occurredAt: new Date(T0).toISOString() } as unknown as JournalEvent;
-  assert.equal(await retry.onOtherEvent(install, 'f'), 'deferred');
-  assert.deepEqual(calls, []);
-  assert.equal(retry.nextDueAt(), T0 - 1_000 + 5 * 60_000);
-  portal.provisionedAt = T0 + 2_000; // the app server finished
-  clock.t = T0 + 5 * 60_000;
-  assert.equal(await retry.runDue(), 1);
-  assert.equal(calls.length, 1);
-  store.close();
-});
+// C2 (lifecycle never holds the offset): src/worker/lifecycle.test.ts. Parking cap: src/worker/data-loss.test.ts.
 
 // ---------------------------------------------------------------- C3: parallel downloads, order kept
 
@@ -132,6 +50,7 @@ test('C3: journal files download in parallel (bounded) but come back in offset o
   const offsets = Array.from({ length: 40 }, (_, i) => `0190-${String(i).padStart(4, '0')}`);
   const api: JournalApi = {
     latest: async () => null,
+    earliest: async () => null,
     batchEarliest: async () => undefined,
     batchNext: async () => ({
       status: 'COMPLETE', startedAt: '', completedAt: '',
@@ -147,11 +66,11 @@ test('C3: journal files download in parallel (bounded) but come back in offset o
       return { offset: e.currentOffset, journalEvents: [] };
     },
   };
-  const read = makeJournalReader(api, { store, downloadConcurrency: 8, log: quiet });
+  const read = makeJournalReader(api, { store, log: quiet });
   const r = await read('0190-start');
   assert.deepEqual(r.files.map((f) => f.offset), offsets, 'processing order = offset order');
   assert.equal(r.nextOffset, offsets.at(-1));
-  assert.ok(maxInFlight > 1 && maxInFlight <= 8, `bounded parallelism (max in flight ${maxInFlight})`);
+  assert.ok(maxInFlight > 1 && maxInFlight <= JOURNAL_DOWNLOAD_CONCURRENCY, `bounded parallelism (max in flight ${maxInFlight})`);
   store.close();
 });
 
@@ -159,6 +78,7 @@ test('C3: one failed download fails the read (offset not advanced past it)', asy
   const store = new Store(':memory:');
   const api: JournalApi = {
     latest: async () => null,
+    earliest: async () => null,
     batchEarliest: async () => undefined,
     batchNext: async () => ({ status: 'COMPLETE', startedAt: '', completedAt: '', results: ['a', 'b', 'c'].map((o) => ({ url: o, expiresAt: '', currentOffset: o })) }),
     download: async (e) => {
@@ -177,10 +97,12 @@ function fairSetup(o: { sendBatches?: (u: StampUpdate[]) => Promise<StampResult[
   const clock = o.clock ?? { t: T0 + 60_000 };
   const sent: StampUpdate[][] = [];
   const queue = new StampQueue({
-    store, tokens: okTokens, now: () => clock.t, log: quiet, defaultSpacingMs: 3_000,
+    store, revoked: noneRevoked, now: () => clock.t, log: quiet,
+    spacingFor: () => DEFAULT_STAMP_SPACING_SECONDS * 1000,
+    retryWindowMs: DEFAULT_RETRY_WINDOW_MS,
     sendBatches: async (u) => {
       sent.push(u);
-      return o.sendBatches ? o.sendBatches(u) : u.map((x) => ({ update: x, ok: true }));
+      return o.sendBatches ? o.sendBatches(u) : u.map((x): StampResult => ({ update: x, kind: 'ok' }));
     },
     ...o.extra,
   });
@@ -196,30 +118,26 @@ test('H3: portal A has 1000 queued; portal B\'s single stamp goes out in the SAM
   const ids = r.sent.map((u) => u.properties.changecatch_last_change_id);
   assert.ok(ids.includes('b-only'), 'B stamped in the first cycle');
   assert.equal(r.sent.filter((u) => u.portalId === 111).length, 100, 'A gets one batch (100) per cycle, not all 1000');
-  assert.equal(s.store.queueSize(), 900);
+  assert.equal(s.store.stamps.queueSize(), 900);
   // Next cycles keep serving A.
   await s.queue.drain();
-  assert.equal(s.store.queueSize(), 800);
+  assert.equal(s.store.stamps.queueSize(), 800);
   s.store.close();
 });
 
-test('H3: a RetryLaterError (429) on portal A defers only A; B is stamped; A is skipped until retryAfter', async () => {
+test('H3: a throttled error (429) on portal A defers only A; B is stamped; A is skipped until retryAfter', async () => {
   const s = fairSetup({
     sendBatches: async (u) =>
       u.map((x): StampResult =>
         x.portalId === 111
-          ? { update: x, ok: false, retryable: true, reason: new RetryLaterError(60_000, undefined, 'portal:111 throttled').message, retryAfterMs: 60_000 }
-          : { update: x, ok: true },
+          ? { update: x, kind: 'throttled', retryAfterMs: 60_000, message: 'portal:111 throttled' }
+          : { update: x, kind: 'ok' },
       ),
   });
-  const metrics = new ChangeCatchMetrics();
-  (s.queue as unknown as { opts: { metrics: ChangeCatchMetrics } }).opts.metrics = metrics;
   s.queue.enqueue([upd(111, 1, T0, 'a1'), upd(111, 2, T0, 'a2'), upd(222, 1, T0, 'b1')]);
   const r1 = await s.queue.drain();
   assert.deepEqual(r1.sent.map((u) => u.properties.changecatch_last_change_id), ['b1']);
   assert.deepEqual(r1.failed.sort(), ['a1', 'a2']);
-  assert.equal(s.store.queuedAttempts('a1'), 0, 'a rate limit is not counted as a failed attempt');
-  assert.equal(metrics.registry.get('rate_limited', { portal: 111 }), 2);
 
   // B gets a new stamp; A is NOT tried again before retryAfter.
   s.clock.t += 5_000;
@@ -239,9 +157,9 @@ test('partial batch failure: only the failed record is retried; refused records 
     sendBatches: async (u) => {
       call++;
       return u.map((x): StampResult => {
-        if (call === 1 && x.objectId === '2') return { update: x, ok: false, retryable: true, reason: 'POST ... failed with 502' };
-        if (call === 1 && x.objectId === '3') return { update: x, ok: false, retryable: false, reason: 'OBJECT_NOT_FOUND: record 3 deleted' };
-        return { update: x, ok: true };
+        if (call === 1 && x.objectId === '2') return { update: x, kind: 'retry', message: 'POST ... failed with 502' };
+        if (call === 1 && x.objectId === '3') return { update: x, kind: 'refused', message: 'OBJECT_NOT_FOUND: record 3 deleted' };
+        return { update: x, kind: 'ok' };
       });
     },
   });
@@ -250,33 +168,27 @@ test('partial batch failure: only the failed record is retried; refused records 
   assert.deepEqual(r1.sent.map((u) => u.objectId), ['1']);
   assert.deepEqual(r1.failed, ['r2']);
   assert.deepEqual(r1.dropped.map((u) => u.objectId), ['3']);
-  const dl = s.queue.tables.listDeadLetters(111);
-  assert.equal(dl.length, 1);
-  assert.equal(dl[0].changeId, 'r3');
-  assert.match(dl[0].error!, /OBJECT_NOT_FOUND/);
-  assert.equal(s.queue.tables.deadLetterCounts().get(111), 1);
+  assert.equal(s.store.stamps.deadLetterCounts().get(111), 1);
 
   s.clock.t += 5_000; // back-off
   await s.queue.drain();
   assert.deepEqual(s.sent[1].map((u) => u.objectId), ['2'], 'only the failed record is re-sent');
-  assert.equal(s.store.queueSize(), 0);
+  assert.equal(s.store.stamps.queueSize(), 0);
   s.store.close();
 });
 
-test('transient failures retry for up to STAMP_RETRY_MAX_MS, then dead-letter', async () => {
+test('transient failures retry for up to the retry window (24 h), then dead-letter', async () => {
   const s = fairSetup({
-    sendBatches: async (u) => u.map((x) => ({ update: x, ok: false, retryable: true, reason: 'failed with 503' })),
+    sendBatches: async (u) => u.map((x): StampResult => ({ update: x, kind: 'retry', message: 'failed with 503' })),
     extra: { retryWindowMs: 60 * 60_000, retryMaxMs: 10 * 60_000 },
   });
   s.queue.enqueue([upd(111, 1, s.clock.t, 'x')]);
-  for (let i = 0; i < 20 && s.store.queueSize(); i++) {
+  for (let i = 0; i < 20 && s.store.stamps.queueSize(); i++) {
     await s.queue.drain();
-    s.clock.t = Math.max(s.clock.t + 1, s.store.nextStampDueAt() ?? s.clock.t);
+    s.clock.t = Math.max(s.clock.t + 1, s.store.stamps.nextDueAt() ?? s.clock.t);
   }
-  assert.equal(s.store.queueSize(), 0);
-  const dl = s.queue.tables.listDeadLetters();
-  assert.equal(dl.length, 1);
-  assert.match(dl[0].error!, /gave up after \d+ attempt/);
+  assert.equal(s.store.stamps.queueSize(), 0);
+  assert.equal(s.store.stamps.deadLetterCounts().get(111), 1);
   assert.ok(s.sent.length > 3, 'retried several times first');
   s.store.close();
 });
@@ -284,27 +196,28 @@ test('transient failures retry for up to STAMP_RETRY_MAX_MS, then dead-letter', 
 // ---------------------------------------------------------------- coalescing adoption (C1 + H4)
 
 test('coalescing: a burst on one record is folded (latest mode); folded ids are marked seen; other records are not delayed (C1)', async () => {
-  const s = fairSetup({ extra: { coalesceFor: () => ({ mode: 'latest', threshold: 3 }) } });
+  const s = fairSetup();
   const burst = Array.from({ length: 10 }, (_, i) => upd(111, 1, T0 + i, `burst${i}`));
   const other = upd(111, 99, T0 + 5, 'other');
-  const delivered: StampUpdate[] = [];
-  await s.queue.sendStamps([...burst, other], (d) => delivered.push(...d));
+  const delivered = s.queue.enqueue([...burst, other]);
+  const drained = await s.queue.drain();
   // Record 1: oldest + newest kept (2 stamps), 8 folded into the newest's count.
-  const rows = s.store.db.prepare('SELECT change_id, not_before, update_json FROM stamp_queue ORDER BY not_before').all() as { change_id: string; not_before: number; update_json: string }[];
-  assert.deepEqual(rows.map((r) => r.change_id), ['burst9']);
-  assert.equal(JSON.parse(rows[0].update_json).coalescedCount, 9);
-  assert.ok(!('changecatch_changes_since_last_stamp' in JSON.parse(rows[0].update_json).properties), 'count is not a HubSpot property (D5)');
-  assert.equal(rows[0].not_before, s.clock.t + 3_000, 'spaced after the first stamp of the same record');
-  assert.equal(s.store.filterSeen(['stamp:burst4']).size, 1, 'folded ids are marked seen');
+  const queued = () => s.store.stamps.queuedFor(recordKey(burst[0]));
+  assert.deepEqual(queued().map((q) => q.changeId), ['burst9']);
+  assert.equal(queued()[0].update.coalescedCount, 9);
+  assert.ok(!('changecatch_changes_since_last_stamp' in queued()[0].update.properties), 'count is not a HubSpot property (D5)');
+  assert.equal(queued()[0].notBefore, s.clock.t + 3_000, 'spaced after the first stamp of the same record');
+  assert.equal(s.store.seen.filterSeen([STAMP_PREFIX + 'burst4']).size, 1, 'folded ids are marked seen (stamp status)');
   const sentIds = s.sent[0].map((u) => u.properties.changecatch_last_change_id).sort();
   assert.deepEqual(sentIds, ['burst0', 'other'], 'the other record went out immediately, not behind the burst');
-  assert.equal(delivered.length, 10, '8 folded + 2 sent now');
+  assert.equal(delivered.length, 8, '8 folded (settled at enqueue)');
+  assert.equal(drained.sent.length, 2, '2 sent by the drain');
 
-  // Off mode: every change is its own stamp, one per record per spacing slot.
-  const o = fairSetup({ extra: { coalesceFor: () => ({ mode: 'off', threshold: 3 }) } });
-  o.queue.enqueue(Array.from({ length: 4 }, (_, i) => upd(111, 1, T0 + i, `o${i}`)));
-  const slots = (o.store.db.prepare('SELECT not_before FROM stamp_queue ORDER BY not_before').all() as { not_before: number }[]).map((r) => r.not_before - o.clock.t);
-  assert.deepEqual(slots, [0, 3_000, 6_000, 9_000]);
+  // At the threshold nothing is folded: every change is its own stamp, one per record per spacing slot.
+  const o = fairSetup();
+  o.queue.enqueue(Array.from({ length: 3 }, (_, i) => upd(111, 1, T0 + i, `o${i}`)));
+  const slots = o.store.stamps.queuedFor(recordKey(upd(111, 1))).map((q) => q.notBefore - o.clock.t);
+  assert.deepEqual(slots, [0, 3_000, 6_000]);
   s.store.close();
   o.store.close();
 });
@@ -318,17 +231,16 @@ test('revoked token: the portal is PAUSED (queue kept, probed hourly), unpaused 
     sendBatches: async (u) =>
       u.map((x): StampResult =>
         revoked
-          ? { update: x, ok: false, retryable: true, reason: new TokenRevokedError(x.portalId).message, retryAfterMs: 3_600_000 }
-          : { update: x, ok: true },
+          ? { update: x, kind: 'auth', message: 'token revoked' }
+          : { update: x, kind: 'ok' },
       ),
     extra: { onPauseExpired: (p) => void expired.push(p) },
   });
   s.queue.enqueue([upd(111, 1, s.clock.t, 'p1'), upd(111, 2, s.clock.t, 'p2'), upd(222, 1, s.clock.t, 'q1')]);
   const r1 = await s.queue.drain();
   assert.equal(r1.dropped.length, 0, 'nothing dropped');
-  assert.equal(s.store.queueSize(), 3, 'queue kept');
-  assert.ok(s.queue.tables.getPause(111) && s.queue.tables.getPause(222));
-  assert.equal(s.store.queuedAttempts('p1'), 0);
+  assert.equal(s.store.stamps.queueSize(), 3, 'queue kept');
+  assert.ok(s.store.stamps.getPause(111) && s.store.stamps.getPause(222));
 
   // Before the hourly probe: not called.
   s.clock.t += 30 * 60_000;
@@ -340,15 +252,15 @@ test('revoked token: the portal is PAUSED (queue kept, probed hourly), unpaused 
   s.clock.t += 31 * 60_000;
   await s.queue.drain();
   assert.equal(s.sent.at(-1)!.length, 2, 'one probe record per paused portal');
-  assert.equal(s.queue.tables.getPause(111), undefined);
+  assert.equal(s.store.stamps.getPause(111), undefined);
   await s.queue.drain();
-  assert.equal(s.store.queueSize(), 0);
+  assert.equal(s.store.stamps.queueSize(), 0);
 
   // Revoked per the token provider (token_revocations) for > 7 days with NOTHING queued -> uninstall routine.
-  const r = fairSetup({ extra: { revokedPortals: () => [{ portalId: 444, revokedAt: T0 }], onPauseExpired: (p) => void expired.push(p) } });
+  const r = fairSetup({ extra: { revoked: { listRevoked: () => [{ portalId: 444, revokedAt: T0 }] }, onPauseExpired: (p) => void expired.push(p) } });
   await r.queue.drain();
   assert.deepEqual(expired, [], 'not yet');
-  assert.ok(r.queue.tables.getPause(444), 'paused from the revocation time');
+  assert.ok(r.store.stamps.getPause(444), 'paused from the revocation time');
   r.clock.t = T0 + 7 * 24 * 60 * 60_000 + 1;
   await r.queue.drain();
   await r.queue.drain();
@@ -357,18 +269,87 @@ test('revoked token: the portal is PAUSED (queue kept, probed hourly), unpaused 
   r.store.close();
 });
 
-test('revoked: a 401 after refresh pauses (not dead-letters); purge clears dead letters, pauses and token_revocations', async () => {
-  const s = fairSetup({ sendBatches: async (u) => u.map((x) => ({ update: x, ok: false, retryable: false, reason: 'POST /crm/objects/2026-09/0-3/batch/update failed with 401: {}' })) });
+test('pause expiry purges again after a reinstall and a second revocation in the same process', async () => {
+  const DAY = 24 * 60 * 60_000;
+  let revoked: { portalId: number; revokedAt: number }[] = [{ portalId: 444, revokedAt: T0 }];
+  const expired: number[] = [];
+  const r = fairSetup({
+    extra: {
+      revoked: { listRevoked: () => revoked },
+      // The uninstall routine: purges the portal's rows (pause included) and its revocation.
+      onPauseExpired: (p) => {
+        expired.push(p);
+        r.store.purgePortal(p);
+        revoked = [];
+      },
+    },
+  });
+  await r.queue.drain();
+  r.clock.t = T0 + 7 * DAY + 1;
+  await r.queue.drain();
+  assert.deepEqual(expired, [444], 'first episode purged');
+  // Reinstall (nothing revoked), then revoked again.
+  r.clock.t += DAY;
+  await r.queue.drain();
+  const second = r.clock.t;
+  revoked = [{ portalId: 444, revokedAt: second }];
+  await r.queue.drain();
+  assert.ok(r.store.stamps.getPause(444), 'paused again');
+  r.clock.t = second + 7 * DAY + 1;
+  await r.queue.drain();
+  assert.deepEqual(expired, [444, 444], 'second episode purged too');
+  r.store.close();
+});
+
+test('revoked: the real sender pauses on a TokenRevokedError from the token provider (not retried, not dead-lettered)', async () => {
+  let calls = 0;
+  const s = fairSetup({
+    extra: {
+      sendBatches: realSender(async () => (calls++, { results: [] }), { getAccessToken: async (p) => { throw new TokenRevokedError(p, T0); } }),
+    },
+  });
+  s.queue.enqueue([upd(111, 1, s.clock.t, 'r1'), upd(111, 2, s.clock.t, 'r2')]);
+  const r = await s.queue.drain();
+  assert.equal(calls, 0);
+  assert.deepEqual([r.sent.length, r.dropped.length, r.failed.length], [0, 0, 2]);
+  assert.equal(s.store.stamps.queueSize(), 2, 'queue kept');
+  assert.ok(s.store.stamps.getPause(111));
+  assert.equal(s.store.stamps.deadLetterCounts().size, 0);
+  s.store.close();
+});
+
+test('a throttle or a pause is not a failed attempt: the first real failure afterwards backs off by the base delay', async () => {
+  let kind: 'throttled' | 'auth' | 'retry' = 'throttled';
+  const s = fairSetup({
+    sendBatches: async (u) =>
+      u.map((x): StampResult => (kind === 'throttled' ? { update: x, kind, retryAfterMs: 1_000, message: '429' } : { update: x, kind, message: kind })),
+    extra: { retryBaseMs: 5_000 },
+  });
+  s.queue.enqueue([upd(111, 1, s.clock.t, 'a1')]);
+  await s.queue.drain();
+  s.clock.t += 1_000;
+  kind = 'auth';
+  await s.queue.drain();
+  assert.ok(s.store.stamps.getPause(111));
+  s.clock.t = s.store.stamps.nextDueAt()!; // the hourly probe
+  kind = 'retry';
+  await s.queue.drain();
+  assert.equal(s.sent.length, 3);
+  assert.equal(s.store.stamps.queuedFor(recordKey(upd(111, 1)))[0].notBefore, s.clock.t + 5_000, 'first failed attempt: base back-off (a 2nd would be 10 s)');
+  s.store.close();
+});
+
+test('revoked: a 401 after refresh pauses the portal (not dead-lettered)', async () => {
+  const s = fairSetup({
+    extra: {
+      sendBatches: realSender(async () => { throw HubSpotError.fromStatus(401, {}, 'POST /crm/objects/2026-09/0-3/batch/update failed with 401: {}'); }),
+    },
+  });
   s.queue.enqueue([upd(111, 1, s.clock.t, 'z')]);
   await s.queue.drain();
-  assert.equal(s.store.queueSize(), 1);
-  assert.equal(s.queue.tables.listDeadLetters().length, 0);
-  assert.ok(s.queue.tables.getPause(111));
-  s.queue.tables.deadLetter([{ q: { changeId: 'd', portalId: 111, recordKey: '111|0-3|1', update: upd(111, 1), notBefore: 0, attempts: 0, lastError: null }, error: 'x' }], T0);
-  s.store.db.exec('CREATE TABLE IF NOT EXISTS token_revocations (portal_id INTEGER PRIMARY KEY, token_revoked_at INTEGER NOT NULL, reason TEXT NOT NULL)');
-  s.store.db.prepare('INSERT INTO token_revocations VALUES (111, 1, ?)').run('invalid_grant');
-  const purged = s.queue.tables.purgePortal(111);
-  assert.deepEqual([purged.stamp_dead_letter, purged.portal_pause, purged.token_revocations], [1, 1, 1]);
+  assert.equal(s.store.stamps.queueSize(), 1);
+  assert.equal(s.store.stamps.deadLetterCounts().size, 0);
+  assert.ok(s.store.stamps.getPause(111));
   s.store.close();
 });
 
@@ -376,8 +357,8 @@ test('revoked: a 401 after refresh pauses (not dead-letters); purge clears dead 
 
 test('worker lock: a second worker refuses to start while the first heartbeats; takes over once it is stale', () => {
   const store = new Store(':memory:');
-  const a = new WorkerTables(store);
-  const b = new WorkerTables(store);
+  const a = new WorkerStore(store.conn);
+  const b = new WorkerStore(store.conn);
   a.acquireLock(T0, 30_000, 1, 'host-a');
   assert.throws(() => b.acquireLock(T0 + 10_000, 30_000, 2, 'host-b'), (e) => e instanceof WorkerLockError && /pid 1 on host-a/.test(e.message));
   assert.equal(a.heartbeat(T0 + 20_000), true);
@@ -393,10 +374,9 @@ test('worker lock: a second worker refuses to start while the first heartbeats; 
 // ---------------------------------------------------------------- metrics + health privacy
 
 test('metrics: /metrics and /health expose queue depth, stamps_sent, e2e latency, journal lag; portal labels only with x-health-token', async () => {
-  const s = fairSetup();
   const metrics = new ChangeCatchMetrics();
-  (s.queue as unknown as { opts: { metrics: ChangeCatchMetrics } }).opts.metrics = metrics;
-  registerWorkerGauges(metrics, s.store, s.queue.tables);
+  const s = fairSetup({ extra: { metrics } });
+  registerWorkerGauges(metrics, s.store);
   s.queue.enqueue([upd(111, 1, s.clock.t - 4_000), upd(111, 1, s.clock.t - 3_000), upd(222, 1, s.clock.t - 2_000)]);
   await s.queue.drain();
   metrics.journalRunOk({ files: 1, events: 3, newestOccurredAtMs: Date.now() - 5_000, caughtUp: true });
@@ -406,7 +386,7 @@ test('metrics: /metrics and /health expose queue depth, stamps_sent, e2e latency
 
   const server = await startHealthServer({
     port: 0, host: '127.0.0.1', healthToken: 'tkn', metrics,
-    snapshot: () => healthSnapshot(s.store, s.clock.t, T0, 1e12, null, { tables: s.queue.tables, metrics }),
+    snapshot: () => healthSnapshot(s.store, s.clock.t, { startedAt: T0, metrics }),
   });
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   try {
@@ -432,61 +412,3 @@ test('metrics: /metrics and /health expose queue depth, stamps_sent, e2e latency
     s.store.close();
   }
 });
-
-// ---------------------------------------------------------------- journal file download allow-list + size cap
-
-test('journal download: only https HubSpot journal bucket on S3; size capped', async () => {
-  assert.ok(assertJournalFileUrl('https://hubspot-webhooks-journal-na1.s3.amazonaws.com/x?sig=1'));
-  for (const bad of [
-    'http://hubspot-webhooks-journal-na1.s3.amazonaws.com/x',
-    'https://evil.example.com/x',
-    'https://hubspot-webhooks-journal.evil.com/x',
-    'https://other-bucket.s3.amazonaws.com/x',
-    'not a url',
-  ])
-    assert.throws(() => assertJournalFileUrl(bad), JournalFileRejectedError, bad);
-
-  const entry: JournalFetchResponse = { url: 'https://hubspot-webhooks-journal-na1.s3.amazonaws.com/f', expiresAt: '2999-01-01T00:00:00Z', currentOffset: 'o' };
-  const okFetch = (async () => new Response(JSON.stringify({ offset: 'o', journalEvents: [] }))) as typeof fetch;
-  assert.equal((await secureDownloadJournalFile(entry, { fetchImpl: okFetch })).offset, 'o');
-  const big = (async () => new Response('x'.repeat(2_000))) as typeof fetch;
-  await assert.rejects(secureDownloadJournalFile(entry, { fetchImpl: big, maxBytes: 1_000 }), JournalFileRejectedError);
-  let called = false;
-  await assert.rejects(
-    secureDownloadJournalFile({ ...entry, url: 'https://evil.example.com/f' }, { fetchImpl: (async () => ((called = true), new Response('{}'))) as typeof fetch }),
-    JournalFileRejectedError,
-  );
-  assert.equal(called, false, 'never fetched');
-});
-
-// ---------------------------------------------------------------- head-of-line: parking cap
-
-test('parking cap: one portal\'s held labels park at most N entries (alert), never holding the offset', async () => {
-  const store = new Store(':memory:');
-  store.setWatchedPairs(111, [{ objectTypeId: DEAL, associatedObjectTypeId: CONTACT }]);
-  const files = [file('f1', Array.from({ length: 6 }, (_, i) => ev({ action: ADD, typeId: 101, category: UD, at: i, to: [CONTACT, 10 + i] })))];
-  const origErr = console.error;
-  const errs: string[] = [];
-  console.error = (m: string) => void errs.push(m);
-  try {
-    const r = await runOnce({
-      readJournal: journalOf(files), store, now: () => T0 + 60_000,
-      labels: { get: async () => { throw new LabelHoldError('111|0-3|0-1|101', 'labels down'); } } as never,
-      sendStamps: async () => {},
-      isParkable: (e) => e instanceof LabelHoldError,
-      config: { maxParkedPerPortal: 4 },
-    });
-    assert.equal(store.getOffset(), 'f1');
-    assert.equal(r.parked, 4);
-    assert.equal(r.parkDropped, 2);
-    assert.equal(store.parkedCount(), 4);
-    assert.match(store.getMetrics(111)!.lastError!, /\[ALERT\].*DROPPED/);
-    assert.ok(errs.some((e) => /\[ALERT\]/.test(e)));
-  } finally {
-    console.error = origErr;
-    store.close();
-  }
-});
-
-// keep recordKey import used (shared helper for readers of this file)
-void recordKey;

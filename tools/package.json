@@ -6,8 +6,6 @@
   "scripts": {
     "load-test": "tsx src/load-test.ts",
     "e2e-check": "tsx src/e2e-check.ts",
-    "properties-setup": "tsx src/properties-setup.ts",
-    "labels-sync": "tsx src/labels-sync.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

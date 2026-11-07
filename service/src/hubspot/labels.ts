@@ -9,11 +9,9 @@
 // Scope: any one CRM object read scope (e.g. crm.objects.deals.read) is accepted by this endpoint.
 // Note: typeIds are per DIRECTION. Deal->Contact and Contact->Deal have different typeIds for the same label.
 
-import { hsRequest } from '../lib/http.js';
-import { portalIdForToken } from '../lib/rate-limiter.js';
-import type { LabelDefinition } from '../store/db.js';
-
-export const ASSOCIATIONS_VERSION = '2026-09';
+import { HUBSPOT_API_VERSION, hsRequest, type PortalAuth } from '../lib/http.js';
+import type { LabelDefinition } from '../core/types.js';
+import { labelPairKey } from '../core/keys.js';
 
 export interface RawLabel {
   category: string;
@@ -21,76 +19,50 @@ export interface RawLabel {
   label: string | null;
 }
 
-/**
- * Fresh read (no cache). The result is also written to the in-memory label cache below, when we know the token's
- * portal (src/lib/rate-limiter.ts token registry), so a sync right after the worker's lookup costs no extra call.
- */
-export async function listLabelsRaw(token: string, fromObjectType: string, toObjectType: string): Promise<{ results: RawLabel[] }> {
-  // GET /crm/associations/2026-09/{fromObjectType}/{toObjectType}/labels
-  // https://developers.hubspot.com/docs/api-reference/latest/crm/associations/associations-schema/labels/get-associations-label
-  const res = await hsRequest<{ results: RawLabel[] }>(
-    `/crm/associations/${ASSOCIATIONS_VERSION}/${encodeURIComponent(fromObjectType)}/${encodeURIComponent(toObjectType)}/labels`,
-    { token },
+type LabelList = { results: RawLabel[] };
+
+/** Fresh read (no cache). */
+export async function listLabelsRaw(auth: PortalAuth, fromObjectType: string, toObjectType: string): Promise<LabelList> {
+  return hsRequest<LabelList>(
+    `/crm/associations/${HUBSPOT_API_VERSION}/${encodeURIComponent(fromObjectType)}/${encodeURIComponent(toObjectType)}/labels`,
+    { ...auth },
   );
-  const portalId = portalIdForToken(token);
-  if (portalId !== undefined) labelCache.set(cacheKey(portalId, fromObjectType, toObjectType), { at: Date.now(), value: res });
-  return res;
-}
-
-// ---------- in-memory cache: one entry per (portal, fromType, toType) ----------
-// Label definitions change rarely. The worker's durable cache is the store (label_definitions) and it only calls
-// listLabels when a typeId is unknown. This cache is for the property/option sync (both directions, per object type,
-// possibly for both sides of a pair) so the same definitions are fetched once, not once per object type or event.
-
-/** Default max age for cached label lists. Short, because a sync usually runs BECAUSE a label was just added. */
-export const LABEL_CACHE_MAX_AGE_MS = 10_000;
-const labelCache = new Map<string, { at: number; value: { results: RawLabel[] } }>();
-const labelInflight = new Map<string, Promise<{ results: RawLabel[] }>>();
-const cacheKey = (portalId: number, from: string, to: string) => `${portalId}|${from}|${to}`;
-
-/**
- * Label definitions for (portal, from, to), served from memory when younger than maxAgeMs.
- * Concurrent misses for the same key share one request. forceRefresh skips the cache (still single-flight).
- */
-export async function getLabelsCached(
-  token: string,
-  portalId: number,
-  fromObjectType: string,
-  toObjectType: string,
-  opts: { maxAgeMs?: number; forceRefresh?: boolean; now?: () => number; fetch?: typeof listLabelsRaw } = {},
-): Promise<{ results: RawLabel[] }> {
-  const now = opts.now ?? Date.now;
-  const k = cacheKey(portalId, fromObjectType, toObjectType);
-  const hit = labelCache.get(k);
-  if (!opts.forceRefresh && hit && now() - hit.at <= (opts.maxAgeMs ?? LABEL_CACHE_MAX_AGE_MS)) return hit.value;
-  const pending = labelInflight.get(k);
-  if (pending) return pending;
-  const p = (async () => {
-    try {
-      const value = await (opts.fetch ?? listLabelsRaw)(token, fromObjectType, toObjectType);
-      labelCache.set(k, { at: now(), value });
-      return value;
-    } finally {
-      labelInflight.delete(k);
-    }
-  })();
-  labelInflight.set(k, p);
-  return p;
-}
-
-/** Drop cached labels for one portal (uninstall, settings change) or all. */
-export function clearLabelCache(portalId?: number): void {
-  if (portalId === undefined) return labelCache.clear();
-  for (const k of labelCache.keys()) if (k.startsWith(`${portalId}|`)) labelCache.delete(k);
 }
 
 /** Same data, in the shape the store / label cache uses. */
-export async function listLabels(token: string, fromObjectType: string, toObjectType: string): Promise<LabelDefinition[]> {
-  const { results } = await listLabelsRaw(token, fromObjectType, toObjectType);
+export async function listLabels(auth: PortalAuth, fromObjectType: string, toObjectType: string): Promise<LabelDefinition[]> {
+  const { results } = await listLabelsRaw(auth, fromObjectType, toObjectType);
   return results.map((r) => ({ associationTypeId: r.typeId, label: r.label, category: r.category }));
 }
 
-/** typeId -> label (null = unlabeled default). */
-export function toLabelMap(defs: LabelDefinition[]): Map<number, LabelDefinition> {
-  return new Map(defs.map((d) => [d.associationTypeId, d]));
+/**
+ * Short-lived label lists per (portal, from, to), owned by the caller that creates it. Concurrent misses for the same
+ * key share one request. The worker's durable label cache is the store (label_definitions); this one only spares the
+ * dropdown option sync repeat reads of the same direction.
+ */
+export class LabelListCache {
+  private readonly entries = new Map<string, { at: number; value: LabelList }>();
+  private readonly inflight = new Map<string, Promise<LabelList>>();
+
+  /** maxAgeMs is short because a sync usually runs BECAUSE a label was just added. */
+  constructor(
+    private readonly opts: { fetch?: typeof listLabelsRaw; now?: () => number; maxAgeMs?: number } = {},
+  ) {}
+
+  get(auth: PortalAuth, fromObjectType: string, toObjectType: string): Promise<LabelList> {
+    const now = this.opts.now ?? Date.now;
+    const k = labelPairKey(auth.portalId, fromObjectType, toObjectType);
+    const hit = this.entries.get(k);
+    if (hit && now() - hit.at <= (this.opts.maxAgeMs ?? 10_000)) return Promise.resolve(hit.value);
+    const pending = this.inflight.get(k);
+    if (pending) return pending;
+    const p = (this.opts.fetch ?? listLabelsRaw)(auth, fromObjectType, toObjectType)
+      .then((value) => {
+        this.entries.set(k, { at: now(), value });
+        return value;
+      })
+      .finally(() => this.inflight.delete(k));
+    this.inflight.set(k, p);
+    return p;
+  }
 }

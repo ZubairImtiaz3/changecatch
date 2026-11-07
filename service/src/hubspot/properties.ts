@@ -1,4 +1,5 @@
-// ChangeCatch property group + properties, created per object type in the customer's portal.
+// HubSpot client for the ChangeCatch property group + properties (definitions: src/core/contract.ts), created per
+// object type in the customer's portal.
 // Uses the customer's OAuth token (NOT the client credentials token).
 //
 // Docs (checked 2026-10-30, all date-based 2026-09):
@@ -15,11 +16,6 @@
 //   Update property  PATCH /crm/properties/2026-09/{objectType}/{propertyName}  ("Provided fields will be overwritten":
 //     an `options` array REPLACES the whole list, so we always send existing + new options)
 //     https://developers.hubspot.com/docs/api-reference/latest/crm/properties/update-property.md
-//   Changing a text property to multiple checkboxes is allowed (KB: "a dropdown option will be created for every unique
-//     text value"; "changing an existing property's field type can invalidate current values"):
-//     https://knowledge.hubspot.com/properties/create-and-edit-properties
-//   Custom object names  GET /crm-object-schemas/2026-09/schemas
-//     https://developers.hubspot.com/docs/api-reference/latest/crm/objects/schemas/guide#retrieve-existing-custom-object-schemas
 //   objectType may be an objectTypeId (0-1, 0-3, 2-xxx):
 //     https://developers.hubspot.com/docs/api-reference/latest/crm/using-object-apis.md
 //   Batch read       POST /crm/properties/2026-09/{objectType}/batch/read
@@ -31,122 +27,37 @@
 //     https://developers.hubspot.com/docs/api-reference/latest/crm/properties/batch/create-properties.md
 //   UNCONFIRMED live: whether batch/read returns 207 or a whole-call error when a name does not exist. We treat
 //   "not in results" as missing, and fall back to the full GET list if the batch read itself fails with a 4xx.
-// Scopes: crm.schemas.{contacts|companies|deals}.write for standard objects, crm.schemas.custom.write for 2-xxx.
+// Scopes: crm.schemas.<object>.write (core/contract.ts scopesFor).
 // The docs list no 409 for duplicates, so we check existence with a read first instead of relying on an error.
-// Call budget per object type (install): 1 group GET + 1 batch read + (1 group POST) + 1 batch create + 1 PATCH per
-// label property that needs a migration. Option sync: label reads (cached, src/hubspot/labels.ts) + 1 property read
-// + at most 1 PATCH per label property (only when an option is missing; options diffed locally).
 
 import {
-  buildLabelOptions,
-  buildObjectTypeOptions,
+  CHANGECATCH_PROPERTIES,
+  CUSTOM_OBJECT_SCOPES,
   FIXED_OPTIONS,
-  MAX_OPTIONS,
-  mergeOptions,
-  otherTypesFor,
-  type LabelSource,
+  GROUP_LABEL,
+  GROUP_NAME,
+  isCustomObjectType,
+  scopesFor,
+  STAMP_PROPS,
+  STANDARD_OBJECT_NAMES,
+  SYNCED_ENUM_PROPERTY_NAMES,
+  type PropertyDefinition,
   type PropertyOption,
-} from '../core/label-options.js';
-import { STAMP_PROPS, STANDARD_OBJECT_NAMES } from '../core/stamp.js';
+} from '../core/contract.js';
+import { desiredSyncedOptions, MAX_OPTIONS, mergeOptions, otherTypesFor, type LabelSource } from '../core/label-options.js';
 import type { WatchedPair } from '../core/types.js';
-import { HttpError, hsRequest } from '../lib/http.js';
-import { getLabelsCached } from './labels.js';
+import { listCustomObjectTypes } from './object-types.js';
+import { HUBSPOT_API_VERSION as V, hsRequest, HubSpotError, type PortalAuth } from '../lib/http.js';
+import { createLogger } from '../obs/log.js';
+import { LabelListCache } from './labels.js';
+import { batchErrorFor, type BatchError } from './batch.js';
 
-const V = '2026-09';
-export const GROUP_NAME = 'changecatch';
-export const GROUP_LABEL = 'ChangeCatch';
+const log = createLogger('properties');
 
-export interface PropertyDefinition {
-  name: string;
-  label: string;
-  description: string;
-  type: 'string' | 'datetime' | 'enumeration' | 'number';
-  fieldType: 'text' | 'date' | 'select' | 'checkbox' | 'number';
-  groupName: string;
-  displayOrder: number;
-  formField: boolean;
-  options?: PropertyOption[];
-}
-
-const def = (
-  name: string,
-  label: string,
-  description: string,
-  type: PropertyDefinition['type'],
-  displayOrder: number,
-  options?: string[] | PropertyOption[],
-  fieldType?: PropertyDefinition['fieldType'],
-): PropertyDefinition => ({
-  name,
-  label,
-  description,
-  type,
-  fieldType: fieldType ?? (type === 'string' ? 'text' : type === 'datetime' ? 'date' : 'select'),
-  groupName: GROUP_NAME,
-  displayOrder,
-  formField: false,
-  ...(options
-    ? { options: options.map((v, i) => (typeof v === 'string' ? { label: v, value: v, displayOrder: i, hidden: false } : { ...v })) }
-    : {}),
-});
-
-/**
- * The 3 label properties are "multiple checkboxes" (enumeration + checkbox): several labels can change at once,
- * values are ";"-separated, and workflow filters can match "is any of" / "is all of" the options.
- * Options = (none), (unknown) + one per (other object type, label), synced by syncLabelOptions.
- */
-export const LABEL_PROPERTY_NAMES: string[] = [STAMP_PROPS.labelBefore, STAMP_PROPS.labelAfter, STAMP_PROPS.labelsCurrent];
-const LABEL_HELP = 'Pick labels from the list. "Billing contact (Contact)" = the "Billing contact" label toward a contact.';
-
-/**
- * Naming (review 2026-11-07, docs/decisions.md): internal names `changecatch_` + snake_case and option VALUES are frozen
- * once customers install; labels ("ChangeCatch: ..." in sentence case) and option labels can change any time.
- * change_type values stay ADDED / REMOVED / LABEL_CHANGED; only their display labels are human-readable.
- */
-export const CHANGE_TYPE_OPTIONS: PropertyOption[] = [
-  { label: 'Added', value: 'ADDED', displayOrder: 0, hidden: false },
-  { label: 'Removed', value: 'REMOVED', displayOrder: 1, hidden: false },
-  { label: 'Label changed', value: 'LABEL_CHANGED', displayOrder: 2, hidden: false },
-];
-
-/** Standard objects always offered in changecatch_other_object_type; custom objects are added by the option sync. */
-export const STANDARD_OTHER_TYPES = ['0-1', '0-2', '0-3', '0-5'];
-
-/** Properties whose options the sync keeps up to date (label + type dropdowns). */
-export const SYNCED_ENUM_PROPERTY_NAMES: string[] = [STAMP_PROPS.changeType, STAMP_PROPS.otherObjectType, ...LABEL_PROPERTY_NAMES];
-
-/**
- * The 7 ChangeCatch properties. Same set on every object type. Earlier builds created other names
- * (changecatch_last_change_at, changecatch_changes_since_last_stamp, changecatch_label_before/_after). Copies that
- * already exist in installed portals are left alone (never deleted).
- */
-export const CHANGECATCH_PROPERTIES: PropertyDefinition[] = [
-  def(STAMP_PROPS.changeId, 'ChangeCatch: last change ID',
-    'Set by ChangeCatch. Gets a new value on every association change. Use "Property value changed" on this property as the workflow trigger.', 'string', 1),
-  def(STAMP_PROPS.changeType, 'ChangeCatch: change type', 'Set by ChangeCatch. Added, Removed or Label changed.', 'enumeration', 2,
-    CHANGE_TYPE_OPTIONS),
-  def(STAMP_PROPS.otherObjectType, 'ChangeCatch: other object type', 'Set by ChangeCatch. The type of the record on the other side of the association.', 'enumeration', 3,
-    buildObjectTypeOptions(STANDARD_OTHER_TYPES, STANDARD_OBJECT_NAMES)),
-  def(STAMP_PROPS.otherRecordId, 'ChangeCatch: other record ID', 'Set by ChangeCatch. The ID of the record on the other side of the association.', 'string', 4),
-  def(STAMP_PROPS.labelBefore, 'ChangeCatch: labels before',
-    `Set by ChangeCatch. Labels before the change. "(none)" if there were none, "(unknown)" if ChangeCatch could not tell. ${LABEL_HELP}`,
-    'enumeration', 5, FIXED_OPTIONS, 'checkbox'),
-  def(STAMP_PROPS.labelAfter, 'ChangeCatch: labels after',
-    `Set by ChangeCatch. Labels after the change. "(none)" if there are none, "(unknown)" if ChangeCatch could not tell. ${LABEL_HELP}`,
-    'enumeration', 6, FIXED_OPTIONS, 'checkbox'),
-  def(STAMP_PROPS.labelsCurrent, 'ChangeCatch: current labels',
-    `Set by ChangeCatch. All labels on the association now. "(none)" if there are none. ${LABEL_HELP}`,
-    'enumeration', 7, FIXED_OPTIONS, 'checkbox'),
-];
-
-export type PropertyStatus =
+type PropertyStatus =
   | 'created'
   | 'exists'
-  | 'would-create'
   | 'exists-mismatch'
-  | 'would-migrate'
-  | 'migrated'
-  | 'would-update'
   | 'updated'
   | 'error';
 
@@ -157,14 +68,24 @@ export interface SetupReport {
   /** Set when the object type needs a scope the install did not grant. */
   missingScope?: string;
   error?: string;
+  /** Why this report is a failure (see failureOf); unset when every property is usable. */
+  failure?: string;
 }
 
-export function schemaWriteScopeFor(objectType: string): string {
-  if (objectType.startsWith('2-')) return 'crm.schemas.custom.write';
-  return (
-    { '0-1': 'crm.schemas.contacts.write', '0-2': 'crm.schemas.companies.write', '0-3': 'crm.schemas.deals.write' }[objectType] ??
-    `crm.schemas.<${objectType}>.write`
-  );
+/**
+ * One line saying why stamps could be refused: a missing scope, a whole-call error, or the first property that is in
+ * error or exists with another type (a stamp on a property of the wrong type is refused by HubSpot). undefined = usable.
+ */
+function failureOf(r: { error?: string; missingScope?: string; properties: { name: string; status: PropertyStatus; detail?: string }[] }): string | undefined {
+  if (r.missingScope) return `missing scope ${r.missingScope}`;
+  if (r.error) return r.error;
+  const bad = r.properties.find((p) => p.status === 'error' || p.status === 'exists-mismatch');
+  return bad && `${bad.name}: ${bad.detail ?? bad.status}`;
+}
+
+function withFailure<T extends Parameters<typeof failureOf>[0]>(r: T): T & { failure?: string } {
+  const failure = failureOf(r);
+  return failure === undefined ? r : { ...r, failure };
 }
 
 interface ExistingProperty {
@@ -175,13 +96,9 @@ interface ExistingProperty {
   options?: PropertyOption[];
 }
 
-/**
- * Every property on the object type, in one GET. Used by the label option sync (one call per sync, no per-property
- * reads). readProperties (batch/read) is lighter, but the option sync keeps this call for now because the worker's
- * tests (src/worker/hooks.test.ts) stub exactly this endpoint; switch it once those stubs know batch/read.
- */
-export async function listProperties(token: string, objectType: string): Promise<ExistingProperty[]> {
-  const res = await hsRequest<{ results: ExistingProperty[] }>(`/crm/properties/${V}/${encodeURIComponent(objectType)}`, { token });
+/** Every property on the object type, in one GET (readProperties' fallback). */
+async function listProperties(auth: PortalAuth, objectType: string): Promise<ExistingProperty[]> {
+  const res = await hsRequest<{ results: ExistingProperty[] }>(`/crm/properties/${V}/${encodeURIComponent(objectType)}`, { ...auth });
   return res?.results ?? [];
 }
 
@@ -189,36 +106,34 @@ export async function listProperties(token: string, objectType: string): Promise
  * Read only the named properties (one call). Names that don't exist are simply absent from the result.
  * Falls back to the full list (one GET) if the batch endpoint rejects the call with a 4xx other than 401/403/429.
  */
-export async function readProperties(token: string, objectType: string, names: string[]): Promise<ExistingProperty[]> {
+async function readProperties(auth: PortalAuth, objectType: string, names: string[]): Promise<ExistingProperty[]> {
   const want = new Set(names);
   try {
     const res = await hsRequest<{ results?: ExistingProperty[] }>(`/crm/properties/${V}/${encodeURIComponent(objectType)}/batch/read`, {
       method: 'POST',
-      token,
+      ...auth,
       body: { archived: false, dataSensitivity: 'non_sensitive', inputs: names.map((name) => ({ name })) },
     });
     return (res?.results ?? []).filter((p) => want.has(p.name));
   } catch (e) {
-    if (e instanceof HttpError && e.status >= 400 && e.status < 500 && ![401, 403, 429].includes(e.status)) {
-      return (await listProperties(token, objectType)).filter((p) => want.has(p.name));
+    if (e instanceof HubSpotError && e.status >= 400 && e.status < 500 && ![401, 403, 429].includes(e.status)) {
+      return (await listProperties(auth, objectType)).filter((p) => want.has(p.name));
     }
     throw e;
   }
 }
 
-export interface BatchCreateResult {
+interface BatchCreateResult {
   created: string[];
   failed: { name: string; error: string }[];
 }
 
-type BatchError = { message?: string; category?: string; context?: Record<string, unknown> };
-
 /** Create several properties in ONE call. Handles 207: per-name results. A whole-call error is thrown. */
-export async function createProperties(token: string, objectType: string, defs: PropertyDefinition[]): Promise<BatchCreateResult> {
+async function createProperties(auth: PortalAuth, objectType: string, defs: PropertyDefinition[]): Promise<BatchCreateResult> {
   if (defs.length === 0) return { created: [], failed: [] };
   const res = await hsRequest<{ results?: { name: string }[]; errors?: BatchError[] }>(
     `/crm/properties/${V}/${encodeURIComponent(objectType)}/batch/create`,
-    { method: 'POST', token, body: { inputs: defs } },
+    { method: 'POST', ...auth, body: { inputs: defs } },
   );
   const ok = new Set((res?.results ?? []).map((r) => r.name));
   const errs = res?.errors ?? [];
@@ -228,28 +143,31 @@ export async function createProperties(token: string, objectType: string, defs: 
       out.created.push(d.name);
       continue;
     }
-    const err = errs.find((e) => JSON.stringify(e.context ?? {}).includes(`"${d.name}"`) || (e.message ?? '').includes(d.name)) ?? errs[0];
+    const err = batchErrorFor(errs, d.name);
     out.failed.push({ name: d.name, error: err ? `${err.category ?? 'ERROR'}: ${err.message ?? ''}` : 'not in batch create results' });
   }
   return out;
 }
 
-export async function listGroups(token: string, objectType: string): Promise<{ name: string }[]> {
-  const res = await hsRequest<{ results: { name: string }[] }>(`/crm/properties/${V}/${encodeURIComponent(objectType)}/groups`, { token });
+async function listGroups(auth: PortalAuth, objectType: string): Promise<{ name: string }[]> {
+  const res = await hsRequest<{ results: { name: string }[] }>(`/crm/properties/${V}/${encodeURIComponent(objectType)}/groups`, { ...auth });
   return res?.results ?? [];
 }
 
 /**
  * Make sure the "changecatch" group and all 7 properties exist on one object type. Idempotent: existing ones are skipped.
- * dryRun = only read, report what would be created.
  * A 403 on create is reported as a missing schema scope (for 2-xxx: crm.schemas.custom.write).
  */
-export async function ensureChangeCatchProperties(token: string, objectType: string, opts: { dryRun: boolean }): Promise<SetupReport> {
+export async function ensureChangeCatchProperties(auth: PortalAuth, objectType: string): Promise<SetupReport> {
+  return withFailure(await ensureProperties(auth, objectType));
+}
+
+async function ensureProperties(auth: PortalAuth, objectType: string): Promise<SetupReport> {
   const report: SetupReport = { objectType, group: 'exists', properties: [] };
   const path = `/crm/properties/${V}/${encodeURIComponent(objectType)}`;
   const on403 = (e: unknown) => {
-    if (e instanceof HttpError && e.status === 403) {
-      report.missingScope = schemaWriteScopeFor(objectType);
+    if (e instanceof HubSpotError && e.status === 403) {
+      report.missingScope = scopesFor(objectType).schemaWrite;
       return true;
     }
     return false;
@@ -258,14 +176,14 @@ export async function ensureChangeCatchProperties(token: string, objectType: str
   let existing: Map<string, ExistingProperty>;
   try {
     const [groups, props] = await Promise.all([
-      listGroups(token, objectType),
-      readProperties(token, objectType, CHANGECATCH_PROPERTIES.map((d) => d.name)),
+      listGroups(auth, objectType),
+      readProperties(auth, objectType, CHANGECATCH_PROPERTIES.map((d) => d.name)),
     ]);
-    report.group = groups.some((g) => g.name === GROUP_NAME) ? 'exists' : opts.dryRun ? 'would-create' : 'created';
+    report.group = groups.some((g) => g.name === GROUP_NAME) ? 'exists' : 'created';
     existing = new Map(props.map((p) => [p.name, p]));
   } catch (e) {
-    if (e instanceof HttpError && e.status === 403) {
-      report.missingScope = objectType.startsWith('2-') ? 'crm.schemas.custom.read (or crm.objects.custom.read)' : `read scope for ${objectType}`;
+    if (e instanceof HubSpotError && e.status === 403) {
+      report.missingScope = isCustomObjectType(objectType) ? `${CUSTOM_OBJECT_SCOPES.schemaRead} (or ${CUSTOM_OBJECT_SCOPES.objectRead})` : (scopesFor(objectType).read ?? `read scope for ${objectType}`);
     }
     report.error = e instanceof Error ? e.message : String(e);
     return report;
@@ -273,7 +191,7 @@ export async function ensureChangeCatchProperties(token: string, objectType: str
 
   if (report.group === 'created') {
     try {
-      await hsRequest(`${path}/groups`, { method: 'POST', token, body: { name: GROUP_NAME, label: GROUP_LABEL, displayOrder: -1 } });
+      await hsRequest(`${path}/groups`, { method: 'POST', ...auth, body: { name: GROUP_NAME, label: GROUP_LABEL, displayOrder: -1 } });
     } catch (e) {
       report.group = 'error';
       on403(e);
@@ -286,9 +204,9 @@ export async function ensureChangeCatchProperties(token: string, objectType: str
   for (const d of CHANGECATCH_PROPERTIES) {
     const hit = existing.get(d.name);
     if (hit && SYNCED_ENUM_PROPERTY_NAMES.includes(d.name)) {
-      // Old free-text version (or wrong fieldType): migrate in place. More options are added by syncLabelOptions.
-      const r = await upsertLabelProperty(token, objectType, d, d.options ?? FIXED_OPTIONS, hit, opts.dryRun);
-      if (r.status === 'error' && r.detail?.includes(' 403')) report.missingScope = schemaWriteScopeFor(objectType);
+      // More options are added by the option sync (createLabelOptionSync).
+      const r = await upsertLabelProperty(auth, objectType, d, d.options ?? FIXED_OPTIONS, hit);
+      if (r.forbidden) report.missingScope = scopesFor(objectType).schemaWrite;
       report.properties.push({ name: d.name, status: r.status, ...(r.detail ? { detail: r.detail } : {}) });
       continue;
     }
@@ -301,14 +219,12 @@ export async function ensureChangeCatchProperties(token: string, objectType: str
       });
       continue;
     }
-    if (opts.dryRun) report.properties.push({ name: d.name, status: 'would-create' });
-    else toCreate.push(d);
+    toCreate.push(d);
   }
 
   if (toCreate.length) {
-    // ONE batch create for every missing property (was one POST each).
     try {
-      const r = await createProperties(token, objectType, toCreate);
+      const r = await createProperties(auth, objectType, toCreate);
       for (const name of r.created) report.properties.push({ name, status: 'created' });
       for (const f of r.failed) report.properties.push({ name: f.name, status: 'error', detail: f.error });
     } catch (e) {
@@ -322,82 +238,73 @@ export async function ensureChangeCatchProperties(token: string, objectType: str
   return report;
 }
 
-// ---------- label properties: migration + option sync ----------
+// ---------- dropdown properties: create + option sync ----------
 
 export interface LabelPropertyResult {
   name: string;
   status: PropertyStatus;
-  /** Option values added (or that would be added). */
+  /** Option values added. */
   added: string[];
   detail?: string;
+  /** HubSpot answered 403 (a schema write scope is missing). */
+  forbidden?: true;
 }
 
 /**
  * Bring one dropdown property (label checkboxes, change type, other object type) to d.type + d.fieldType with at least
  * `desired` options.
- *  - missing                      -> create (POST) with `desired`
- *  - string / other fieldType     -> migrate in place (PATCH type + fieldType + options). Old free-text values become invalid.
- *  - right type                   -> PATCH options only if some are missing / hidden / renamed (existing ones are kept)
- * dryRun = report only.
+ *  - missing          -> create (POST) with `desired`
+ *  - other type       -> reported as exists-mismatch, left alone (never changed in place)
+ *  - right type       -> PATCH options only if some are missing / hidden / renamed (existing ones are kept)
  */
-export async function upsertLabelProperty(
-  token: string,
+async function upsertLabelProperty(
+  auth: PortalAuth,
   objectType: string,
   d: PropertyDefinition,
   desired: PropertyOption[],
   hit: ExistingProperty | undefined,
-  dryRun: boolean,
 ): Promise<LabelPropertyResult> {
   const path = `/crm/properties/${V}/${encodeURIComponent(objectType)}`;
-  const fail = (e: unknown): LabelPropertyResult => ({ name: d.name, status: 'error', added: [], detail: e instanceof Error ? e.message : String(e) });
+  const fail = (e: unknown): LabelPropertyResult => ({
+    name: d.name,
+    status: 'error',
+    added: [],
+    detail: e instanceof Error ? e.message : String(e),
+    ...(e instanceof HubSpotError && e.status === 403 ? { forbidden: true as const } : {}),
+  });
 
   if (!hit) {
-    if (dryRun) return { name: d.name, status: 'would-create', added: desired.map((o) => o.value) };
     try {
-      await hsRequest(path, { method: 'POST', token, body: { ...d, options: desired } });
+      await hsRequest(path, { method: 'POST', ...auth, body: { ...d, options: desired } });
       return { name: d.name, status: 'created', added: desired.map((o) => o.value) };
     } catch (e) {
       return fail(e);
     }
   }
 
-  const isTarget = hit.type === d.type && hit.fieldType === d.fieldType;
-  // A text property has no options. An enumeration with another fieldType keeps its options.
-  const merged = mergeOptions(hit.type === 'enumeration' ? (hit.options ?? []) : [], desired);
+  if (hit.type !== d.type || hit.fieldType !== d.fieldType)
+    return { name: d.name, status: 'exists-mismatch', added: [], detail: `existing ${hit.type}/${hit.fieldType ?? '?'}, expected ${d.type}/${d.fieldType}` };
+  const merged = mergeOptions(hit.options ?? [], desired);
   if (merged.options.length > MAX_OPTIONS)
     return { name: d.name, status: 'error', added: [], detail: `${merged.options.length} options is over the ${MAX_OPTIONS} limit` };
-  if (isTarget && !merged.changed) return { name: d.name, status: 'exists', added: [] };
-
-  const migrate = !isTarget;
-  const detail = migrate ? `existing ${hit.type}/${hit.fieldType ?? '?'} -> ${d.type}/${d.fieldType}` : undefined;
-  if (dryRun) return { name: d.name, status: migrate ? 'would-migrate' : 'would-update', added: merged.added, ...(detail ? { detail } : {}) };
-
-  const body = migrate
-    ? { type: d.type, fieldType: d.fieldType, label: d.label, description: d.description, options: merged.options }
-    : { options: merged.options };
+  if (!merged.changed) return { name: d.name, status: 'exists', added: [] };
   try {
-    // PATCH /crm/properties/2026-09/{objectType}/{propertyName}
-    // https://developers.hubspot.com/docs/api-reference/latest/crm/properties/update-property.md
-    await hsRequest(`${path}/${encodeURIComponent(d.name)}`, { method: 'PATCH', token, body });
-    return { name: d.name, status: migrate ? 'migrated' : 'updated', added: merged.added, ...(detail ? { detail } : {}) };
+    await hsRequest(`${path}/${encodeURIComponent(d.name)}`, { method: 'PATCH', ...auth, body: { options: merged.options } });
+    return { name: d.name, status: 'updated', added: merged.added };
   } catch (e) {
     return fail(e);
   }
 }
 
 /** Display names for object type ids: standard names, plus custom object singular labels when readable. */
-export async function objectTypeNames(token: string, ids: string[]): Promise<Record<string, string>> {
+async function objectTypeNames(auth: PortalAuth, ids: string[]): Promise<Record<string, string>> {
   const names: Record<string, string> = { ...STANDARD_OBJECT_NAMES };
-  if (ids.some((id) => id.startsWith('2-') && !names[id])) {
+  if (ids.some(isCustomObjectType)) {
     try {
-      // GET /crm-object-schemas/2026-09/schemas (needs crm.schemas.custom.read; on failure we fall back to the raw id)
-      const res = await hsRequest<{ results: { objectTypeId: string; name?: string; labels?: { singular?: string } }[] }>(
-        '/crm-object-schemas/2026-09/schemas',
-        { token },
-      );
-      for (const s of res?.results ?? []) names[s.objectTypeId] = s.labels?.singular ?? s.name ?? s.objectTypeId;
-    } catch {
-      /* raw ids are fine as a fallback */
+      for (const t of await listCustomObjectTypes(auth)) names[t.objectTypeId] = t.singular;
+    } catch (e) {
+      // Option labels fall back to the raw type id; option values (the ids) are unaffected.
+      log.warn('object_names_failed', `custom object names not readable: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
   return names;
@@ -413,15 +320,11 @@ export interface LabelSyncReport {
   /** Label endpoints that failed (e.g. a pair that no longer exists). Their labels are simply not added. */
   labelErrors: { from: string; to: string; error: string }[];
   error?: string;
+  /** Why the dropdowns are not usable (failureOf; labelErrors are not counted). */
+  failure?: string;
 }
 
-export interface LabelSyncOptions {
-  dryRun?: boolean;
-  /** Pre-resolved names (skips the schemas call). */
-  objectTypeNames?: Record<string, string>;
-}
-
-const syncInflight = new Map<string, Promise<LabelSyncReport>>();
+export type SyncLabelOptions = (auth: PortalAuth, objectTypeId: string, watchedPairs: WatchedPair[]) => Promise<LabelSyncReport>;
 
 /**
  * Make the dropdowns on `objectTypeId` hold every value a stamp can write: the 3 label properties get an option for
@@ -429,42 +332,52 @@ const syncInflight = new Map<string, Promise<LabelSyncReport>>();
  * translates its labels to this direction, see resolve.ts mirrorKeysOf), changecatch_other_object_type gets every
  * other type, and changecatch_change_type its 3 values. Idempotent and additive: only PATCHes when an option is missing,
  * hidden or renamed (a label renamed in HubSpot keeps its value; only the display text changes). Never removes options.
- * Concurrent calls for the same portal + object type share one run.
- * Call it on install / settings change, and from the worker's onUnknownLabel hook BEFORE stamping a new label
- * (a value that is not an option makes HubSpot reject the record update).
+ * Concurrent calls for the same portal + object type share one run when it covers the caller's other types; otherwise
+ * the caller's run starts after it.
+ * Called BEFORE a value can be stamped (a value that is not an option makes HubSpot reject the record update): by the
+ * worker's onUnknownLabel hook on the first event of each type id per object pair (labeled or not) and on a rename,
+ * and by the installer when a custom-object pair starts being watched (its type is not a starting option).
  * Uses the customer's OAuth token. Scopes: one CRM read scope (labels) + crm.schemas.<object>.write (PATCH).
+ * One instance per process (api main, worker main): it owns the label-read cache and the in-flight runs.
  */
-export function syncLabelOptions(
-  token: string,
-  portalId: number,
-  objectTypeId: string,
-  watchedPairs: WatchedPair[],
-  opts: LabelSyncOptions = {},
-): Promise<LabelSyncReport> {
-  const key = `${portalId}|${objectTypeId}|${opts.dryRun ? 'dry' : 'apply'}`;
-  const running = syncInflight.get(key);
-  if (running) return running;
-  const p = runLabelSync(token, portalId, objectTypeId, watchedPairs, opts).finally(() => syncInflight.delete(key));
-  syncInflight.set(key, p);
-  return p;
+export function createLabelOptionSync(): SyncLabelOptions {
+  // The label reads: the same direction is often read for several object types in a row.
+  const labelLists = new LabelListCache();
+  // The latest run per portal + object type, and the other types it covers.
+  const inflight = new Map<string, { others: Set<string>; done: Promise<LabelSyncReport> }>();
+  return (auth, objectTypeId, watchedPairs) => {
+    const key = `${auth.portalId}|${objectTypeId}`;
+    const others = otherTypesFor(objectTypeId, watchedPairs);
+    const running = inflight.get(key);
+    if (running && others.every((o) => running.others.has(o))) return running.done;
+    // A running sync that misses some of our other types: ours runs after it (never two PATCHes of one list at once).
+    const done = (running ? running.done.catch(() => undefined) : Promise.resolve())
+      .then(() => runLabelSync(labelLists, auth, objectTypeId, watchedPairs))
+      .finally(() => {
+        if (inflight.get(key) === entry) inflight.delete(key);
+      });
+    const entry = { others: new Set(others), done };
+    inflight.set(key, entry);
+    return done;
+  };
 }
 
 async function runLabelSync(
-  token: string,
-  portalId: number,
+  labelLists: LabelListCache,
+  auth: PortalAuth,
   objectTypeId: string,
   watchedPairs: WatchedPair[],
-  opts: LabelSyncOptions,
 ): Promise<LabelSyncReport> {
+  const { portalId } = auth;
   const others = otherTypesFor(objectTypeId, watchedPairs);
   const report: LabelSyncReport = { portalId, objectTypeId, otherObjectTypeIds: others, options: [], properties: [], labelErrors: [] };
-  const names = opts.objectTypeNames ?? (await objectTypeNames(token, others));
+  const names = await objectTypeNames(auth, others);
 
   const sources: LabelSource[] = [];
   for (const other of others) {
     try {
-      // Cached per (portal, from, to). Only this direction: option values use its type ids.
-      const { results } = await getLabelsCached(token, portalId, objectTypeId, other);
+      // Only this direction: option values use its type ids.
+      const { results } = await labelLists.get(auth, objectTypeId, other);
       sources.push({
         otherObjectTypeId: other,
         otherObjectName: names[other] ?? other,
@@ -474,22 +387,18 @@ async function runLabelSync(
       report.labelErrors.push({ from: objectTypeId, to: other, error: e instanceof Error ? e.message : String(e) });
     }
   }
-  report.options = buildLabelOptions(sources);
-  const desiredFor: Record<string, PropertyOption[]> = {
-    [STAMP_PROPS.changeType]: CHANGE_TYPE_OPTIONS,
-    [STAMP_PROPS.otherObjectType]: buildObjectTypeOptions([...STANDARD_OTHER_TYPES, ...others], names),
-  };
+  const desired = desiredSyncedOptions(others, sources, names);
+  report.options = desired[STAMP_PROPS.labelsCurrent];
 
   let existing: Map<string, ExistingProperty>;
   try {
-    existing = new Map((await listProperties(token, objectTypeId)).map((p) => [p.name, p]));
+    existing = new Map((await readProperties(auth, objectTypeId, SYNCED_ENUM_PROPERTY_NAMES)).map((p) => [p.name, p]));
   } catch (e) {
     report.error = e instanceof Error ? e.message : String(e);
-    return report;
+    return withFailure(report);
   }
   for (const d of CHANGECATCH_PROPERTIES.filter((x) => SYNCED_ENUM_PROPERTY_NAMES.includes(x.name))) {
-    const desired = desiredFor[d.name] ?? report.options;
-    report.properties.push(await upsertLabelProperty(token, objectTypeId, d, desired, existing.get(d.name), !!opts.dryRun));
+    report.properties.push(await upsertLabelProperty(auth, objectTypeId, d, desired[d.name], existing.get(d.name)));
   }
-  return report;
+  return withFailure(report);
 }

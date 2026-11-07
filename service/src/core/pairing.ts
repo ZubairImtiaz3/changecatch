@@ -1,4 +1,6 @@
-import type { AssociationEntry, ChangeType, LabelRef, PairedChange, PendingEntry } from './types.js';
+import { offsetTimeMs } from './journal-offset.js';
+import { pairKey } from './keys.js';
+import { HUBSPOT_DEFINED, type AssociationEntry, type ChangeType, type LabelRef, type PairedChange, type PendingEntry } from './types.js';
 
 /*
  * Turns raw ASSOCIATION_ADDED / ASSOCIATION_REMOVED events into user-level changes.
@@ -17,9 +19,11 @@ import type { AssociationEntry, ChangeType, LabelRef, PairedChange, PendingEntry
  *        - custom object pairs (e.g. Car->Contact 125, Pets->Contact 163): USER_DEFINED, label null.
  *      Rule: a type is structural if its label definition has `label === null` (any category).
  *      Only when the label for a typeId is unknown do we fall back to category === HUBSPOT_DEFINED.
- *      The rule is injected as `isStructural` (built from the LabelCache in poller.ts).
+ *      The rule is injected as `isStructural` (labels.ts buildStructuralCheck, called by poller.ts).
+ *      So structural events only mean "link created / link removed" and are never paired as labels, and a label
+ *      added or removed on its own (no structural event alongside) is a LABEL_CHANGED, never ADDED / REMOVED.
  *  A3. CONFIRMED: one direction only. Each change appears once, from the subscribed object's side.
- *      `collapseMirrorEvents` stays on as a harmless safety net in case that ever changes.
+ *      Mirror events (B->A copies of A->B) are still collapsed, as a harmless safety net in case that ever changes.
  *  A4. The journal is roughly ordered by time, so once we have seen an event that occurred well
  *      after a cluster's window, no more partners for that cluster will arrive.
  *  A5. (2026-10-30 latency work) HubSpot publishes a journal file ~1-4 s after occurredAt. So when a read
@@ -35,7 +39,7 @@ import type { AssociationEntry, ChangeType, LabelRef, PairedChange, PendingEntry
  *      Rule: a cluster that may be HALF of a change (only structural events, or only label events of one action)
  *      is also held until splitHoldMs after the publish time of its newest journal file (the UUIDv7 offset time):
  *      on the wall clock when caught up, or once a file that much newer has been read (backlog). Partner files
- *      were published <= 3.9 s apart and visible <= ~8.2 s after publishing, so 15 s covers it with margin.
+ *      were published <= 3.9 s apart and visible <= ~8.2 s after publishing (A7 below sets the hold).
  *      A cluster with both structural and label events, or a label swap (label REMOVED + ADDED), describes a
  *      whole change and keeps the fast rules. Offsets that are not UUIDv7 (tests) skip the split hold.
  *  A7. (load test `mixed` 04:12 UTC, 1,300 ops) Even an 8 s split hold is not enough: halves of one action (IDENTICAL
@@ -46,7 +50,7 @@ import type { AssociationEntry, ChangeType, LabelRef, PairedChange, PendingEntry
  *      default 4 s, see PairingConfig.splitHoldMs.
  *
  * When is a held cluster released? The FIRST of:
- *   1. stream moved on:  latest occurredAt seen >= cluster start + windowMs + orderingSlackMs
+ *   1. stream moved on:  latest occurredAt seen >= cluster start + windowMs + ORDERING_SLACK_MS
  *   2. deadline:         caughtUp && now >= max occurredAt in cluster + windowMs + publishDelaySlackMs
  *   3. safety cap:       now >= holdUntil (first time held + maxHoldMs)
  * A possibly-half cluster (A6) needs 1 or 2 AND its split hold to have passed (3 always releases).
@@ -56,7 +60,7 @@ import type { AssociationEntry, ChangeType, LabelRef, PairedChange, PendingEntry
 export type StructuralCheck = (portalId: number, ref: LabelRef) => boolean;
 
 /** Fallback when no label info is available: HUBSPOT_DEFINED = structural. */
-export const categoryIsStructural: StructuralCheck = (_portalId, r) => r.associationCategory === 'HUBSPOT_DEFINED';
+export const categoryIsStructural: StructuralCheck = (_portalId, r) => r.associationCategory === HUBSPOT_DEFINED;
 
 export interface PairingConfig {
   /**
@@ -66,8 +70,6 @@ export interface PairingConfig {
    * stamp spacing, so two separate user edits on one link are still very unlikely to merge.
    */
   windowMs: number;
-  /** Extra margin for out-of-order journal files before a cluster counts as closed. */
-  orderingSlackMs: number;
   /**
    * Wall-clock allowance for HubSpot's journal publish delay (~1-4 s after occurredAt). A held cluster is
    * released once now >= its newest occurredAt + windowMs + this (only when the read reached the journal head).
@@ -82,74 +84,27 @@ export interface PairingConfig {
    * Default 4000 (PAIRING_SPLIT_HOLD_MS). Since late-half absorption (A7) a missed partner no longer causes a wrong
    * result, so this only trades latency for fewer corrections: partner files were published <= 3.9 s apart in the
    * typical case (A6), so 4 s pairs most splits up front (no amend stamp, one enrollment even for label-first splits),
-   * while adding at most 4 s to an unlabeled link/unlink or a single-label edit (vs 8-15 s before, against a ~10 s p50
+   * while adding at most 4 s to an unlabeled link/unlink or a single-label edit (against a ~10 s p50
    * latency target). Anything later is absorbed (structural-first) or converted (label-first).
    */
   splitHoldMs: number;
-  /**
-   * 'structural': structural (unlabeled default) events only mean "link created / link removed" and
-   *   are never paired as labels (relies on A2).
-   * 'label': the structural type is treated like a label ("unlabeled"), so unlabeled -> "Decision maker"
-   *   becomes LABEL_CHANGED. A cluster of only REMOVED events that includes the structural type is
-   *   still a full unlink (REMOVED), and only-ADDED with the structural type is a new link (ADDED).
-   */
-  structuralMode: 'structural' | 'label';
-  /**
-   * A label added to a link that already exists (no structural ADDED alongside).
-   * Default LABEL_CHANGED: the link is not new, so firing "ADDED" would make users' "new link"
-   * workflows run on a label edit. labelBefore is filled from known state where possible.
-   * Set to 'ADDED' if A2 ever turns out false (then we cannot tell the two cases apart).
-   */
-  labelOnlyAddedAs: 'LABEL_CHANGED' | 'ADDED';
-  /** Same idea for a label removed while the link stays. */
-  labelOnlyRemovedAs: 'LABEL_CHANGED' | 'REMOVED';
-  collapseMirrorEvents: boolean;
 }
 
 export const DEFAULT_PAIRING_CONFIG: PairingConfig = {
   windowMs: 2000,
-  orderingSlackMs: 2000,
   publishDelaySlackMs: 4000,
   maxHoldMs: 60_000,
   splitHoldMs: 4_000,
-  structuralMode: 'structural',
-  labelOnlyAddedAs: 'LABEL_CHANGED',
-  labelOnlyRemovedAs: 'LABEL_CHANGED',
-  collapseMirrorEvents: true,
 };
+
+/** Extra margin for out-of-order journal files before a cluster counts as closed by the stream watermark. */
+const ORDERING_SLACK_MS = 2000;
 
 export interface PairingResult {
   changes: PairedChange[];
   stillPending: PendingEntry[];
   /** Earliest wall-clock time a still-pending cluster will be released (deadline or holdUntil). null = none held. */
   nextReleaseAt: number | null;
-}
-
-export interface PairingOptions {
-  /**
-   * True when the read reached the head of the journal (batch not full). Only then may the wall-clock
-   * deadline release a cluster: during a backlog catch-up, a partner may still be in an unread file.
-   * Default true.
-   */
-  caughtUp?: boolean;
-}
-
-/** Pairing config from env (PAIRING_WINDOW_MS, PAIRING_PUBLISH_SLACK_MS, PAIRING_MAX_HOLD_MS, PAIRING_SPLIT_HOLD_MS). */
-export function pairingConfigFromEnv(env: NodeJS.ProcessEnv = process.env, base: PairingConfig = DEFAULT_PAIRING_CONFIG): PairingConfig {
-  const num = (k: string): number | undefined => {
-    const v = env[k];
-    if (v === undefined || v.trim() === '') return undefined;
-    const n = Number(v);
-    if (!Number.isFinite(n) || n < 0) throw new Error(`Expected a non-negative number for ${k}, got "${v}"`);
-    return n;
-  };
-  return {
-    ...base,
-    windowMs: num('PAIRING_WINDOW_MS') ?? base.windowMs,
-    publishDelaySlackMs: num('PAIRING_PUBLISH_SLACK_MS') ?? base.publishDelaySlackMs,
-    maxHoldMs: num('PAIRING_MAX_HOLD_MS') ?? base.maxHoldMs,
-    splitHoldMs: num('PAIRING_SPLIT_HOLD_MS') ?? base.splitHoldMs,
-  };
 }
 
 /** Wall-clock time at which a cluster (sorted by occurredAt) no longer expects partners. */
@@ -161,24 +116,6 @@ interface Item {
   entry: AssociationEntry;
   holdUntil?: number;
   seq: number;
-}
-
-/**
- * Journal offsets are UUIDv7 (time-ordered): the first 48 bits are the file's publish time in epoch ms.
- * NaN for anything else (e.g. test offsets).
- */
-export function offsetTimeMs(offset: string): number {
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-/i.test(offset)) return NaN;
-  return parseInt(offset.slice(0, 8) + offset.slice(9, 13), 16);
-}
-
-const HD = 'HUBSPOT_DEFINED';
-
-/** Direction-insensitive key for "these two records in this portal". */
-export function pairKey(portalId: number, aType: string, aId: string | number, bType: string, bId: string | number): string {
-  const a = `${aType}:${aId}`;
-  const b = `${bType}:${bId}`;
-  return `${portalId}|${a < b ? `${a}|${b}` : `${b}|${a}`}`;
 }
 
 function entryPairKey(e: AssociationEntry): string {
@@ -193,25 +130,37 @@ function sameDirection(a: AssociationEntry, b: AssociationEntry): boolean {
   );
 }
 
-/**
- * Pure: (new entries, entries held from last run, now, config) -> changes + entries still on hold.
- * Entries must already be de-duplicated.
- */
-export function pairAssociations(
-  entries: AssociationEntry[],
-  pendingFromLastRun: PendingEntry[],
-  now: number,
-  config: PairingConfig = DEFAULT_PAIRING_CONFIG,
+export interface PairingInput {
+  /** New entries, already de-duplicated. */
+  entries: AssociationEntry[];
+  /** Entries held from the last run. */
+  pending: PendingEntry[];
+  now: number;
+  config: PairingConfig;
   /** Latest occurredAt seen in the whole stream, including events filtered out before pairing. */
-  streamWatermarkMs: number = -Infinity,
-  /** Which types mean "linked at all". Default: category fallback only (no label info). */
-  isStructural: StructuralCheck = categoryIsStructural,
-  options: PairingOptions = {},
-): PairingResult {
-  const caughtUp = options.caughtUp ?? true;
+  streamWatermarkMs?: number;
+  /** Which types mean "linked at all" (buildStructuralCheck). */
+  isStructural: StructuralCheck;
+  /**
+   * True when the read reached the head of the journal (batch not full). Only then may the wall-clock
+   * deadline release a cluster: during a backlog catch-up, a partner may still be in an unread file.
+   */
+  caughtUp: boolean;
+}
+
+/** Pure: (new entries, entries held from last run, now, config) -> changes + entries still on hold. */
+export function pairAssociations({
+  entries,
+  pending,
+  now,
+  config,
+  streamWatermarkMs = -Infinity,
+  isStructural,
+  caughtUp,
+}: PairingInput): PairingResult {
   let seq = 0;
   const items: Item[] = [
-    ...pendingFromLastRun.map((p) => ({ entry: p.entry, holdUntil: p.holdUntil, seq: seq++ })),
+    ...pending.map((p) => ({ entry: p.entry, holdUntil: p.holdUntil, seq: seq++ })),
     ...entries.map((entry) => ({ entry, seq: seq++ })),
   ];
   items.sort((a, b) => a.entry.occurredAtMs - b.entry.occurredAtMs || a.seq - b.seq);
@@ -221,7 +170,7 @@ export function pairAssociations(
   // Newest journal publish time (UUIDv7 offset) among our entries: the backlog-safe "journal moved on" signal (A6).
   const offsetWatermark = items.reduce((m, i) => {
     const t = offsetTimeMs(i.entry.fileOffset);
-    return Number.isNaN(t) ? m : Math.max(m, t);
+    return t === null ? m : Math.max(m, t);
   }, -Infinity);
 
   const groups = new Map<string, Item[]>();
@@ -239,7 +188,7 @@ export function pairAssociations(
   for (const group of groups.values()) {
     for (const cluster of clusterByWindow(group, config.windowMs)) {
       const start = cluster[0].entry.occurredAtMs;
-      const streamMovedOn = watermark >= start + config.windowMs + config.orderingSlackMs;
+      const streamMovedOn = watermark >= start + config.windowMs + ORDERING_SLACK_MS;
       const holds = cluster.map((c) => c.holdUntil).filter((h): h is number => h !== undefined);
       const holdUntil = holds.length ? Math.min(...holds) : now + config.maxHoldMs;
       const timedOut = now >= holdUntil;
@@ -249,14 +198,15 @@ export function pairAssociations(
       // A6: a possibly-half cluster also waits until its other half can no longer be on its way.
       let splitReleaseAt = -Infinity;
       let splitSafe = true;
-      const newestFile = Math.max(...cluster.map((c) => offsetTimeMs(c.entry.fileOffset)));
-      if (config.splitHoldMs > 0 && !Number.isNaN(newestFile) && mayBeHalf(cluster.map((c) => c.entry), isStructural)) {
+      const fileTimes = cluster.map((c) => offsetTimeMs(c.entry.fileOffset));
+      const newestFile = fileTimes.includes(null) ? null : Math.max(...(fileTimes as number[]));
+      if (config.splitHoldMs > 0 && newestFile !== null && mayBeHalf(cluster.map((c) => c.entry), isStructural)) {
         splitReleaseAt = newestFile + config.splitHoldMs;
         splitSafe = (caughtUp && now >= splitReleaseAt) || offsetWatermark >= splitReleaseAt;
       }
 
       if (timedOut || ((streamMovedOn || deadlinePassed) && splitSafe)) {
-        const change = interpretCluster(cluster.map((c) => c.entry), config, isStructural);
+        const change = interpretCluster(cluster.map((c) => c.entry), isStructural);
         if (change) changes.push(change);
       } else {
         for (const c of cluster) stillPending.push({ entry: c.entry, holdUntil });
@@ -354,38 +304,21 @@ function netRefs(events: AssociationEntry[]): { removed: LabelRef[]; added: Labe
   return { removed, added };
 }
 
-export function interpretCluster(
-  raw: AssociationEntry[],
-  config: PairingConfig,
-  isStructural: StructuralCheck = categoryIsStructural,
-): PairedChange | null {
+function interpretCluster(raw: AssociationEntry[], isStructural: StructuralCheck): PairedChange | null {
   const portalId = raw[0].event.portalId;
-  const structuralRef = (r: LabelRef) => isStructural(portalId, r);
-  const structural = (e: AssociationEntry) => structuralRef(ref(e));
-  const cluster = config.collapseMirrorEvents ? collapseMirrors(raw, structural) : raw;
+  const structural = (e: AssociationEntry) => isStructural(portalId, ref(e));
+  const cluster = collapseMirrors(raw, structural);
   const first = cluster[0].event;
   const labeled = cluster.filter((e) => !structural(e));
   const unlabeled = cluster.filter(structural);
 
-  let changeType: ChangeType | null;
-  let removed: LabelRef[];
-  let added: LabelRef[];
-  let structuralNet: number | undefined;
-
-  if (config.structuralMode === 'structural') {
-    structuralNet = unlabeled.reduce((n, e) => n + (e.event.action === 'ASSOCIATION_ADDED' ? 1 : -1), 0);
-    ({ removed, added } = netRefs(labeled));
-    if (structuralNet < 0) changeType = 'REMOVED';
-    else if (structuralNet > 0) changeType = 'ADDED';
-    else changeType = classifyLabelOnly(removed, added, config);
-  } else {
-    ({ removed, added } = netRefs(cluster));
-    const hasStructural = (rs: LabelRef[]) => rs.some(structuralRef);
-    if (added.length === 0 && hasStructural(removed)) changeType = 'REMOVED';
-    else if (removed.length === 0 && hasStructural(added)) changeType = 'ADDED';
-    else changeType = classifyLabelOnly(removed, added, config);
-  }
-  if (!changeType) return null;
+  const structuralNet = unlabeled.reduce((n, e) => n + (e.event.action === 'ASSOCIATION_ADDED' ? 1 : -1), 0);
+  const { removed, added } = netRefs(labeled);
+  let changeType: ChangeType;
+  if (structuralNet < 0) changeType = 'REMOVED';
+  else if (structuralNet > 0) changeType = 'ADDED';
+  else if (removed.length || added.length) changeType = 'LABEL_CHANGED';
+  else return null; // everything cancelled out (e.g. label removed and re-added quickly)
 
   // Category of the labels involved. For an unlabeled link/unlink, the structural type's own category
   // (HUBSPOT_DEFINED for standard pairs, USER_DEFINED for custom object pairs).
@@ -400,18 +333,11 @@ export function interpretCluster(
     toObjectId: String(first.toObjectId),
     removed,
     added,
-    associationCategory: categories.length ? categories.sort().join(',') : HD,
+    associationCategory: categories.sort().join(','),
     occurredAt: cluster[cluster.length - 1].event.occurredAt,
     // Keys/offsets come from the raw cluster so dropped mirror events are still marked as handled.
     sourceKeys: raw.map((e) => e.key),
     sourceOffsets: [...new Set(raw.map((e) => e.fileOffset))],
-    ...(structuralNet === undefined ? {} : { structuralNet }),
+    structuralNet,
   };
-}
-
-function classifyLabelOnly(removed: LabelRef[], added: LabelRef[], config: PairingConfig): ChangeType | null {
-  if (removed.length && added.length) return 'LABEL_CHANGED';
-  if (added.length) return config.labelOnlyAddedAs;
-  if (removed.length) return config.labelOnlyRemovedAs;
-  return null; // everything cancelled out (e.g. label removed and re-added quickly)
 }

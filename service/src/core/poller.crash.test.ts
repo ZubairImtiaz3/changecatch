@@ -5,65 +5,80 @@
 // reopened from the same SQLite file, all in-memory state is thrown away) and check that the held half still
 // completes into exactly ONE change with the right labels.
 
+import { memoryLogger } from '../../test/fixtures/log.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../store/db.js';
-import { StoreLabelCache } from './labels.js';
-import { runOnce, type JournalReadResult, type RunDeps } from './poller.js';
+import { runOnce, type RunDeps } from './poller.js';
 import type { StampUpdate } from './stamp.js';
 import type { JournalFile } from './types.js';
-import { ADD, CONTACT, DEAL, ev, file, REM, T0, UD } from './testutil.js';
+import { ADD, CONTACT, DEAL, ev, fakeJournal, file, REM, T0, UD, uuid7 } from '../../test/fixtures/journal.js';
+import { fixedLabelCache, LABELS } from '../../test/fixtures/labels.js';
+import { activePairsOn } from '../../test/fixtures/worker.js';
+import { StampQueue } from '../worker/stamp-queue.js';
 
-const LABELS = [
-  { associationTypeId: 3, label: null, category: 'HUBSPOT_DEFINED' },
-  { associationTypeId: 101, label: 'Influencer', category: UD },
-  { associationTypeId: 102, label: 'Decision maker', category: UD },
-];
+type CrashPoint = 'none' | 'in-send' | 'after-send' | 'in-commit' | 'after-commit';
 
-/** UUIDv7-shaped journal offset whose first 48 bits are `ms` (pairing reads the publish time from it). */
-function uuid7(ms: number, n: number): string {
-  const h = ms.toString(16).padStart(12, '0');
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-7000-8000-${n.toString(16).padStart(12, '0')}`;
-}
-
-type CrashPoint = 'none' | 'in-send' | 'after-send' | 'after-commit';
-
-/** One "process": a Store opened on the DB file + a runOnce wired to a fake journal and a stamp sink. */
-function boot(dbFile: string, journal: JournalFile[], stamps: StampUpdate[], clock: { t: number }) {
+/**
+ * One "process": a Store opened on the DB file + a runOnce wired to a fake journal and a stamp sink (a fake that
+ * records into `stamps`, or with `stamps` null the real persisted StampQueue).
+ */
+function boot(dbFile: string, journal: JournalFile[], stamps: StampUpdate[] | null, clock: { t: number }) {
   const store = new Store(dbFile);
-  const labels = new StoreLabelCache(store, async () => LABELS, undefined, () => clock.t);
+  const { portals, watchedPairs } = activePairsOn(store);
+  const labels = fixedLabelCache(LABELS);
   let crash: CrashPoint = 'none';
   const realTx = store.transaction.bind(store) as (fn: () => unknown) => unknown;
   // Crash injection around the final transaction of runOnce (the one that saves the offset).
+  let depth = 0; // nested transactions (the queue's own) run inside the outer one: only the outer one crashes
   (store as unknown as { transaction: (fn: () => unknown) => unknown }).transaction = (fn) => {
+    if (depth > 0) return realTx(fn);
     if (crash === 'after-send') throw new Error('CRASH before the offset commit');
-    const before = store.getOffset();
-    const r = realTx(fn);
-    if (crash === 'after-commit' && store.getOffset() !== before) throw new Error('CRASH right after the offset commit');
+    const before = store.journal.getOffset();
+    depth++;
+    let r: unknown;
+    try {
+      r = realTx(() => {
+        const out = fn();
+        if (crash === 'in-commit' && store.journal.getOffset() !== before) throw new Error('CRASH in the final (offset) commit');
+        return out;
+      });
+    } finally {
+      depth--;
+    }
+    if (crash === 'after-commit' && store.journal.getOffset() !== before) throw new Error('CRASH right after the offset commit');
     return r;
   };
-  const readJournal = async (after: string | null): Promise<JournalReadResult> => {
-    const start = after === null ? 0 : journal.findIndex((f) => f.offset === after) + 1;
-    const batch = journal.slice(start);
-    return { files: batch, nextOffset: batch.at(-1)?.offset ?? null, full: false };
-  };
+  const queue = new StampQueue({
+    store,
+    revoked: { listRevoked: () => [] },
+    spacingFor: () => 0,
+    now: () => clock.t,
+    log: memoryLogger().log,
+    sendBatches: async (us) => us.map((update) => ({ update, kind: 'ok' as const })),
+  });
+  const { readJournal } = fakeJournal(journal);
   const deps: RunDeps = {
     readJournal,
-    sendStamps: async (updates, onDelivered) => {
+    enqueueStamps: (updates) => {
       if (crash === 'in-send') throw new Error('CRASH while stamping');
+      if (!stamps) return queue.enqueue(updates);
       stamps.push(...updates);
-      onDelivered(updates);
+      return updates;
     },
     store,
     labels,
     now: () => clock.t,
-    config: { deliveryMode: 'stamp' },
+    watchedPairs,
+    log: memoryLogger().log,
   };
   return {
     store,
+    queue,
+    portals,
     run: (c: CrashPoint = 'none') => {
       crash = c;
       return runOnce(deps);
@@ -71,10 +86,9 @@ function boot(dbFile: string, journal: JournalFile[], stamps: StampUpdate[], clo
   };
 }
 
+/** change_log of deal 1, oldest first. */
 function changeRows(store: Store) {
-  return store.db
-    .prepare('SELECT change_type, label_before, label_after, labels_current, occurred_at FROM change_log ORDER BY occurred_at, change_id')
-    .all() as { change_type: string; label_before: string; label_after: string; labels_current: string; occurred_at: string }[];
+  return store.changes.changesForRecords(111, DEAL, ['1'], 0).sort((a, b) => a.occurredAt.localeCompare(b.occurredAt) || a.changeId.localeCompare(b.changeId));
 }
 
 function withDb(fn: (dbFile: string) => Promise<void>) {
@@ -104,17 +118,17 @@ for (const second of ['none', 'in-send', 'after-send', 'after-commit'] as const)
       const stamps: StampUpdate[] = [];
       const clock = { t: T0 + 20_500 }; // f2's cluster is inside its deadline -> held
       let p = boot(dbFile, journal, stamps, clock);
-      p.store.setWatchedPairs(111, [{ objectTypeId: DEAL, associatedObjectTypeId: CONTACT }]);
+      p.portals.setWatchedPairs(111, [{ objectTypeId: DEAL, associatedObjectTypeId: CONTACT }]);
 
       // Run 1 dies right AFTER its transaction committed (offset f2 + the held half).
       await assert.rejects(p.run('after-commit'), /right after the offset commit/);
-      assert.equal(p.store.getOffset(), 'f2');
+      assert.equal(p.store.journal.getOffset(), 'f2');
       p.store.close();
 
       // Restart: nothing in memory survives; the held half must come back from the DB.
       p = boot(dbFile, journal, stamps, clock);
-      assert.equal(p.store.loadPending().length, 1, 'held half persisted with the offset');
-      assert.equal(p.store.getOffset(), 'f2');
+      assert.equal(p.store.entries.loadPending().length, 1, 'held half persisted with the offset');
+      assert.equal(p.store.journal.getOffset(), 'f2');
 
       // The partner half arrives in a later file; optionally the restarted worker crashes once more.
       journal.push(file('f3', [ev({ action: ADD, typeId: 102, category: UD, at: 20_100 })]));
@@ -124,19 +138,19 @@ for (const second of ['none', 'in-send', 'after-send', 'after-commit'] as const)
         if (second === 'after-commit') {
           // Committed: the change is done; nothing to re-read.
         } else {
-          assert.equal(p.store.getOffset(), 'f2', 'offset not advanced by a crashed run');
-          assert.equal(p.store.loadPending().length, 1, 'held half still there');
+          assert.equal(p.store.journal.getOffset(), 'f2', 'offset not advanced by a crashed run');
+          assert.equal(p.store.entries.loadPending().length, 1, 'held half still there');
         }
         p.store.close();
         p = boot(dbFile, journal, stamps, clock);
       }
       await p.run();
 
-      assert.equal(p.store.getOffset(), 'f3');
-      assert.equal(p.store.loadPending().length, 0);
+      assert.equal(p.store.journal.getOffset(), 'f3');
+      assert.equal(p.store.entries.loadPending().length, 0);
       const rows = changeRows(p.store);
       assert.deepEqual(
-        rows.map((r) => [r.change_type, r.label_before, r.label_after, r.labels_current]),
+        rows.map((r) => [r.changeType, r.labelBefore, r.labelAfter, r.labelsCurrent]),
         [
           ['ADDED', 'none', '0-1:101', '0-1:101'],
           ['LABEL_CHANGED', '0-1:101', '0-1:102', '0-1:102'],
@@ -164,20 +178,20 @@ test(
     const stamps: StampUpdate[] = [];
     const clock = { t: pub + 1_000 }; // inside the 4 s split hold
     let p = boot(dbFile, journal, stamps, clock);
-    p.store.setWatchedPairs(111, [{ objectTypeId: DEAL, associatedObjectTypeId: CONTACT }]);
+    p.portals.setWatchedPairs(111, [{ objectTypeId: DEAL, associatedObjectTypeId: CONTACT }]);
 
     await assert.rejects(p.run('after-commit'), /right after the offset commit/);
     p.store.close();
 
     p = boot(dbFile, journal, stamps, clock);
-    assert.equal(p.store.loadPending().length, 1, 'split-hold half persisted with the offset');
+    assert.equal(p.store.entries.loadPending().length, 1, 'split-hold half persisted with the offset');
     journal.push(file(uuid7(pub + 2_500, 3), [ev({ action: REM, typeId: 101, category: UD, at: 0 })]));
     clock.t = pub + 10_000;
     await p.run();
 
-    assert.equal(p.store.loadPending().length, 0);
+    assert.equal(p.store.entries.loadPending().length, 0);
     assert.deepEqual(
-      changeRows(p.store).map((r) => [r.change_type, r.label_before, r.labels_current]),
+      changeRows(p.store).map((r) => [r.changeType, r.labelBefore, r.labelsCurrent]),
       [
         ['ADDED', 'none', '0-1:101'],
         ['REMOVED', '0-1:101', 'none'],
@@ -186,3 +200,40 @@ test(
     p.store.close();
   }),
 );
+
+for (const crash of ['in-send', 'after-send', 'in-commit'] as const) {
+  test(
+    `a failed final commit (${crash}) leaves no queued stamps and no change_log rows from that run; the re-run queues exactly one stamp per change`,
+    withDb(async (dbFile) => {
+      const journal: JournalFile[] = [
+        file('f1', [ev({ action: REM, typeId: 3, at: 0 }), ev({ action: ADD, typeId: 3, from: [DEAL, 7], to: [CONTACT, 9], at: 1_000 })]),
+        file('f2', [ev({ portalId: 5, at: 40_000 })]),
+      ];
+      const clock = { t: T0 + 60_000 };
+      let p = boot(dbFile, journal, null, clock);
+      p.portals.setWatchedPairs(111, [{ objectTypeId: DEAL, associatedObjectTypeId: CONTACT }]);
+
+      await assert.rejects(p.run(crash), /CRASH/);
+      assert.equal(p.store.journal.getOffset(), null, 'offset not saved');
+      assert.equal(p.store.stamps.queueSize(), 0, 'no queued stamps from the failed run');
+      assert.equal(p.store.portalFootprint(111).change_log, 0, 'no orphan change_log rows from the failed run');
+      p.store.close();
+
+      p = boot(dbFile, journal, null, clock);
+      const r = await p.run();
+      assert.equal(r.offset, 'f2');
+      const queued = p.store.stamps.queueSize();
+      assert.ok(r.changesEmitted === 2 && queued >= 2, `${queued} queued for ${r.changesEmitted} change(s)`);
+      const drained = await p.queue.drain();
+      const keys = drained.sent.map((u) => `${u.objectTypeId}|${u.objectId}|${u.properties.changecatch_last_change_id}`);
+      assert.equal(keys.length, queued);
+      assert.equal(new Set(keys).size, keys.length, 'exactly one stamp per change and record');
+      assert.equal(p.store.stamps.queueSize(), 0);
+
+      // Nothing new: a third run queues nothing.
+      await p.run();
+      assert.equal(p.store.stamps.queueSize(), 0);
+      p.store.close();
+    }),
+  );
+}

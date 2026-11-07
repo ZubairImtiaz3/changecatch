@@ -1,54 +1,28 @@
-// Per-portal install state: encrypted refresh token, granted scopes, install/uninstall times, settings.
-// Lives in the SAME SQLite file as src/store/db.ts (DB_PATH, default service/data/changecatch.db) but owns its own table
-// ("portals") and its own connection.
-//
-// Watched pairs are NOT stored here. They live in db.ts's `portal_settings` table, because the worker
-// (Store.getWatchedPairs) reads them from there. We read/write that table with plain SQL and create it with the
-// exact same schema if it doesn't exist yet. If db.ts ever renames that table, update PAIRS_SQL below.
+// Per-portal install state (table "portals": encrypted refresh token, granted scopes, install/uninstall times, stamp
+// spacing), rejected refresh tokens (table "token_revocations") and the watched pairs (table "portal_settings").
+// Same SQLite file as src/store/db.ts; schema in schema.ts. The API server opens its own connection; the worker's
+// PortalStore shares the worker Store's connection. PortalStore is the only path to portal_settings.
 
-import type { DatabaseSync, StatementSync } from 'node:sqlite';
-import {
-  MAINTENANCE_INTERVAL_MS, PRUNE_CHUNK_ROWS, StatementCache, getStoreLogger, openDatabase, optimizeDatabase, runInTransaction, runMigrations,
-  type Migration,
-} from './db.js';
+import type { DatabaseSync } from 'node:sqlite';
 import type { WatchedPair } from '../core/types.js';
-import { decryptToken, encryptToken, keyFromEnv } from '../install/crypto.js';
-import { dbPath } from '../lib/env.js';
+import { decryptToken, encryptToken, keyIdOf, usesActiveKey, type Keyring } from '../lib/crypto.js';
+import { createLogger, type Logger } from '../obs/log.js';
+import { DEFAULT_STAMP_SPACING_SECONDS, migrateSchema } from './schema.js';
+import { Db, PRUNE_CHUNK_ROWS, openDatabase, optimizeDatabase } from './sqlite.js';
 
-export const DEFAULT_STAMP_SPACING_SECONDS = 3;
 /** Uninstalled portal rows (portal_id + uninstalled_at only) are deleted this long after the uninstall. */
 export const UNINSTALLED_PORTAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+/** Chunked prune of long-uninstalled portal rows (planned by store.test.ts). */
+export const PRUNE_UNINSTALLED_SQL = `DELETE FROM portals WHERE rowid IN (SELECT rowid FROM portals WHERE uninstalled_at IS NOT NULL AND uninstalled_at < ? AND refresh_token_enc IS NULL LIMIT ${PRUNE_CHUNK_ROWS})`;
 
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS portals (
-  portal_id INTEGER PRIMARY KEY,          -- = hub_id from the OAuth token response
-  refresh_token_enc TEXT,                 -- AES-256-GCM, see src/install/crypto.ts. NULL after uninstall.
-  scopes TEXT NOT NULL DEFAULT '',        -- space-separated granted scopes
-  installed_at INTEGER,                   -- epoch ms of the latest install
-  uninstalled_at INTEGER,                 -- epoch ms; NULL while installed
-  provisioned_at INTEGER,                 -- epoch ms of the last successful subscription+property setup
-  last_provision_error TEXT,
-  stamp_spacing_seconds INTEGER NOT NULL DEFAULT ${DEFAULT_STAMP_SPACING_SECONDS},
-  updated_at INTEGER NOT NULL
-);
--- Same schema as in src/store/db.ts (owned there). Created here too so this module works on its own.
-CREATE TABLE IF NOT EXISTS portal_settings (
-  portal_id INTEGER NOT NULL,
-  object_type_id TEXT NOT NULL,
-  associated_object_type_id TEXT NOT NULL,
-  PRIMARY KEY (portal_id, object_type_id, associated_object_type_id)
-);
-`;
-
-/** Versioned schema for this store (scope 'portals' in schema_migrations). APPEND ONLY; steps idempotent. */
-export const PORTAL_MIGRATIONS: Migration[] = [
-  { version: 1, name: 'initial portals schema', up: (db) => db.exec(SCHEMA) },
-  {
-    version: 2,
-    name: 'index for the uninstalled-portal prune',
-    up: (db) => db.exec('CREATE INDEX IF NOT EXISTS portals_uninstalled_at ON portals (uninstalled_at) WHERE uninstalled_at IS NOT NULL;'),
-  },
-];
+/**
+ * Privacy: delete portal rows uninstalled more than maxAgeMs ago (the row then holds only portal_id + uninstalled_at,
+ * see markUninstalled). Indexed and chunked; run by the Store's maintenance timer. After this, a late lifecycle event
+ * for that portal finds no row (the journal keeps events for ~3 days, so that can't happen in practice).
+ */
+export function pruneUninstalledPortals(c: Db, now: number = Date.now(), maxAgeMs: number = UNINSTALLED_PORTAL_RETENTION_MS): number {
+  return c.pruneChunks(PRUNE_UNINSTALLED_SQL, now - maxAgeMs);
+}
 
 export interface PortalRow {
   portalId: number;
@@ -61,72 +35,75 @@ export interface PortalRow {
   hasToken: boolean;
 }
 
+/** Encryption AAD of a portal's refresh token: binds the ciphertext to its portal row. */
+const tokenAad = (portalId: number) => String(portalId);
+
+/**
+ * A row not newer than the portal's latest install is ignored: this is how a reinstall clears a revocation (a
+ * rejection in the install's own millisecond was of the old token).
+ */
+const REVOKED_SQL = `SELECT r.portal_id AS portalId, r.token_revoked_at AS revokedAt FROM token_revocations r
+  LEFT JOIN portals p ON p.portal_id = r.portal_id
+  WHERE (p.installed_at IS NULL OR p.installed_at < r.token_revoked_at)`;
+
+export interface RotateReport {
+  dryRun: boolean;
+  total: number;
+  alreadyActive: number;
+  /** Rows not on the active key that decrypt fine (what --apply re-encrypts). */
+  wouldReencrypt: number;
+  reencrypted: number;
+  /** Rows that could not be decrypted (missing key id, wrong key, tampered). Left unchanged. */
+  failed: { portalId: number; keyId: string | null; error: string }[];
+  /** Count of rows per key id before the run. */
+  byKeyId: Record<string, number>;
+}
+
 export class PortalStore {
-  readonly db: DatabaseSync;
-  private readonly key: Buffer;
-  private readonly stmts: StatementCache;
-  private maintenanceTimer: ReturnType<typeof setInterval> | undefined;
-
-  constructor(opts: { path?: string; key?: Buffer } = {}) {
-    const path = opts.path ?? dbPath();
-    // Shared pragmas (busy_timeout first, WAL, synchronous=NORMAL, ...): see applyPragmas in ./db.ts.
-    this.db = openDatabase(path);
-    this.stmts = new StatementCache(this.db);
-    runMigrations(this.db, 'portals', PORTAL_MIGRATIONS);
-    this.key = opts.key ?? keyFromEnv();
-    optimizeDatabase(this.db, true);
-    if (path !== ':memory:' && MAINTENANCE_INTERVAL_MS > 0) {
-      this.maintenanceTimer = setInterval(() => {
-        try {
-          if (this.db.isOpen) this.runMaintenance();
-        } catch (e) {
-          getStoreLogger().error('maintenance_failed', `portals maintenance failed: ${(e as Error).message}`, { store: 'portals', error: e });
-        }
-      }, MAINTENANCE_INTERVAL_MS);
-      this.maintenanceTimer.unref();
-    }
-  }
-
-  close(): void {
-    if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
-    this.maintenanceTimer = undefined;
-    this.stmts.clear();
-    if (this.db.isOpen) this.db.close();
-  }
-
-  /** Periodic: delete long-uninstalled portal rows, then PRAGMA optimize. Skipped inside a transaction. */
-  runMaintenance(now: number = Date.now()): { uninstalledPortalsDeleted: number } {
-    if (this.db.isTransaction) return { uninstalledPortalsDeleted: 0 };
-    const n = this.pruneUninstalled(now);
-    optimizeDatabase(this.db);
-    return { uninstalledPortalsDeleted: n };
-  }
+  /** The connection (the worker's PortalStore shares the worker Store's). */
+  readonly conn: Db;
+  private readonly owned: boolean;
+  private readonly key: Keyring;
 
   /**
-   * Privacy: delete portal rows uninstalled more than maxAgeMs ago (the row then holds only portal_id + uninstalled_at,
-   * see markUninstalled). Indexed and chunked. After this, a late lifecycle event for that portal finds no row
-   * (the journal keeps events for ~3 days, so that can't happen in practice).
+   * { path }: open (and migrate) the file on its own connection (API server, tools).
+   * { db }: share an open, migrated connection (the worker's Store.conn), so a process opens the file once.
+   * No maintenance timer: the worker's Store runs the one maintenance pass for this file (incl. pruneUninstalledPortals).
    */
-  pruneUninstalled(now: number = Date.now(), maxAgeMs: number = UNINSTALLED_PORTAL_RETENTION_MS): number {
-    const st = this.stmt(
-      `DELETE FROM portals WHERE rowid IN (SELECT rowid FROM portals WHERE uninstalled_at IS NOT NULL AND uninstalled_at < ? AND refresh_token_enc IS NULL LIMIT ${PRUNE_CHUNK_ROWS})`,
-    );
-    let total = 0;
-    for (;;) {
-      const n = Number(this.transaction(() => st.run(now - maxAgeMs).changes));
-      total += n;
-      if (n < PRUNE_CHUNK_ROWS) return total;
+  constructor(opts: { key: Keyring; log?: Logger } & ({ path: string } | { db: Db })) {
+    this.key = opts.key;
+    this.owned = 'path' in opts;
+    if ('path' in opts) {
+      // Shared pragmas (busy_timeout first, WAL, synchronous=NORMAL, ...): see applyPragmas in ./sqlite.ts.
+      this.conn = new Db(openDatabase(opts.path));
+      try {
+        migrateSchema(this.conn.raw, opts.log ?? createLogger('store'));
+      } catch (e) {
+        this.conn.close();
+        throw e;
+      }
+      optimizeDatabase(this.conn.raw, true);
+    } else {
+      this.conn = opts.db;
     }
   }
 
-  /** Cached prepared statement. */
-  private stmt(sql: string): StatementSync {
-    return this.stmts.get(sql);
+  get db(): DatabaseSync {
+    return this.conn.raw;
+  }
+
+  /** Closes the connection only if this store opened it. */
+  close(): void {
+    if (this.owned) this.conn.close();
+  }
+
+  private stmt(sql: string) {
+    return this.conn.stmt(sql);
   }
 
   /** Save a (re)install. Encrypts the refresh token. Clears uninstalled_at. Keeps stamp spacing. */
   saveInstall(portalId: number, refreshToken: string, scopes: string[], now: number = Date.now()): void {
-    const enc = encryptToken(refreshToken, this.key, String(portalId));
+    const enc = encryptToken(refreshToken, this.key, tokenAad(portalId));
     this.stmt(
         `INSERT INTO portals (portal_id, refresh_token_enc, scopes, installed_at, uninstalled_at, updated_at)
          VALUES (?, ?, ?, ?, NULL, ?)
@@ -138,7 +115,7 @@ export class PortalStore {
 
   /** HubSpot may rotate the refresh token on refresh. Only updates installed portals. */
   updateRefreshToken(portalId: number, refreshToken: string, now: number = Date.now()): void {
-    const enc = encryptToken(refreshToken, this.key, String(portalId));
+    const enc = encryptToken(refreshToken, this.key, tokenAad(portalId));
     this.stmt('UPDATE portals SET refresh_token_enc = ?, updated_at = ? WHERE portal_id = ? AND uninstalled_at IS NULL')
       .run(enc, now, portalId);
   }
@@ -147,25 +124,23 @@ export class PortalStore {
   getRefreshToken(portalId: number): string | undefined {
     const row = this.stmt('SELECT refresh_token_enc FROM portals WHERE portal_id = ? AND uninstalled_at IS NULL')
       .get(portalId) as { refresh_token_enc: string | null } | undefined;
-    return row?.refresh_token_enc ? decryptToken(row.refresh_token_enc, this.key, String(portalId)) : undefined;
+    return row?.refresh_token_enc ? decryptToken(row.refresh_token_enc, this.key, tokenAad(portalId)) : undefined;
   }
 
   /**
-   * Mark uninstalled, wipe the token and the watched pairs. Privacy: the row keeps only portal_id + uninstalled_at
-   * (+ updated_at); scopes, install time, errors and spacing are reset. pruneUninstalled deletes it after 30 days.
+   * Mark uninstalled and wipe the token. Privacy: the row keeps only portal_id + uninstalled_at (+ updated_at); scopes,
+   * install time, errors and spacing are reset. pruneUninstalledPortals deletes it after 30 days. Watched pairs and every
+   * other per-portal row go with Store.purgePortal (the worker runs it right after the uninstall).
    */
   markUninstalled(portalId: number, now: number = Date.now()): void {
-    this.transaction(() => {
-      this.stmt(
-          `INSERT INTO portals (portal_id, refresh_token_enc, installed_at, uninstalled_at, provisioned_at, updated_at)
-           VALUES (?, NULL, NULL, ?, NULL, ?)
-           ON CONFLICT(portal_id) DO UPDATE SET refresh_token_enc = NULL, scopes = '', installed_at = NULL,
-             uninstalled_at = excluded.uninstalled_at, provisioned_at = NULL, last_provision_error = NULL,
-             stamp_spacing_seconds = ${DEFAULT_STAMP_SPACING_SECONDS}, updated_at = excluded.updated_at`,
-        )
-        .run(portalId, now, now);
-      this.stmt('DELETE FROM portal_settings WHERE portal_id = ?').run(portalId);
-    });
+    this.stmt(
+        `INSERT INTO portals (portal_id, refresh_token_enc, installed_at, uninstalled_at, provisioned_at, updated_at)
+         VALUES (?, NULL, NULL, ?, NULL, ?)
+         ON CONFLICT(portal_id) DO UPDATE SET refresh_token_enc = NULL, scopes = '', installed_at = NULL,
+           uninstalled_at = excluded.uninstalled_at, provisioned_at = NULL, last_provision_error = NULL,
+           stamp_spacing_seconds = ${DEFAULT_STAMP_SPACING_SECONDS}, updated_at = excluded.updated_at`,
+      )
+      .run(portalId, now, now);
   }
 
   getPortal(portalId: number): PortalRow | undefined {
@@ -187,9 +162,75 @@ export class PortalStore {
     else this.stmt('UPDATE portals SET last_provision_error = ?, updated_at = ? WHERE portal_id = ?').run(error.slice(0, 2000), now, portalId);
   }
 
-  // --- settings ---
+  // --- token revocations (HubSpot rejected the refresh token; see hubspot/portal-tokens.ts) ---
+
+  /** When the portal's refresh token was rejected since its latest install, or null. */
+  revokedAt(portalId: number): number | null {
+    const r = this.stmt(`${REVOKED_SQL} AND r.portal_id = ?`).get(portalId) as { revokedAt: number } | undefined;
+    return r ? Number(r.revokedAt) : null;
+  }
+
+  listRevoked(): { portalId: number; revokedAt: number }[] {
+    const rows = this.stmt(`${REVOKED_SQL} ORDER BY r.portal_id`).all() as { portalId: number; revokedAt: number }[];
+    return rows.map((r) => ({ portalId: Number(r.portalId), revokedAt: Number(r.revokedAt) }));
+  }
+
+  /** Keep the first rejection; replace a row left from before the latest install. */
+  markRevoked(portalId: number, at: number): void {
+    this.stmt(
+      `INSERT INTO token_revocations (portal_id, token_revoked_at, reason) VALUES (?, ?, 'invalid_grant')
+       ON CONFLICT(portal_id) DO UPDATE SET token_revoked_at = excluded.token_revoked_at
+       WHERE token_revoked_at <= COALESCE((SELECT installed_at FROM portals WHERE portal_id = excluded.portal_id), 0)`,
+    ).run(portalId, at);
+  }
+
+  // --- key rotation (src/cli/rotate-token-key.ts) ---
+
+  /**
+   * Re-encrypt every stored refresh token with the active key (the first entry of the keyring). Dry run by default:
+   * decrypts everything (proves every row is readable with the current keyring) but writes nothing.
+   */
+  rotateTokens(opts: { dryRun?: boolean; now?: number } = {}): RotateReport {
+    const dryRun = opts.dryRun ?? true;
+    const now = opts.now ?? Date.now();
+    const rows = this.stmt('SELECT portal_id, refresh_token_enc FROM portals WHERE refresh_token_enc IS NOT NULL').all() as {
+      portal_id: number;
+      refresh_token_enc: string;
+    }[];
+    const report: RotateReport = { dryRun, total: rows.length, alreadyActive: 0, wouldReencrypt: 0, reencrypted: 0, failed: [], byKeyId: {} };
+    const updates: { portalId: number; enc: string; old: string }[] = [];
+    for (const r of rows) {
+      const portalId = Number(r.portal_id);
+      const kid = keyIdOf(r.refresh_token_enc);
+      report.byKeyId[kid ?? 'unknown'] = (report.byKeyId[kid ?? 'unknown'] ?? 0) + 1;
+      let plain: string;
+      try {
+        plain = decryptToken(r.refresh_token_enc, this.key, tokenAad(portalId));
+      } catch (e) {
+        report.failed.push({ portalId, keyId: kid, error: (e as Error).message });
+        continue;
+      }
+      if (usesActiveKey(r.refresh_token_enc, this.key)) {
+        report.alreadyActive++;
+        continue;
+      }
+      updates.push({ portalId, enc: encryptToken(plain, this.key, tokenAad(portalId)), old: r.refresh_token_enc });
+    }
+    if (!dryRun && updates.length) {
+      // Compare-and-set on the old value: a token refreshed meanwhile (already re-encrypted by the app) is left alone.
+      const st = this.stmt('UPDATE portals SET refresh_token_enc = ?, updated_at = ? WHERE portal_id = ? AND refresh_token_enc = ?');
+      this.conn.transaction(() => {
+        for (const u of updates) report.reencrypted += Number(st.run(u.enc, now, u.portalId, u.old).changes);
+      });
+    }
+    report.wouldReencrypt = updates.length;
+    return report;
+  }
+
+  // --- settings: stamp spacing (portals row) and watched pairs (portal_settings) ---
   getStampSpacingSeconds(portalId: number): number {
-    return this.getPortal(portalId)?.stampSpacingSeconds ?? DEFAULT_STAMP_SPACING_SECONDS;
+    const r = this.stmt('SELECT stamp_spacing_seconds AS s FROM portals WHERE portal_id = ?').get(portalId) as { s: number } | undefined;
+    return r ? Number(r.s) : DEFAULT_STAMP_SPACING_SECONDS;
   }
   /** For the worker: minimum gap between two stamps on the same record in this portal. */
   getStampSpacingMs(portalId: number): number {
@@ -205,16 +246,11 @@ export class PortalStore {
     return rows.map((r) => ({ objectTypeId: r.object_type_id, associatedObjectTypeId: r.associated_object_type_id }));
   }
   setWatchedPairs(portalId: number, pairs: WatchedPair[]): void {
-    this.transaction(() => {
+    this.conn.transaction(() => {
       this.stmt('DELETE FROM portal_settings WHERE portal_id = ?').run(portalId);
       const ins = this.stmt('INSERT OR IGNORE INTO portal_settings (portal_id, object_type_id, associated_object_type_id) VALUES (?, ?, ?)');
       for (const p of pairs) ins.run(portalId, p.objectTypeId, p.associatedObjectTypeId);
     });
-  }
-
-  /** One write transaction (BEGIN IMMEDIATE; nested calls join the outer one). Never await inside fn. */
-  transaction<T>(fn: () => T): T {
-    return runInTransaction(this.db, fn);
   }
 }
 

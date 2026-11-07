@@ -4,7 +4,7 @@
 //   - one per installed portal, for every call made with that portal's OAuth token
 //     (stamping, property create/update/option sync, label reads, object-type reads, installer calls).
 //     HubSpot limit for marketplace OAuth apps: 110 requests / 10 s PER INSTALLED ACCOUNT.
-//     Default here: 100 / 10 s (HS_PORTAL_RATE_PER_10S) to leave headroom.
+//     Here: 100 / 10 s (HS_PORTAL_RATE_PER_10S) to leave headroom.
 //   - 'journal'       : Webhooks Journal reads (client-credentials token). HubSpot: 100 req/s per app. We use 80/s.
 //   - 'subscriptions' : journal subscription management. HubSpot: 50 req/s per app. We use 40/s.
 //   Source: https://developers.hubspot.com/docs/developer-tooling/platform/usage-guidelines
@@ -21,37 +21,33 @@
 // Fairness: each bucket has its own FIFO queue and its own timer, so a throttled portal (full window, or paused
 // after a 429) never delays another portal's calls.
 //
-// Which bucket a request uses is decided in src/lib/http.ts. For portal calls it looks the bearer token up in the
-// token registry below; token providers call registerPortalToken() whenever they hand out a new access token.
+// Which bucket a request uses is decided in src/lib/http.ts hsRequest: the call's portalId, else its app bucket
+// (hubspot/journal.ts passes 'journal' or 'subscriptions'), else none.
 
-export type RateKey = { portalId: number } | 'journal' | 'subscriptions';
+/** App-level rate bucket of a journal-family call (hubspot/journal.ts passes it as RequestOpts.bucket). */
+export type AppBucket = 'journal' | 'subscriptions';
 
-export interface BucketConfig {
+export type RateKey = { portalId: number } | AppBucket;
+
+interface BucketConfig {
   limit: number;
   windowMs: number;
-}
-
-export interface RateLimiterOptions {
-  portal?: BucketConfig;
-  journal?: BucketConfig;
-  subscriptions?: BucketConfig;
-  now?: () => number;
-}
-
-/** Thrown by acquire() when the caller would wait longer than maxWaitMs. Nothing was queued. */
-export class RateLimitWaitError extends Error {
-  constructor(public readonly key: string, public readonly waitMs: number) {
-    super(`rate limit: ${key} is throttled for about ${Math.ceil(waitMs / 1000)}s`);
-    this.name = 'RateLimitWaitError';
-  }
 }
 
 interface Waiter {
   resolve: () => void;
 }
 
+/** Live buckets: app-level ones by name ("journal", "subscriptions"), portal ones by portal id. */
+export interface RateLimiterStats {
+  app: Record<string, BucketStats>;
+  portals: Record<number, BucketStats>;
+}
+
 interface Bucket {
   cfg: BucketConfig;
+  /** Set for a portal bucket. */
+  portalId?: number;
   /** Start times inside the current window, oldest first. */
   starts: number[];
   waiters: Waiter[];
@@ -68,10 +64,10 @@ export interface BucketStats {
   pausedForMs: number;
 }
 
-function numEnv(name: string): number | undefined {
-  const n = Number(process.env[name]);
-  return Number.isFinite(n) && n > 0 ? n : undefined;
-}
+/** Requests per 10 s per installed portal (HubSpot's limit is 110). */
+export const HS_PORTAL_RATE_PER_10S = 100;
+/** HubSpot's per-portal window: requests per 10 s. */
+const PORTAL_WINDOW_MS = 10_000;
 
 export function keyName(key: RateKey): string {
   return typeof key === 'string' ? key : `portal:${key.portalId}`;
@@ -80,60 +76,47 @@ export function keyName(key: RateKey): string {
 export class RateLimiter {
   private readonly buckets = new Map<string, Bucket>();
   private readonly portalCfg: BucketConfig;
-  private readonly appCfg: Record<'journal' | 'subscriptions', BucketConfig>;
-  private readonly now: () => number;
+  private readonly appCfg: Record<AppBucket, BucketConfig> = {
+    journal: { limit: 80, windowMs: 1_000 },
+    subscriptions: { limit: 40, windowMs: 1_000 },
+  };
   private acquires = 0;
 
-  constructor(opts: RateLimiterOptions = {}) {
-    this.portalCfg = opts.portal ?? { limit: numEnv('HS_PORTAL_RATE_PER_10S') ?? 100, windowMs: 10_000 };
-    this.appCfg = {
-      journal: opts.journal ?? { limit: 80, windowMs: 1_000 },
-      subscriptions: opts.subscriptions ?? { limit: 40, windowMs: 1_000 },
-    };
-    this.now = opts.now ?? Date.now;
+  /** `portalRatePer10s` = requests per 10 s per portal (HS_PORTAL_RATE_PER_10S). */
+  constructor(portalRatePer10s: number = HS_PORTAL_RATE_PER_10S) {
+    this.portalCfg = { limit: portalRatePer10s, windowMs: PORTAL_WINDOW_MS };
   }
 
-  /**
-   * Wait for a slot in this key's bucket. Resolves in FIFO order per key.
-   * maxWaitMs: if the estimated wait is longer, throw RateLimitWaitError at once instead of queueing.
-   */
-  acquire(key: RateKey, opts: { maxWaitMs?: number } = {}): Promise<void> {
+  /** Wait for a slot in this key's bucket. Resolves in FIFO order per key. */
+  acquire(key: RateKey): Promise<void> {
     if (++this.acquires % 1000 === 0) this.sweep();
     const b = this.bucket(key);
-    if (opts.maxWaitMs !== undefined) {
-      const wait = this.estimateWaitMs(b);
-      if (wait > opts.maxWaitMs) return Promise.reject(new RateLimitWaitError(keyName(key), wait));
-    }
     return new Promise<void>((resolve) => {
       b.waiters.push({ resolve });
       this.pump(b);
     });
   }
 
-  /** Stop admitting calls for this key for `ms` (after a 429). Other keys are not affected. */
-  pause(key: RateKey, ms: number): void {
-    const b = this.bucket(key);
-    b.pausedUntil = Math.max(b.pausedUntil, this.now() + ms);
-    this.pump(b);
-  }
-
-  /** Estimated wait (ms) for a new call on this key right now. */
+  /** About how long a new acquire() for this key would wait (0 = a slot is free now). */
   waitMs(key: RateKey): number {
     return this.estimateWaitMs(this.bucket(key));
   }
 
-  /** Calls waiting for a slot for this portal (for /health). */
-  queueDepth(portalId: number): number {
-    return this.buckets.get(keyName({ portalId }))?.waiters.length ?? 0;
+  /** Stop admitting calls for this key for `ms` (after a 429). Other keys are not affected. */
+  pause(key: RateKey, ms: number): void {
+    const b = this.bucket(key);
+    b.pausedUntil = Math.max(b.pausedUntil, Date.now() + ms);
+    this.pump(b);
   }
 
-  /** Snapshot of every live bucket, keyed by "portal:<id>", "journal", "subscriptions". */
-  stats(): Record<string, BucketStats> {
-    const now = this.now();
-    const out: Record<string, BucketStats> = {};
+  /** Snapshot of every live bucket. */
+  stats(): RateLimiterStats {
+    const now = Date.now();
+    const out: RateLimiterStats = { app: {}, portals: {} };
     for (const [k, b] of this.buckets) {
       this.trim(b, now);
-      out[k] = {
+      const target: Record<string | number, BucketStats> = b.portalId === undefined ? out.app : out.portals;
+      target[b.portalId ?? k] = {
         queued: b.waiters.length,
         inWindow: b.starts.length,
         limit: b.cfg.limit,
@@ -149,7 +132,7 @@ export class RateLimiter {
     let b = this.buckets.get(k);
     if (!b) {
       const cfg = typeof key === 'string' ? this.appCfg[key] : this.portalCfg;
-      b = { cfg, starts: [], waiters: [], pausedUntil: 0 };
+      b = { cfg, starts: [], waiters: [], pausedUntil: 0, ...(typeof key === 'string' ? {} : { portalId: key.portalId }) };
       this.buckets.set(k, b);
     }
     return b;
@@ -163,7 +146,7 @@ export class RateLimiter {
   }
 
   private estimateWaitMs(b: Bucket): number {
-    const now = this.now();
+    const now = Date.now();
     this.trim(b, now);
     const paused = Math.max(0, b.pausedUntil - now);
     const pos = b.starts.length + b.waiters.length; // slots taken before us
@@ -178,7 +161,7 @@ export class RateLimiter {
 
   private pump(b: Bucket): void {
     while (b.waiters.length) {
-      const now = this.now();
+      const now = Date.now();
       this.trim(b, now);
       if (b.pausedUntil > now) return this.wake(b, b.pausedUntil);
       if (b.starts.length >= b.cfg.limit) return this.wake(b, b.starts[0] + b.cfg.windowMs);
@@ -195,13 +178,13 @@ export class RateLimiter {
       b.timer = undefined;
       b.timerAt = undefined;
       this.pump(b);
-    }, Math.max(1, at - this.now()));
+    }, Math.max(1, at - Date.now()));
     b.timer.unref?.();
   }
 
   /** Drop idle buckets (no queue, nothing in the window, not paused) so 1000s of portals don't pile up. */
   private sweep(): void {
-    const now = this.now();
+    const now = Date.now();
     for (const [k, b] of this.buckets) {
       this.trim(b, now);
       if (!b.waiters.length && !b.starts.length && b.pausedUntil <= now && !b.timer) this.buckets.delete(k);
@@ -213,48 +196,13 @@ export class RateLimiter {
 
 let shared: RateLimiter | undefined;
 
+/** The process-wide limiter. Throws if configureHttp (lib/process.ts startProcess) was not called. */
 export function getRateLimiter(): RateLimiter {
-  return (shared ??= new RateLimiter());
+  if (!shared) throw new Error('rate limiter not configured: call startProcess (lib/process.ts) or configureHttp first');
+  return shared;
 }
 
-/** Replace the shared limiter (tests, or a custom config at startup). */
-export function setRateLimiter(l: RateLimiter): void {
-  shared = l;
-}
-
-/** Calls waiting for a slot for this portal. For /health. */
-export function portalQueueDepth(portalId: number): number {
-  return getRateLimiter().queueDepth(portalId);
-}
-
-/** All buckets (portal + app-level). For /health. */
-export function rateLimiterStats(): Record<string, BucketStats> {
-  return getRateLimiter().stats();
-}
-
-// ---------- token -> portal registry ----------
-// Lets http.ts put a call into the right portal bucket without every function taking a portalId.
-// Keeps the last few tokens per portal (an old one can still be in flight just after a refresh).
-
-const KEEP_TOKENS_PER_PORTAL = 3;
-const tokenToPortal = new Map<string, number>();
-const portalTokens = new Map<number, string[]>();
-
-export function registerPortalToken(token: string, portalId: number): void {
-  if (!token || tokenToPortal.get(token) === portalId) return;
-  tokenToPortal.set(token, portalId);
-  const list = portalTokens.get(portalId) ?? [];
-  list.push(token);
-  while (list.length > KEEP_TOKENS_PER_PORTAL) tokenToPortal.delete(list.shift()!);
-  portalTokens.set(portalId, list);
-}
-
-export function portalIdForToken(token: string | undefined): number | undefined {
-  return token ? tokenToPortal.get(token) : undefined;
-}
-
-/** On uninstall. */
-export function forgetPortalTokens(portalId: number): void {
-  for (const t of portalTokens.get(portalId) ?? []) tokenToPortal.delete(t);
-  portalTokens.delete(portalId);
+/** Replace the process-wide limiter: only configureHttp (lib/http.ts) calls this. */
+export function setRateLimiter(limiter: RateLimiter): void {
+  shared = limiter;
 }

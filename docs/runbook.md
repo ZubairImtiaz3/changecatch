@@ -24,15 +24,16 @@ The fields that matter (`service/src/worker/health.ts`):
 | `status` | `ok`, or `stale` (HTTP 503) when there's been no successful journal read for 1 h | `ok` |
 | `lastSuccessfulReadAt` | last good journal read | under 1 min ago |
 | `offset` | stored journal offset (UUIDv7) | changes over time |
-| `consecutiveErrors`, `lastError` | journal read failures in a row, and the last message | 0 / old |
+| `consecutiveErrors`, `lastError` | journal read failures in a row (since the worker started), and the last message | 0 / old |
 | `stampQueue.size`, `stampQueue.nextDueAt` | stamps waiting; next due time | small; near now |
-| `latency` | `occurredAt` → stamped, for recent stamps | p50 under ~10 s |
+| `latency` | `occurredAt` → stamped, for recent stamps of this process (the `e2e_latency_ms` histogram) | p50 under ~10 s |
+| `totals.changesEmitted`, `totals.stampsSent`, `totals.stampsDropped` | counts since the worker started (in-memory metrics; a restart resets them) | dropped stays 0 |
 | `totals.deadLetters`, `totals.pausedPortals`, `totals.lifecycleRetries`, `totals.parkedEntries`, `totals.labelHolds` | trouble counters, all portals | 0 |
 | `workerLock` | which process holds the single-worker lock | `mine: true` |
 | `metrics` | the metrics registry as JSON (journal lag, offset age, and so on) | see [observability.md](observability.md) |
 | `labelHolds[]` (token only) | label lookups failing, and since when | empty |
 | `portals[]` (token only): `lastError`, `lastErrorAt`, `stampsDropped`, `queued`, `deadLetters`, `paused` | per-portal trouble | no recent errors, not paused |
-| `lifecycleRetries[]` (token only) | install/uninstall handling waiting for a retry | empty |
+| `lifecycleRetries[]` (token only) | uninstall cleanups in HubSpot waiting for a retry | empty |
 
 **Journal lag.** `/metrics` has `changecatch_journal_lag_seconds` and `changecatch_journal_offset_age_seconds`. To work it out by hand: offsets are UUIDv7, so their first 12 hex digits are a Unix-ms timestamp. Lag = now minus that time:
 
@@ -41,8 +42,8 @@ node -e "const o=process.argv[1].replace(/-/g,'');const ms=parseInt(o.slice(0,12
 ```
 
 **Other checks:**
-- The host's process status: there must be exactly **one** worker process. A second one refuses to start while the lock heartbeat is fresh (`WORKER_LOCK_STALE_MS`).
-- Logs: search for `[ALERT]`, `[http]`, `DEAD-LETTERED`, `PAUSED`, `SKIPPING journal`.
+- The host's process status: there must be exactly **one** worker process. A second one refuses to start while the lock heartbeat is fresh (30 s, `WORKER_LOCK_STALE_MS`).
+- Logs: search for `event=alert` (narrow by the `alert` field), `[http]`, `event=dead_letter`, `PAUSED`, `SKIPPING journal`.
 
 **SQL on the host.** You don't need a `sqlite3` CLI; Node has one built in:
 
@@ -50,24 +51,26 @@ node -e "const o=process.argv[1].replace(/-/g,'');const ms=parseInt(o.slice(0,12
 node -e "const d=new (require('node:sqlite').DatabaseSync)(process.env.DB_PATH||'data/changecatch.db');console.log(d.prepare(process.argv[1]).all())" "SELECT key,value FROM worker_state WHERE key LIKE 'journal_%'"
 ```
 
-The stored offset is in table `journal_offset`. An expired-offset reset is recorded in `worker_state` key `journal_offset_reset`.
+The stored offset is in table `journal_offset`. An expired-offset reset is logged as alert `offset_expired` (the old offset is in the message and the `offset` field) and recorded in `lastError`.
 
-**Log strings to know:**
+**Log strings to know.** Alerts are JSON lines with `"level":"error","event":"alert","alert":"<name>"` (the name is in the first column); the message text follows. A cleared alert is `"event":"alert_cleared"`.
 
-| Log line | Source | Meaning |
+| Alert name / log line | Source | Meaning |
 |---|---|---|
-| `[ALERT] ChangeCatch worker: no successful journal read since …` | `health.ts` StaleAlerter | No read for 1 h. Repeats while stale. `[ALERT-CLEARED]` when it recovers. |
-| `[ALERT] journal offset … is gone (HTTP 404 …)` | `journal-reader.ts` | Offset expired. We restarted from `earliest`, so **data was lost**. Also sets `worker_state.journal_offset_reset`. |
-| `SKIPPING journal entr… that failed for over 30 min` | `journal-reader.ts` | One journal file kept failing (HTTP 207) and was skipped. Its changes are lost. |
-| `[ALERT] journal file …` (bad URL host, over the byte cap) | `journal-reader.ts` | A journal file was refused for safety. |
+| `worker_stale`: `ChangeCatch worker: no successful journal read since …` | `health.ts` StaleAlerter | No read for 1 h. Repeats every 15 min while stale. `alert_cleared` when it recovers. |
+| `offset_expired`: `journal offset … is gone (HTTP 404 …)` | `journal-reader.ts` | Offset expired. We restarted from `earliest`, so **data was lost**. Also counts `data_loss{reason="offset_expired"}` and sets `lastError`. |
+| `journal_entries_skipped`: `SKIPPING journal entr… that failed for over 30 min` | `journal-reader.ts` | One journal file kept failing (HTTP 207) and was skipped. Its changes are lost. |
+| `journal_file_rejected`: `journal file …` (bad URL host, over the byte cap) | `journal-reader.ts` | A journal file was refused for safety. |
 | `[http] … -> 429 (…)` / `-> 5xx, retry in …` / `timeout` | `lib/http.ts` | Rate limit, server error, or hung call. |
 | `portal N: stamp … failed (attempt K), retry in …` | `stamp-queue.ts` | A transient stamp failure; it will be retried. |
-| `portal N: K stamp(s) DEAD-LETTERED (kept in stamp_dead_letter)` | `stamp-queue.ts` | HubSpot refused the record, or retries ran out after `STAMP_RETRY_MAX_MS` (24 h). |
-| `[ALERT] portal N: K stamps refused in a row` | `stamp-queue.ts` | Bad data, or a missing property or scope in that portal. Other portals are not affected. |
-| `[ALERT] portal N: token revoked/invalid; PAUSED …` | `stamp-queue.ts` | That portal is paused until the admin reinstalls (B5). |
-| `[ALERT] portal N: paused for over 7 days without a reinstall; running the uninstall routine` | `stamp-queue.ts` | The pause expired; the portal's data is purged. |
-| `[ALERT] portal N: lifecycle retry K failed` | `lifecycle-retry.ts` | Install/uninstall handling keeps failing. |
-| `[ALERT] … parked entr… DROPPED` | `core/poller.ts` | A portal's label lookup was held too long and the park cap was hit. |
+| `portal N: K stamp(s) DEAD-LETTERED (kept in stamp_dead_letter)` | `stamp-queue.ts` | HubSpot refused the record, or retries ran out after 24 h (`STAMP_RETRY_MAX_MS`). |
+| `stamps_refused`: `portal N: K stamps refused in a row` | `stamp-queue.ts` | Bad data, or a missing property or scope in that portal. Other portals are not affected. |
+| `portal_paused`: `portal N: token revoked/invalid; PAUSED …` | `stamp-queue.ts` | That portal is paused until the admin reinstalls (B5). |
+| `pause_expired`: `portal N: paused for over 7 days without a reinstall; running the uninstall routine` | `stamp-queue.ts` | The pause expired; the portal's data is purged. |
+| `uninstall_retry_failing`: `portal N: uninstall (reason) retry K failed` | worker `lifecycle.ts` | Deleting the portal's journal subscriptions keeps failing (from retry 10, at most hourly). Local data is already purged. |
+| `provisioning_failing`: `portal N: provisioning failed (K sweep(s) in a row)` | API server `installer.ts` (`provisionPending`) | An installed portal can't be set up (properties or subscriptions), from the 3rd sweep, at most hourly. Read the error; the sweep retries every 10 min, the admin can also press **Save**. |
+| `parked_entries_dropped`: `portal N: K parked entr… DROPPED` | `core/poller.ts` | A portal's label lookup was held too long and the park cap was hit. Counts `data_loss{reason="park_dropped"}`. |
+| `worker_lock_lost` / `worker_lock_refused` | `worker/main.ts` | Another worker holds the single-worker lock; this one stops / does not start. |
 
 ---
 
@@ -100,7 +103,7 @@ Sources:
 - It returns, for each source record, `to[]` with `toObjectId` and `associationTypes[]` = `{ category, typeId, label }`. So it gives **current links plus labels**, which is exactly what we need.
 - Paging is per input (`paging.next.after`).
 - The max inputs per call is **not stated**. Start with 100 and confirm live.
-- It uses the **customer's** 110 req/10 s budget, so every call goes through our per-portal limiter (`service/src/lib/rate-limiter.ts`, `HS_PORTAL_RATE_PER_10S`, default 100).
+- It uses the **customer's** 110 req/10 s budget, so every call goes through our per-portal limiter (`service/src/lib/rate-limiter.ts`, `HS_PORTAL_RATE_PER_10S` = 100).
 
 You also need the record IDs of the subscribed side. List them with the date-based CRM objects list endpoint (`GET /crm/objects/2026-09/{objectType}?limit=100&after=…`). Confirm the exact path on the current docs page before first use.
 
@@ -126,7 +129,7 @@ This is a per-record scan, the thing the design avoids for normal running. That'
 ### A4. "Reconcile after data loss" procedure (design; no tool yet)
 
 **Inputs:**
-- the gap window: `journal_offset_reset.from` (the timestamp in the UUIDv7) up to the `occurredAt` of the first `earliest` entry
+- the gap window: the old offset from the `offset_expired` alert (`journal offset …` line) (the timestamp in the UUIDv7) up to the `occurredAt` of the first `earliest` entry
 - the affected portals: all installed portals with watched pairs, if the whole journal reset
 - or one portal (token revoked, then reinstalled)
 
@@ -188,7 +191,7 @@ This is a per-record scan, the thing the design avoids for normal running. That'
 - **Symptoms:** `changecatch_*` properties stop changing. Customer workflows don't fire.
 - **Detect:**
   - Heartbeat check fails (Healthchecks), or the alert on `changecatch_journal_read_age_seconds`.
-  - Log: `[ALERT] ChangeCatch worker: no successful journal read since …`.
+  - Log: alert `worker_stale` (`ChangeCatch worker: no successful journal read since …`).
   - `/health`: `status: "stale"`, old `lastSuccessfulReadAt`, journal lag (section 0) in hours.
   - If the host itself is down, the public `/health` of the API server fails too.
 - **Fix:**
@@ -196,7 +199,7 @@ This is a per-record scan, the thing the design avoids for normal running. That'
   2. Restart the worker (`pnpm --filter @changecatch/service start:worker`, or the host's restart command).
   3. Nothing else is needed. The stored offset is still valid, so the worker resumes from it. Dedupe (`seen_events`, change IDs) prevents double stamps.
 - **Catch-up time:** about backlog files ÷ (download rate − arrival rate).
-  - Files download in parallel (`JOURNAL_DOWNLOAD_CONCURRENCY`, default 16), in batches of up to 100.
+  - Files download in parallel (`JOURNAL_DOWNLOAD_CONCURRENCY`, 16), in batches of up to 100.
   - Small installs (a few hundred files a day): seconds to minutes.
   - At large scale, estimate about 3 h of catch-up per day of downtime, and measure it in your own load tests.
   - Watch the lag shrink. If it isn't shrinking after 30 min, treat it as a B2 risk.
@@ -204,11 +207,11 @@ This is a per-record scan, the thing the design avoids for normal running. That'
 
 ### B2. Worker down more than 3 days (or never caught up)
 
-- **Symptoms:** as B1, plus on restart: `[ALERT] journal offset … is gone (HTTP 404 …)`.
-- **Detect:** the `journal_offset_reset` row in `worker_state` (SQL in section 0); `lastError` mentions the expired offset and the restart from earliest.
+- **Symptoms:** as B1, plus on restart: alert `offset_expired` (`journal offset … is gone (HTTP 404 …)`).
+- **Detect:** `data_loss{reason="offset_expired"}`; `lastError` mentions the expired offset and the restart from earliest.
 - **Fix:**
   1. Restart as in B1. The worker restarts by itself from `earliest` and stamps the last ~3 days.
-  2. Work out the gap. From = the time in `journal_offset_reset.from` (UUIDv7). To = the `occurredAt` of the first file read after the reset. Write it into the incident note.
+  2. Work out the gap. From = the time in the old offset named by the `offset_expired` alert (UUIDv7). To = the `occurredAt` of the first file read after the reset. Write it into the incident note.
   3. For every installed portal with watched pairs, run the **reconcile** (Part A4) as a dry run, review it, then apply in silent-refresh mode.
   4. Tell affected admins the gap window, and say that changes in it did not trigger workflows.
 - **Recovery time:**
@@ -220,9 +223,9 @@ This is a per-record scan, the thing the design avoids for normal running. That'
 
 This can happen if the worker was "up" but stuck, for example erroring for days or falling behind.
 
-- **Detect:** the same `[ALERT] journal offset … is gone` log and `journal_offset_reset` row. Before it happened, `consecutiveErrors` grew and journal lag climbed toward 72 h (alerts 3 and 4 in [observability.md](observability.md)).
+- **Detect:** the same `offset_expired` alert (`journal offset … is gone`) and `data_loss{reason="offset_expired"}`. Before it happened, `consecutiveErrors` grew and journal lag climbed toward 72 h (alerts 3 and 4 in [observability.md](observability.md)).
 - **Fix:** the worker has already restarted from `earliest`, so there is nothing to restart. Find the root cause (look at `lastError` before the reset). Then follow B2 steps 2–4.
-- **Empty, not 404 (seen live 2026-11-05):** HubSpot may answer an expired offset with **204 / an empty batch** instead of 404. Before this fix the worker then read "nothing new" forever and `/health` said `ok`. Now it is auto-detected: when a read is empty and the stored offset is older than `JOURNAL_OFFSET_MAX_AGE_MS` (default 48 h), the worker calls `earliest` + `latest` (at most every 5 min). If the offset is older than `earliest`, it logs `[ALERT] journal offset expired; recovered from earliest …`, counts `data_loss{reason="offset_expired"}`, sets `journal_offset_reset` (with `"via":"empty_read"`) and restarts from `earliest`. Follow B2 steps 2–4. Meanwhile `/health` returns 503 `status: "degraded"` with `offsetAgeSeconds` and `degradedReason`. The last check is in `worker_state` key `journal_offset_check`.
+- **Empty, not 404 (seen live 2026-11-05):** HubSpot may answer an expired offset with **204 / an empty batch** instead of 404. Before this fix the worker then read "nothing new" forever and `/health` said `ok`. Now it is auto-detected: when a read is empty and the stored offset is older than `JOURNAL_OFFSET_MAX_AGE_MS` (48 h), the worker calls `earliest` + `latest` (at most every 5 min). If the offset is older than `earliest`, it logs alert `offset_expired` (`journal offset expired; recovered from earliest …`), counts `data_loss{reason="offset_expired"}` and restarts from `earliest`. Follow B2 steps 2–4. Meanwhile `/health` returns 503 `status: "degraded"` with `offsetAgeSeconds` and `degradedReason`. The last check is in `worker_state` key `journal_offset_check`.
 - **Related:** `SKIPPING journal entr… failed for over 30 min` is a smaller version of the same thing (one file lost). Note the offset. The affected portals are unknown, because the file was never read. If it repeats, open a HubSpot support ticket with the offset and `correlationId`.
 
 ### B4. HubSpot outage / 5xx storm
@@ -232,27 +235,27 @@ This can happen if the worker was "up" but stuck, for example erroring for days 
   - `/health` `lastError`, `consecutiveErrors`, `stampQueue`.
   - Check https://status.hubspot.com. If the journal is down, the stale alert fires after 1 h.
 - **What the code already does:**
-  - Journal reads back off from 5 s up to 120 s (`JOURNAL_ERROR_BASE_MS` / `JOURNAL_ERROR_MAX_MS`). The offset doesn't move, so no data is lost while the outage is **under 3 days**.
-  - Stamps retry with back-off for `STAMP_RETRY_MAX_MS` (24 h), then are **dead-lettered** (kept in `stamp_dead_letter`, never silently deleted). The change itself is also still in `change_log`.
-  - HTTP timeouts are 20 s (`HTTP_TIMEOUT_MS`).
+  - Journal reads back off from 5 s up to 120 s (`DEFAULT_DELAY_CONFIG`). The offset doesn't move, so no data is lost while the outage is **under 3 days**.
+  - Stamps retry with back-off for 24 h (`STAMP_RETRY_MAX_MS`; raise it during a long outage), then are **dead-lettered** (kept in `stamp_dead_letter`, never silently deleted). The change itself is also still in `change_log`.
+  - HTTP timeouts are 20 s (`HTTP_TIMEOUT_MS`, a constant).
 - **Do:**
   - Usually nothing. **Don't restart in a loop**; it resets nothing useful.
-  - If the outage looks like it will last longer than a day, raise `STAMP_RETRY_MAX_MS` and restart the worker before dead-letters start.
+  - If the outage looks like it will last longer than a day, raise `DEFAULT_RETRY_WINDOW_MS` (`service/src/worker/stamp-queue.ts`) and redeploy the worker before dead-letters start.
 - **After:** if stamps were dead-lettered, they can be re-queued from `stamp_dead_letter` (or from `change_log` by `change_id`). There is no re-queue tool yet, so today this is a manual job.
 - **Recovery time:** the journal catches up as in B1, once HubSpot is back.
 
 ### B5. A portal's token is revoked, or the app is uninstalled, while stamps are queued
 
 - **Symptoms:**
-  - Log: `portal N: refresh token rejected by HubSpot; marked revoked`, then `[ALERT] portal N: token revoked/invalid; PAUSED …`. Or `app uninstalled`.
+  - Log: `portal N: refresh token rejected by HubSpot; marked revoked`, then alert `portal_paused` (`portal N: token revoked/invalid; PAUSED …`). Or `app uninstalled`.
   - **Other portals are not affected.**
 - **Detect:** `/health` `totals.pausedPortals`; with the health token, `portals[N].paused` and `portals[N].queued`. Metric `changecatch_portals_paused`.
 - **If it was an uninstall:** this is expected. The worker reads the uninstall event, deletes the portal's subscriptions and purges its rows ([install-flow.md](install-flow.md)). Nothing to do.
 - **If it was a revoke without uninstall** (an admin removed access, or the user who installed was removed):
   - The portal is **paused**: its queue is kept and probed hourly.
   - Ask the admin to reinstall at `<PUBLIC_BASE_URL>/install`. A reinstall lifts the pause and the queued stamps go out.
-  - If there is no reinstall within `PORTAL_PAUSE_MAX_MS` (7 days), the uninstall routine runs and the portal's data is purged.
-  - After the reinstall, check that `portals.last_provision_error` is empty (the settings page shows it).
+  - If there is no reinstall within 7 days (`PAUSE_MAX_MS`), the uninstall routine runs and the portal's data is purged.
+  - After the reinstall, check that `portals.last_provision_error` is empty (the settings page shows it). If not, the API server's sweep retries it every 10 min.
   - If the pause ran long enough for the journal to move past changes that were never queued, reconcile that portal (Part A) for the window, in silent-refresh mode.
 - **Recovery time:** as fast as the admin reinstalls.
 
@@ -261,8 +264,8 @@ This can happen if the worker was "up" but stuck, for example erroring for days 
 - **Symptoms:** many `[http] … -> 429 (…)` lines. Stamp latency grows.
 - **Detect:** logs; `latency` p95 in `/health`; `stampQueue.nextDueAt` slipping; `changecatch_rate_limited_total`.
 - **Know which bucket:**
-  - **Portal bucket** (the customer's 110 req/10 s). Usually the customer's own integrations are using up the shared budget, or a bulk import. Our limiter allows `HS_PORTAL_RATE_PER_10S` (default 100) per portal, and a throttled portal is deferred on its own. Other portals are not blocked.
-    - Fix: lower `HS_PORTAL_RATE_PER_10S` (for example to 60) and restart both processes, or raise that portal's stamp spacing in its settings page.
+  - **Portal bucket** (the customer's 110 req/10 s). Usually the customer's own integrations are using up the shared budget, or a bulk import. Our limiter allows `HS_PORTAL_RATE_PER_10S` (100) per portal, and a throttled portal is deferred on its own. Other portals are not blocked.
+    - Fix: set `HS_PORTAL_RATE_PER_10S` lower (for example 60) and restart both processes, or raise that portal's stamp spacing in its settings page.
   - **Journal bucket** (100 req/s per app; we use 80). This should never happen at 3 s polling. If it does, something is looping. Check for a **second worker** (two hosts, or a local worker pointed at production). There must be exactly one.
   - **Subscriptions bucket** (we use 40 req/s): only during mass reprovisioning. Wait it out.
 - **Recovery time:** minutes after the source of load stops. Deferred stamps are not lost.
@@ -278,17 +281,17 @@ This can happen if the worker was "up" but stuck, for example erroring for days 
   ```
 - **Disk full:**
   1. Grow the disk (the host's volume resize), then restart both processes.
-  2. Then shrink what grew. The usual causes are `seen_events`, `change_log` (30 days), and the WAL file. Pruning runs every `DB_MAINTENANCE_INTERVAL_MS`.
+  2. Then shrink what grew. The usual causes are `seen_events`, `change_log` (30 days), and the WAL file. Pruning runs every 10 min (`MAINTENANCE_INTERVAL_MS`).
 - **Corruption: restore from backup.**
   1. **Stop both processes** (API server and worker), so nothing writes to the file.
   2. Move the broken files aside for later study: `changecatch.db`, `changecatch.db-wal`, `changecatch.db-shm`. Don't leave an old `-wal` or `-shm` next to the restored file.
   3. Copy the latest good backup to `DB_PATH`.
   4. Check it: run `PRAGMA integrity_check` (above). It must print `ok`.
-  5. Make sure the **same** `TOKEN_ENC_KEYS` (and `TOKEN_ENC_KEY`, if any old `v1:` rows exist) are set. Otherwise every restored refresh token is unreadable and every portal must reinstall.
+  5. Make sure the **same** `TOKEN_ENC_KEYS` are set. Otherwise every restored refresh token is unreadable and every portal must reinstall.
   6. Start both processes. Pending schema migrations apply on start.
 - **What the worker does after a restore:**
   - The restored offset is older than the real one. If it is **under ~3 days old**, the worker re-reads the journal from there. Changes already handled are re-read; dedupe and deterministic change IDs keep them from being treated as new.
-  - If it is **more than ~3 days old**, the journal returns 404. The worker logs `[ALERT] journal offset … is gone`, records `journal_offset_reset`, and restarts from `earliest`. Follow B2.
+  - If it is **more than ~3 days old**, the journal returns 404. The worker logs alert `offset_expired` (`journal offset … is gone`), counts `data_loss{reason="offset_expired"}`, and restarts from `earliest`. Follow B2.
   - Records already stamped get the same `change_id` again. They should not re-enrol in workflows, because setting a property to its current value is not a change. **Confirm this once** in a test portal before relying on it.
   - The restored `worker_lock` row has an old heartbeat, so the new worker takes the lock normally.
   - Settings saved and installs done after the backup time are lost. Those admins must save settings or reinstall again. Compare `portals.installed_at` with the backup time to find them.
@@ -305,7 +308,7 @@ This can happen if the worker was "up" but stuck, for example erroring for days 
 - **Fix:**
   1. Redeploy the last good build (previous git tag or image).
   2. Run **one** worker only. Don't scale up to "help".
-  3. **Database schema:** migrations are append-only (`runMigrations` in `service/src/store/db.ts`), and normally only add tables or columns, so old code usually runs on a newer file. If the bad release did a destructive migration, restore the database (B7) **before** rolling back.
+  3. **Database schema:** migrations are append-only (`runMigrations` in `service/src/store/sqlite.ts`, steps in `service/src/store/schema.ts`), and normally only add tables or columns, so old code usually runs on a newer file. If the bad release did a destructive migration, restore the database (B7) **before** rolling back. Builds from before the pre-launch squash (2026-11-07, decisions D8) refuse a newer file and vice versa; for a dev DB, recreate it ([development.md](development.md), "Recreate the dev DB").
   4. If the bad release **stamped wrong values**, list the affected `change_id`s from `change_log` for the window, and correct them with the reconcile in silent-refresh mode after the rollback.
   5. If the release also changed the HubSpot app (scopes, `permittedUrls`, settings page), roll that back separately with `hs project upload --profile <env>` from `hubspot-app/` on the previous version. Get sign-off first: a project upload affects every installed portal.
 - **Recovery time:** minutes if the previous build is ready, plus journal catch-up for the downtime.
@@ -324,7 +327,7 @@ This can happen if the worker was "up" but stuck, for example erroring for days 
 
 ### B10. Rotating the token encryption key
 
-- **How it works:** stored refresh tokens are AES-256-GCM with the portal id as AAD (`service/src/install/crypto.ts`). Each value carries a key id. `TOKEN_ENC_KEYS` is a list: the **first** key encrypts new values, the others only decrypt. `TOKEN_ENC_KEY` is the legacy single key, still needed for old `v1:` values until they are re-encrypted.
+- **How it works:** stored refresh tokens are AES-256-GCM with the portal id as AAD (`service/src/lib/crypto.ts`). Each value carries a key id. `TOKEN_ENC_KEYS` is a list: the **first** key encrypts new values, the others only decrypt.
 - **When to rotate:**
   - The key leaked.
   - Someone who had it left.
@@ -337,7 +340,7 @@ This can happen if the worker was "up" but stuck, for example erroring for days 
   4. Dry run: `pnpm --filter @changecatch/service exec tsx src/cli/rotate-token-key.ts`. It decrypts every row and writes nothing. Token values are never printed. (The tools package README lists the current way to run it.)
   5. Apply: the same command with `--apply`. It re-encrypts every row that is not on the active key. Exit code 1 means some rows could not be decrypted; they are left unchanged.
   6. Verify: `/health` shows no portal with a token error, and logs show no decrypt errors.
-  7. Remove the old key (and `TOKEN_ENC_KEY`) and restart again. Keep the old key in the password manager while older backups still need it, then destroy it.
+  7. Remove the old key and restart again. Keep the old key in the password manager while older backups still need it, then destroy it.
 - **Recovery time:** a few minutes. Without the keys, every portal must reinstall.
 
 ---
@@ -346,6 +349,6 @@ This can happen if the worker was "up" but stuck, for example erroring for days 
 
 1. **No reconcile tool** (Part A4). Today a gap of more than 3 days is unrecoverable.
 2. **No re-queue tool for dead-lettered stamps.** `stamp_dead_letter` and `change_log` have the data.
-3. **External alerting is not wired.** The heartbeat, Sentry and the `data_loss` metric exist as modules but are not called yet ([observability.md](observability.md), "Wiring status"). `[ALERT]` lines only reach the logs until they are.
+3. **External alerting is not wired.** The heartbeat and the `data_loss` metric exist as modules but are not called yet ([observability.md](observability.md), "Wiring status"). Alerts (`event=alert`) only reach the logs until they are.
 4. **No backup method chosen yet.** Hosting is not decided. Pick one with a short restore-point gap (continuous SQLite replication is best), and run a restore drill (B7) before launch.
 5. To confirm live: the max inputs for associations `batch/read`; whether re-stamping the same value re-enrols workflows; what the snapshot journal event looks like (only if snapshots are ever needed).

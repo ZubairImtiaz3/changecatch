@@ -1,95 +1,109 @@
-// Custom-object scopes: install URL lists, the automatic second consent step (and its loop guard), settings view.
+// APP_SCOPES vs app-hsmeta.json (one source of truth). Custom-object scopes: install URL lists, the automatic second consent step (and its loop guard), settings view.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import type { AddressInfo } from 'node:net';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import type { TokenResponse } from '../hubspot/oauth.js';
-import { buildInstallUrl } from '../hubspot/oauth.js';
 import { PortalStore } from '../store/portals.js';
 import type { ChangeReport } from './installer.js';
-import { createAppServer, isGovernanceError, safeReturnUrl } from './server.js';
-import { CUSTOM_WRITE_SCOPES, customAccess, customWriteMode, installScopes, needsCustomStep } from './scopes.js';
+import { buildInstallUrl, HUBSPOT_AUTHORIZE_URL, safeReturnUrl } from './oauth-flow.js';
+import { listen, testAppServer } from '../../test/fixtures/app-server.js';
+import { APP_SCOPES, installScopes, needsCustomStep } from './scopes.js';
+import { CUSTOM_WRITE_SCOPES, customAccess } from '../core/pairs.js';
+import { parseKeyring } from '../lib/crypto.js';
 
-const SETS = {
-  required: ['oauth', 'crm.objects.deals.read'],
-  optional: ['crm.objects.custom.read', 'crm.schemas.custom.read'],
-  conditional: ['crm.objects.custom.write', 'crm.schemas.custom.write'],
-};
 const PRO = ['oauth', 'crm.objects.deals.read'];
 const ENT_READ = [...PRO, 'crm.objects.custom.read', 'crm.schemas.custom.read'];
 const ENT_ALL = [...ENT_READ, ...CUSTOM_WRITE_SCOPES];
 
-test('scopes: install URL lists per mode', () => {
-  assert.deepEqual(installScopes(SETS, { mode: 'conditional' }), { scope: SETS.required, optionalScope: SETS.optional });
-  assert.deepEqual(installScopes(SETS, { mode: 'conditional', custom: true }), { scope: [...SETS.required, ...SETS.conditional], optionalScope: SETS.optional });
-  assert.deepEqual(installScopes(SETS, { mode: 'optional' }), { scope: SETS.required, optionalScope: [...SETS.optional, ...SETS.conditional] });
-  assert.equal(customWriteMode(undefined), 'conditional');
-  assert.equal(customWriteMode('optional'), 'optional');
-  assert.throws(() => customWriteMode('maybe'));
+// Copies of hubspot-app/src/app/app-hsmeta.json values must match it exactly (reading the other package is fine in a
+// test; the service itself never does it at runtime).
+const appFile = (rel: string) => readFileSync(fileURLToPath(new URL(`../../../hubspot-app/src/app/${rel}`, import.meta.url)), 'utf8');
+const meta = JSON.parse(appFile('app-hsmeta.json')).config;
 
-  process.env.HUBSPOT_CLIENT_ID ||= 'cid';
-  process.env.HUBSPOT_REDIRECT_URI ||= 'http://localhost:3001/oauth/callback';
-  const u = new URL(buildInstallUrl('st', { custom: true, mode: 'conditional', scopes: SETS }));
-  assert.equal(u.searchParams.get('scope'), [...SETS.required, ...SETS.conditional].join(' '));
-  assert.equal(u.searchParams.get('optional_scope'), SETS.optional.join(' '));
-  // The real app scopes (APP_SCOPES): conditional scopes are NOT in a plain install URL.
-  const plain = new URL(buildInstallUrl('st', { mode: 'conditional' }));
-  assert.ok(!(plain.searchParams.get('scope') ?? '').includes('crm.objects.custom.write'));
+test('APP_SCOPES matches hubspot-app/src/app/app-hsmeta.json', () => {
+  const auth = meta.auth;
+  const sorted = (xs: readonly string[] | undefined) => [...(xs ?? [])].sort();
+  assert.deepEqual(sorted(APP_SCOPES.required), sorted(auth.requiredScopes), 'requiredScopes drifted');
+  assert.deepEqual(sorted(APP_SCOPES.optional), sorted(auth.optionalScopes), 'optionalScopes drifted');
+  assert.deepEqual(sorted(APP_SCOPES.conditional), sorted(auth.conditionallyRequiredScopes), 'conditionallyRequiredScopes drifted');
+});
+
+test('the settings page SUPPORT_EMAIL matches app-hsmeta.json support.supportEmail', () => {
+  const page = /const SUPPORT_EMAIL = '([^']+)'/.exec(appFile('settings/ChangeCatchSettings.tsx'))?.[1];
+  assert.ok(meta.support?.supportEmail, 'app-hsmeta.json has no support.supportEmail');
+  assert.equal(page, meta.support.supportEmail);
+});
+
+test('scopes: install URL lists (custom write only on the ?custom=1 step)', () => {
+  assert.deepEqual(installScopes(), { scope: APP_SCOPES.required, optionalScope: APP_SCOPES.optional });
+  assert.deepEqual(installScopes({ custom: true }), { scope: [...APP_SCOPES.required, ...APP_SCOPES.conditional], optionalScope: APP_SCOPES.optional });
+
+  const app = { clientId: 'cid', redirectUri: 'http://localhost:3001/oauth/callback' };
+  const u = new URL(buildInstallUrl(app, 'st', { custom: true }));
+  assert.equal(`${u.origin}${u.pathname}`, HUBSPOT_AUTHORIZE_URL);
+  assert.equal(u.searchParams.get('scope'), [...APP_SCOPES.required, ...APP_SCOPES.conditional].join(' '));
+  assert.equal(u.searchParams.get('optional_scope'), APP_SCOPES.optional.join(' '));
+  assert.equal(u.searchParams.get('client_id'), 'cid');
+  assert.equal(u.searchParams.get('state'), 'st');
+  // Conditional scopes are NOT in a plain install URL.
+  const plain = new URL(buildInstallUrl(app, 'st'));
+  assert.equal(plain.searchParams.get('scope'), APP_SCOPES.required.join(' '));
   assert.ok(!(plain.searchParams.get('optional_scope') ?? '').includes('crm.objects.custom.write'));
 });
 
 test('scopes: redirect decision', () => {
   assert.deepEqual(customAccess(ENT_READ), { available: true, enabled: false });
-  assert.equal(needsCustomStep(ENT_READ, 'conditional', 1), true, 'custom read granted + write missing -> redirect');
-  assert.equal(needsCustomStep(PRO, 'conditional', 1), false, 'Pro (no custom objects) -> no redirect');
-  assert.equal(needsCustomStep(ENT_ALL, 'conditional', 1), false, 'already granted -> no redirect');
-  assert.equal(needsCustomStep(ENT_READ, 'conditional', 2), false, 'step 2 -> never again (loop guard)');
-  assert.equal(needsCustomStep(ENT_READ, 'optional', 1), false, 'optional mode never redirects');
-  assert.equal(needsCustomStep(['crm.objects.custom.read', 'crm.objects.custom.write'], 'conditional', 1), true, 'both write scopes needed');
+  assert.equal(needsCustomStep(ENT_READ, 1), true, 'custom read granted + write missing -> redirect');
+  assert.equal(needsCustomStep(PRO, 1), false, 'Pro (no custom objects) -> no redirect');
+  assert.equal(needsCustomStep(ENT_ALL, 1), false, 'already granted -> no redirect');
+  assert.equal(needsCustomStep(ENT_READ, 2), false, 'step 2 -> never again (loop guard)');
+  assert.equal(needsCustomStep(['crm.objects.custom.read', 'crm.objects.custom.write'], 1), true, 'both write scopes needed');
 });
 
 // ---------------------------------------------------------------- the server flow
 
-async function startServer(grants: string[][], mode: 'conditional' | 'optional' = 'conditional', extra: { appId?: number; refreshToken?: string } = {}) {
-  const portals = new PortalStore({ path: ':memory:', key: randomBytes(32) });
-  let n = 0;
+/** A redirect to HubSpot's authorize page for step 2 (the custom write scopes are in `scope`). */
+const asksCustomWrite = (loc: string | null) => (new URL(loc ?? '').searchParams.get('scope') ?? '').split(' ').includes('crm.objects.custom.write');
+
+/** `grants`: the scopes HubSpot grants per authorization code (by code, not call order, so tests stay deterministic). */
+async function startServer(grants: Record<string, string[]>, extra: { appId?: number; refreshToken?: string } = {}) {
+  const portals = new PortalStore({ path: ':memory:', key: parseKeyring(`t:${randomBytes(32).toString('base64')}`) });
+  const grantsFor = (code: string) => {
+    if (!(code in grants)) throw new Error(`test: no grants for code ${code}`);
+    return grants[code];
+  };
   const installs: number[] = [];
-  const server = createAppServer({
+  const server = testAppServer({
     installer: {
       completeInstall: async (t: TokenResponse) => {
         portals.saveInstall(Number(t.hub_id), t.refresh_token!, t.scopes ?? []);
         installs.push(Number(t.hub_id));
         return { portalId: Number(t.hub_id), watchedPairs: [], properties: [], subscriptions: { created: [], deleted: [], unchanged: [] } } as ChangeReport;
       },
-      saveSettings: async () => { throw new Error('unused'); },
+      objectTypes: async () => [{ objectTypeId: '0-3', singular: 'Deal', plural: 'Deals', custom: false }, { objectTypeId: '2-9', singular: 'Pet', plural: 'Pets', custom: true }],
     },
     portals,
-    clientSecret: 's',
-    callbackPath: '/oauth/callback',
     publicBaseUrl: 'http://localhost:3001/', // allowUnsigned is only accepted for localhost
     allowUnsigned: true,
-    customWriteMode: mode,
     appId: extra.appId,
-    objectTypes: async () => [{ objectTypeId: '0-3', label: 'Deal', custom: false }, { objectTypeId: '2-9', label: 'Pet', custom: true }],
-    buildInstallUrl: (state, o) => `https://app.hubspot.com/oauth/authorize?state=${state}&custom=${o?.custom ? 1 : 0}`,
-    exchangeCode: async () => ({ token_type: 'bearer', access_token: 'a', refresh_token: extra.refreshToken ?? 'r', expires_in: 1800, hub_id: 111, scopes: grants[n++] }),
-    log: () => {},
+    exchangeCode: async (code) => ({ token_type: 'bearer', access_token: 'a', refresh_token: extra.refreshToken ?? 'r', expires_in: 1800, hub_id: 111, scopes: grantsFor(code) }),
   });
-  await new Promise<void>((r) => server.listen(0, r));
-  const base = `http://localhost:${(server.address() as AddressInfo).port}`;
+  const base = await listen(server);
   const get = (p: string) => fetch(base + p, { redirect: 'manual' });
   const stateOf = (loc: string | null) => new URL(loc!).searchParams.get('state')!;
   return { server, portals, installs, get, stateOf, close: () => new Promise((r) => server.close(r)) };
 }
 
 test('callback: Enterprise without custom write -> straight to the ?custom=1 consent; step 2 never loops', async () => {
-  const s = await startServer([ENT_READ, ENT_READ]); // HubSpot still doesn't grant write on step 2
+  const s = await startServer({ c1: ENT_READ, c2: ENT_READ }); // HubSpot still doesn't grant write on step 2
   try {
     const st1 = s.stateOf((await s.get('/install')).headers.get('location'));
     const cb1 = await s.get(`/oauth/callback?code=c1&state=${st1}`);
     assert.equal(cb1.status, 302);
     const loc = cb1.headers.get('location')!;
-    assert.match(loc, /custom=1/);
+    assert.ok(asksCustomWrite(loc));
     const cb2 = await s.get(`/oauth/callback?code=c2&state=${s.stateOf(loc)}`);
     assert.equal(cb2.status, 200, 'no second redirect');
     assert.match(await cb2.text(), /enabled later/);
@@ -100,7 +114,7 @@ test('callback: Enterprise without custom write -> straight to the ?custom=1 con
 });
 
 test('callback: step 2 declined -> "installed" page, no loop; Pro and already-granted portals never redirect', async () => {
-  const s = await startServer([ENT_READ, PRO, ENT_ALL, ENT_READ]);
+  const s = await startServer({ c1: ENT_READ, c2: PRO, c3: ENT_ALL });
   try {
     const cb1 = await s.get(`/oauth/callback?code=c1`); // install started in HubSpot (no state of ours) = step 1
     assert.equal(cb1.status, 302);
@@ -117,16 +131,7 @@ test('callback: step 2 declined -> "installed" page, no loop; Pro and already-gr
 
     // /install?custom=1 (the settings-page backup link) asks for the conditional scopes; a stale step-2 state can't be reused.
     const manual = await s.get('/install?custom=1');
-    assert.match(manual.headers.get('location')!, /custom=1/);
-  } finally {
-    await s.close();
-  }
-});
-
-test('callback: optional mode never redirects', async () => {
-  const s = await startServer([ENT_READ], 'optional');
-  try {
-    assert.equal((await s.get('/oauth/callback?code=c1')).status, 200);
+    assert.ok(asksCustomWrite(manual.headers.get('location')));
   } finally {
     await s.close();
   }
@@ -138,11 +143,11 @@ const APP_ID = 60681660;
 const SETTINGS = `https://app.hubspot.com/connected-apps/111/installed/framework/${APP_ID}/settings/general-settings`;
 
 test('landing: our own install link -> straight to the ChangeCatch settings tab (after the custom consent)', async () => {
-  const s = await startServer([ENT_READ, ENT_ALL, PRO], 'conditional', { appId: APP_ID, refreshToken: 'na1-' + 'abc' });
+  const s = await startServer({ 'na1-c1': ENT_READ, 'na1-c2': ENT_ALL, 'na1-c3': PRO }, { appId: APP_ID, refreshToken: 'na1-' + 'abc' });
   try {
     const st1 = s.stateOf((await s.get('/install')).headers.get('location'));
     const cb1 = await s.get(`/oauth/callback?code=na1-c1&state=${st1}`);
-    assert.match(cb1.headers.get('location')!, /custom=1/, 'custom consent first');
+    assert.ok(asksCustomWrite(cb1.headers.get('location')), 'custom consent first');
     const cb2 = await s.get(`/oauth/callback?code=na1-c2&state=${s.stateOf(cb1.headers.get('location'))}`);
     assert.equal(cb2.status, 302);
     assert.equal(cb2.headers.get('location'), SETTINGS);
@@ -154,7 +159,7 @@ test('landing: our own install link -> straight to the ChangeCatch settings tab 
 });
 
 test('landing: EU portals go to app-eu1.hubspot.com', async () => {
-  const s = await startServer([PRO], 'conditional', { appId: APP_ID, refreshToken: 'eu1-' + 'abc' });
+  const s = await startServer({ 'eu1-c1': PRO }, { appId: APP_ID, refreshToken: 'eu1-' + 'abc' });
   try {
     assert.equal((await s.get('/oauth/callback?code=eu1-c1')).headers.get('location'), `https://app-eu1.hubspot.com/connected-apps/111/installed/framework/${APP_ID}/settings/general-settings`);
   } finally {
@@ -164,12 +169,12 @@ test('landing: EU portals go to app-eu1.hubspot.com', async () => {
 
 test('landing: Marketplace returnUrl wins, survives the custom consent, and is used even when step 2 is declined', async () => {
   const ret = 'https://app.hubspot.com/marketplace/111/install-complete?x=1';
-  const s = await startServer([ENT_READ, ENT_ALL, ENT_READ, ENT_READ], 'conditional', { appId: APP_ID });
+  const s = await startServer({ c1: ENT_READ, c2: ENT_ALL, c3: ENT_READ }, { appId: APP_ID });
   try {
     const q = `returnUrl=${encodeURIComponent(ret)}&step=finalize`;
     const cb1 = await s.get(`/oauth/callback?code=c1&${q}`);
     const consent = cb1.headers.get('location')!;
-    assert.match(consent, /custom=1/);
+    assert.ok(asksCustomWrite(consent));
     assert.doesNotMatch(consent, /marketplace/, 'returnUrl travels inside the signed state, not in clear');
     const cb2 = await s.get(`/oauth/callback?code=c2&state=${s.stateOf(consent)}`);
     assert.equal(cb2.headers.get('location'), ret);
@@ -184,7 +189,7 @@ test('landing: Marketplace returnUrl wins, survives the custom consent, and is u
 });
 
 test('landing: a non-HubSpot returnUrl is ignored (no open redirect)', async () => {
-  const s = await startServer([PRO, PRO, PRO], 'conditional', { appId: APP_ID });
+  const s = await startServer({ c: PRO }, { appId: APP_ID });
   try {
     for (const bad of ['https://evil.example/x', 'http://app.hubspot.com/x', 'https://app.hubspot.com.evil.example/', 'https://user@app.hubspot.com/', 'javascript:alert(1)']) {
       const r = await s.get(`/oauth/callback?code=c&returnUrl=${encodeURIComponent(bad)}`);
@@ -198,7 +203,7 @@ test('landing: a non-HubSpot returnUrl is ignored (no open redirect)', async () 
 });
 
 test('landing: the callback can be framed by HubSpot; other routes still cannot be framed', async () => {
-  const s = await startServer([PRO], 'conditional', { appId: APP_ID });
+  const s = await startServer({ c1: PRO }, { appId: APP_ID });
   try {
     const cb = await s.get('/oauth/callback?code=c1');
     assert.match(cb.headers.get('content-security-policy')!, /frame-ancestors 'self' https:\/\/app\.hubspot\.com/);
@@ -212,7 +217,7 @@ test('landing: the callback can be framed by HubSpot; other routes still cannot 
 });
 
 test('landing: without HUBSPOT_APP_ID the plain "installed" page is kept', async () => {
-  const s = await startServer([PRO]);
+  const s = await startServer({ c1: PRO });
   try {
     const r = await s.get('/oauth/callback?code=c1');
     assert.equal(r.status, 200);
@@ -223,7 +228,7 @@ test('landing: without HUBSPOT_APP_ID the plain "installed" page is kept', async
 });
 
 test('settings GET: custom-object flags, backup URL, custom types selectable only when enabled', async () => {
-  const s = await startServer([]);
+  const s = await startServer({});
   try {
     s.portals.saveInstall(111, 'r', ENT_READ);
     let body = (await (await s.get('/api/settings?portalId=111')).json()) as any;
@@ -244,7 +249,7 @@ test('settings GET: custom-object flags, backup URL, custom types selectable onl
 const GOV = "Authorization failed because this app hasn't been approved to access the required scopes [crm.objects.custom.write, crm.schemas.custom.write] in your account. Please reach out to your account super admin to add the app's permissions in your account's app governance settings.";
 
 test('callback error page: app governance -> super-admin steps, retry link to ?custom=1, standard objects still work', async () => {
-  const s = await startServer([]);
+  const s = await startServer({});
   try {
     const st = s.stateOf((await s.get('/install?custom=1')).headers.get('location'));
     const r = await s.get(`/oauth/callback?error=access_denied&error_description=${encodeURIComponent(GOV)}&state=${st}`);
@@ -266,7 +271,7 @@ test('callback error page: app governance -> super-admin steps, retry link to ?c
 });
 
 test('callback error page: custom step access_denied shows the governance hint; other errors are escaped and offer a retry', async () => {
-  const s = await startServer([]);
+  const s = await startServer({});
   try {
     const st = s.stateOf((await s.get('/install?custom=1')).headers.get('location'));
     const declined = await s.get(`/oauth/callback?error=access_denied&state=${st}`);
@@ -285,10 +290,4 @@ test('callback error page: custom step access_denied shows the governance hint; 
   } finally {
     await s.close();
   }
-});
-
-test('isGovernanceError wording', () => {
-  assert.equal(isGovernanceError('access_denied', GOV), true);
-  assert.equal(isGovernanceError('access_denied', 'User denied access'), false);
-  assert.equal(isGovernanceError(null, null), false);
 });
