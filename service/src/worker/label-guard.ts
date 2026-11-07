@@ -5,9 +5,9 @@
 //  - The label fetch fails (network, 5xx, 401 after refresh)       -> LabelHoldError (offset not saved, retry later)
 //  - The type id is still unknown after a fresh fetch              -> LabelHoldError (a brand-new label may not be
 //                                                                     visible yet; retry later)
-//  - A labeled type id we never announced for an object pair      -> await onUnknownLabel(portalId, from, to) first,
-//                                                                     so the dropdown options can be synced (agent (a):
-//                                                                     src/core/label-options.ts). If the hook throws -> hold.
+//  - A type id we never announced for an object pair (labeled or   -> await onUnknownLabel(portalId, from, to) first,
+//    not: the first event of a new pair needs its other-object-       so the dropdown options can be synced
+//    type option), or a label whose name changed (rename)             (src/core/label-options.ts). If the hook throws -> hold.
 //  - A hold that lasts longer than maxHoldMs (default 30 min)      -> give up for that type: return undefined, so
 //                                                                     resolve.ts uses its "type N" fallback. Logged as
 //                                                                     an error; the shared journal can't wait forever.
@@ -75,23 +75,29 @@ export class GuardedLabelCache implements LabelCache {
 
     if (!hit) return this.hold(holdKey, 'association type id not found in the portal\'s label definitions');
 
-    // A labeled type id we have not announced yet (new label, or first sight after install): let the
-    // dropdown options catch up BEFORE we stamp it. Persisted per pair, so it runs once per new label.
-    if (hit.label !== null && this.opts.onUnknownLabel) {
+    // A type id we have not announced yet (new label, or the first event of a pair after install), or a label renamed
+    // in HubSpot (the refresh returned a new name): let the dropdown options catch up BEFORE we stamp it. Persisted per
+    // pair, so it runs once per new type id / rename.
+    if (this.opts.onUnknownLabel) {
       const syncKey = `labels_synced:${this.opts.syncScope ? `${this.opts.syncScope}:` : ''}${portalId}|${from}|${to}`;
       const synced: number[] = JSON.parse(store.getState(syncKey) ?? '[]');
-      if (!synced.includes(typeId)) {
+      const renamed = !!cachedBefore && cachedBefore.label !== hit.label;
+      if (!synced.includes(typeId) || renamed) {
         try {
           await this.opts.onUnknownLabel(portalId, from, to);
         } catch (e) {
           return this.hold(holdKey, `onUnknownLabel failed: ${(e as Error).message}`);
         }
-        const now = store.listLabels(portalId, from, to).filter((d) => d.label !== null).map((d) => d.associationTypeId);
+        const now = store.listLabels(portalId, from, to).map((d) => d.associationTypeId);
         store.setState(syncKey, JSON.stringify([...new Set([...synced, ...now, typeId])].sort((a, b) => a - b)));
       }
     }
     store.clearLabelHold(holdKey);
     return hit;
+  }
+
+  findByName(portalId: number, from: string, to: string, label: string): Promise<number | undefined> {
+    return this.inner.findByName ? this.inner.findByName(portalId, from, to, label) : Promise.resolve(undefined);
   }
 
   private hold(holdKey: string, why: string): undefined {

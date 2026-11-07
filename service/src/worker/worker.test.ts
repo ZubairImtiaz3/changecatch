@@ -209,7 +209,7 @@ test('worker: label fetch failure HOLDS the batch; nothing guessed, nothing stam
   assert.equal(s.store.listLabelHolds().length, 0);
   assert.equal(s.calls.length, 1);
   const row = s.store.db.prepare('SELECT labels_current FROM change_log').get() as { labels_current: string };
-  assert.match(row.labels_current, /Influencer/); // exact option value format belongs to src/core/label-options.ts
+  assert.equal(row.labels_current, '0-1:101', 'Influencer (type 101) as its option value');
 });
 
 test('worker: unknown label type is held, then given up after the max hold (fallback name)', async () => {
@@ -497,7 +497,7 @@ test('worker: one portal\'s label failure PARKS only that portal; the offset mov
   await s.worker.readOnce();
   assert.equal(s.calls.length, 2);
   const row = s.store.db.prepare('SELECT label_after FROM change_log WHERE portal_id = 111').get() as { label_after: string };
-  assert.equal(row.label_after, '0-1:Influencer');
+  assert.equal(row.label_after, '0-1:101', 'Influencer (type 101)');
 });
 
 test('worker: a parked entry whose pair is no longer watched (uninstall wiped the pairs) is dropped', async () => {

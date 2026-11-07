@@ -1,5 +1,6 @@
-// Option sets + value formatting for the 3 label properties (changecatch_label_before / _after / labels_current).
-// They are enumeration + checkbox ("multiple checkboxes") properties, so a record value is a set of option values.
+// Option sets + value formatting for the 3 label properties (changecatch_labels_before / _after / _current) and the
+// changecatch_other_object_type dropdown.
+// The label properties are enumeration + checkbox ("multiple checkboxes"), so a record value is a set of option values.
 //
 // Docs (checked 2026-10-30):
 //   Multi-checkbox values are ";"-separated with no spaces (properties guide, "enumeration" type):
@@ -7,27 +8,28 @@
 //   Limits: 5,000 options or 512,000 bytes per property; 3,000 chars per option (label + value + description):
 //     https://knowledge.hubspot.com/properties/property-field-types-in-hubspot
 //
-// Option value design (decision log D4 follow-up):
-//   value = `${otherObjectTypeId}:${label name}`  e.g. "0-1:Billing contact"
-//   label = `${label name} (${other object name})` e.g. "Billing contact (Contact)"
-// Why: the same label text can exist on two pairs (Deal->Contact "Billing contact" and Deal->Company
-// "Billing contact"). One option per pair lets an admin pick exactly the one they mean in a single filter,
-// without also filtering on changecatch_other_object_type. The type id prefix is stable (object names can be renamed).
-// We key by label NAME, not typeId, because the stamp pipeline only carries names (resolve.ts). A renamed label
-// gets a new option; the old one is kept (records may still hold it).
+// Option value design (naming review 2026-11-07, docs/decisions.md):
+//   value = `${otherObjectTypeId}:${associationTypeId}`  e.g. "0-1:279"
+//   label = `${label name} (${other object name})`        e.g. "Billing contact (Contact)"
+// The associationTypeId is the label's id in the direction stamped record -> other record. Ids never change, so a
+// label renamed in HubSpot keeps its option value (customers' workflow filters keep matching); the sync only updates
+// the option's display text. One option per (other type, label) lets an admin pick exactly the label they mean in a
+// single filter. Option VALUES are frozen once customers install: never change this format.
+// The pipeline carries label KEYS (resolve.ts labelKeysOf): the type id as a string, UNLABELED_KEY for the structural
+// default link, or "type N" when the id could not be resolved.
 //
 // Pure: no HTTP. The sync (GET + PATCH) lives in src/hubspot/properties.ts.
 
-/** Written instead of "" so workflow filters ("is any of (none)") work. */
-export const NONE = '(none)';
-/** Written when we genuinely don't know (e.g. a label edit on a pair we never saw being created). */
-export const UNKNOWN = '(unknown)';
+/** Written instead of "" so workflow filters ("is any of (none)") work. Shown as "(none)". */
+export const NONE = 'none';
+/** Written when we genuinely don't know (e.g. a label edit on a pair we never saw being created). Shown as "(unknown)". */
+export const UNKNOWN = 'unknown';
 /** HubSpot's multi-checkbox separator. No spaces. */
 export const MULTI_SEPARATOR = ';';
-/** resolve.ts names a structural (unlabeled) type like this. It is not a real label, so it is dropped. */
-export const UNLABELED_NAME = 'Unlabeled';
-/** resolve.ts writes `type 123` when a type id is still unknown after a label refresh. */
-const UNRESOLVED_TYPE = /^type \d+$/;
+/** resolve.ts keys a structural (unlabeled) type like this. It is not a real label, so it is dropped. */
+export const UNLABELED_KEY = 'unlabeled';
+/** A resolved label key: the association type id. Anything else (e.g. "type 123") is unknown. */
+const LABEL_KEY = /^\d+$/;
 
 export const MAX_OPTIONS = 5000;
 
@@ -39,16 +41,16 @@ export interface PropertyOption {
 }
 
 export const FIXED_OPTIONS: PropertyOption[] = [
-  { label: NONE, value: NONE, displayOrder: 0, hidden: false },
-  { label: UNKNOWN, value: UNKNOWN, displayOrder: 1, hidden: false },
+  { label: '(none)', value: NONE, displayOrder: 0, hidden: false },
+  { label: '(unknown)', value: UNKNOWN, displayOrder: 1, hidden: false },
 ];
 
-/** ";" would split one label into two values, so it is replaced. */
-const clean = (s: string) => s.trim().replace(/;/g, ',').replace(/\s+/g, ' ');
+/** Tidy a label name for display. */
+const clean = (s: string) => s.trim().replace(/\s+/g, ' ');
 
 /** The option value for one label seen from the stamped record, towards `otherObjectTypeId`. */
-export function labelOptionValue(otherObjectTypeId: string, labelName: string): string {
-  return `${otherObjectTypeId}:${clean(labelName)}`;
+export function labelOptionValue(otherObjectTypeId: string, associationTypeId: number | string): string {
+  return `${otherObjectTypeId}:${associationTypeId}`;
 }
 
 export function labelOptionLabel(otherObjectName: string, labelName: string): string {
@@ -56,17 +58,17 @@ export function labelOptionLabel(otherObjectName: string, labelName: string): st
 }
 
 /**
- * Label names -> the property value: sorted option values joined with ";".
- * undefined -> `whenUndefined` (default "(unknown)"); no real labels -> "(none)".
- * "Unlabeled" is dropped; an unresolved "type 123" becomes "(unknown)" (it can't match an option).
+ * Label keys -> the property value: sorted option values joined with ";".
+ * undefined -> `whenUndefined` (default "unknown"); no real labels -> "none".
+ * The unlabeled key is dropped; an unresolved "type 123" (anything that isn't a type id) becomes "unknown".
  */
 export function formatLabelValues(labels: string[] | undefined, otherObjectTypeId: string, whenUndefined: string = UNKNOWN): string {
   if (labels === undefined) return whenUndefined;
   const out = new Set<string>();
   for (const raw of labels) {
-    const l = clean(raw);
-    if (l === '' || l === UNLABELED_NAME) continue;
-    out.add(UNRESOLVED_TYPE.test(l) ? UNKNOWN : labelOptionValue(otherObjectTypeId, l));
+    const l = raw.trim();
+    if (l === '' || l === UNLABELED_KEY) continue;
+    out.add(LABEL_KEY.test(l) ? labelOptionValue(otherObjectTypeId, l) : UNKNOWN);
   }
   return out.size === 0 ? NONE : [...out].sort().join(MULTI_SEPARATOR);
 }
@@ -76,11 +78,11 @@ export function splitValues(value: string | null | undefined): string[] {
   return (value ?? '').split(MULTI_SEPARATOR).map((v) => v.trim()).filter(Boolean);
 }
 
-/** Label definitions toward one other object type (from the labels endpoint, either direction). */
+/** Label definitions toward one other object type, in the direction stamped object -> other object. */
 export interface LabelSource {
   otherObjectTypeId: string;
   otherObjectName: string;
-  labels: { label: string | null; category: string }[];
+  labels: { typeId: number; label: string | null; category: string }[];
 }
 
 /**
@@ -91,8 +93,8 @@ export function buildLabelOptions(sources: LabelSource[]): PropertyOption[] {
   const byValue = new Map<string, { label: string; sort: string }>();
   for (const s of sources) {
     for (const l of s.labels) {
-      if (l.label === null || clean(l.label) === '' || clean(l.label) === UNLABELED_NAME) continue;
-      const value = labelOptionValue(s.otherObjectTypeId, l.label);
+      if (l.label === null || clean(l.label) === '') continue;
+      const value = labelOptionValue(s.otherObjectTypeId, l.typeId);
       if (!byValue.has(value))
         byValue.set(value, { label: labelOptionLabel(s.otherObjectName, l.label), sort: `${s.otherObjectName}\u0000${clean(l.label).toLowerCase()}` });
     }
@@ -104,28 +106,46 @@ export function buildLabelOptions(sources: LabelSource[]): PropertyOption[] {
   ];
 }
 
+/** changecatch_other_object_type options: value = object type id (stable), label = its display name. */
+export function buildObjectTypeOptions(otherTypeIds: string[], names: Record<string, string>): PropertyOption[] {
+  return [...new Set(otherTypeIds)]
+    .sort((a, b) => (names[a] ?? a).localeCompare(names[b] ?? b))
+    .map((id, i) => ({ label: names[id] ?? id, value: id, displayOrder: i, hidden: false }));
+}
+
 export interface MergeResult {
   options: PropertyOption[];
   /** Values that were missing and are appended. */
   added: string[];
   /** Values that existed but were hidden, and are shown again. */
   unhidden: string[];
+  /** Values whose display text changed (a label or object renamed in HubSpot). The value itself never changes. */
+  relabelled: string[];
   changed: boolean;
 }
 
 /**
  * PATCH replaces the whole options list ("Provided fields will be overwritten"), so we send existing + missing.
- * Never removes an option: records may still hold it (deleted or renamed labels).
+ * Never removes an option: records may still hold it (deleted labels). Updates the display text of an option whose
+ * label was renamed (same value = same association type id).
  */
 export function mergeOptions(existing: PropertyOption[], desired: PropertyOption[]): MergeResult {
   const have = new Map(existing.map((o) => [o.value, o]));
+  const want = new Map(desired.map((d) => [d.value, d]));
   const unhidden: string[] = [];
+  const relabelled: string[] = [];
   const options = existing.map((o) => {
-    if (o.hidden && desired.some((d) => d.value === o.value)) {
+    const d = want.get(o.value);
+    const next = { ...o };
+    if (d && o.hidden) {
       unhidden.push(o.value);
-      return { ...o, hidden: false };
+      next.hidden = false;
     }
-    return { ...o };
+    if (d && d.label !== o.label) {
+      relabelled.push(o.value);
+      next.label = d.label;
+    }
+    return next;
   });
   let order = options.reduce((m, o) => Math.max(m, o.displayOrder), -1) + 1;
   const added: string[] = [];
@@ -134,7 +154,7 @@ export function mergeOptions(existing: PropertyOption[], desired: PropertyOption
     options.push({ ...d, displayOrder: order++ });
     added.push(d.value);
   }
-  return { options, added, unhidden, changed: added.length > 0 || unhidden.length > 0 };
+  return { options, added, unhidden, relabelled, changed: added.length > 0 || unhidden.length > 0 || relabelled.length > 0 };
 }
 
 /** Other object types this object type is associated with, among the watched pairs (either side). */

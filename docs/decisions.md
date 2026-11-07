@@ -15,6 +15,24 @@ All decisions below were made in October 2026, while v1 was being built and test
 
 ---
 
+## D7: Naming of everything in the customer's portal (2026-11-07)
+
+**Why:** internal property names and option values are frozen once customers install (HubSpot can't rename a property, and customers' workflow filters store option values). Reviewed before the first customer.
+
+**Research:** HubSpot documents no naming rules beyond: internal name max 100 characters and not editable after creation; labels editable; option values are what the API and filters use. Marketplace requirements only cover app branding. Common practice: a snake_case `brand_field` internal name, the brand in the group and in the label (many pickers show only the label).
+
+**Kept:** `changecatch_` prefix and snake_case; group `changecatch` / "ChangeCatch"; labels "ChangeCatch: …" in sentence case; change type values `ADDED` / `REMOVED` / `LABEL_CHANGED`.
+
+**Changed:**
+- `changecatch_label_before` / `_after` → `changecatch_labels_before` / `_after` (consistent with `changecatch_labels_current`).
+- Change type option labels: "Added", "Removed", "Label changed" (values unchanged).
+- Special label values `(none)` / `(unknown)` → `none` / `unknown` (display text still "(none)" / "(unknown)").
+- `changecatch_other_object_type`: free text with a display name → dropdown, value = object type id (`0-1`, `2-…`), label = the object's name. A renamed custom object no longer breaks "is equal to" filters.
+- Label option values: `${otherTypeId}:${label name}` → `${otherTypeId}:${associationTypeId}`. A label renamed in HubSpot keeps its value (filters keep matching); the option sync only updates the display text. The pipeline carries label type ids instead of names (resolve.ts `labelKeysOf`).
+- Mirror stamps (`STAMP_MIRROR=1`): type ids are per direction, so labels are translated to the other direction by name; a paired label with different names per side is written as `unknown` rather than guessed.
+
+**Migration:** store migration 8 clears the short-lived label memory that held names (`association_labels`, `emitted_actions`) and the `labels_synced:` markers, so every pair's dropdowns are synced again. Old properties in already-installed test portals are left alone (never deleted).
+
 ## D6: Late-half absorption instead of a longer split hold (2026-10-30)
 
 ### Original plan
@@ -31,7 +49,7 @@ In a 1,300-operation mixed load test, HubSpot published the two halves of one ac
 ### Choice
 `service/src/core/absorb.ts` plus an `emitted_actions` table (10-minute TTL):
 - Late label REMOVED after a REMOVED: absorbed (no new change).
-- Late label ADDED after an ADDED: amended. If the stamp is still queued, it is merged. Otherwise an amend PATCH writes only `changecatch_label_after` and `changecatch_labels_current`, with no new change ID, so there is no extra workflow enrollment.
+- Late label ADDED after an ADDED: amended. If the stamp is still queued, it is merged. Otherwise an amend PATCH writes only `changecatch_labels_after` and `changecatch_labels_current` (named `changecatch_label_after` before D7), with no new change ID, so there is no extra workflow enrollment.
 - Late structural half after a LABEL_CHANGED: converted in place if not stamped yet. If already stamped, the correct REMOVED or ADDED is emitted. That is one extra, correct enrollment; it can't be avoided.
 
 The default split hold dropped to 4 s. It is now only an optimisation. The next 1,300-operation run was 100% correct (see [kpis.md](kpis.md)).

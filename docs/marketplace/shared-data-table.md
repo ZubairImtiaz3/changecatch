@@ -39,7 +39,7 @@ We request read **and** write scopes on all 4 object types, so every row is **bi
 ### What we WRITE to HubSpot
 | Data | Objects | How | Scope |
 |---|---|---|---|
-| A property group "ChangeCatch", plus 7 properties: `changecatch_last_change_id`, `changecatch_change_type`, `changecatch_other_object_type`, `changecatch_other_record_id`, `changecatch_label_before`, `changecatch_label_after`, `changecatch_labels_current` | Each watched object type | `POST/PATCH /crm/properties/2026-09/{object}` | `crm.schemas.<object>.write` |
+| A property group "ChangeCatch", plus 7 properties: `changecatch_last_change_id`, `changecatch_change_type`, `changecatch_other_object_type`, `changecatch_other_record_id`, `changecatch_labels_before`, `changecatch_labels_after`, `changecatch_labels_current` | Each watched object type | `POST/PATCH /crm/properties/2026-09/{object}` | `crm.schemas.<object>.write` |
 | Dropdown options for the 3 label properties, kept in sync with the portal's label names | Same | `PATCH /crm/properties/2026-09/{object}/{name}` | `crm.schemas.<object>.write` |
 | Values of the 7 `changecatch_*` properties on the record whose association changed (one side of each pair; see [../user-guide.md](../user-guide.md), "Which record gets updated?") | Watched records | `POST /crm/objects/2026-09/{object}/batch/update` | `crm.objects.<object>.write` |
 

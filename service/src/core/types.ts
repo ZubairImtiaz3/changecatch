@@ -91,9 +91,16 @@ export interface NormalizedChange {
   labelAfter?: string[];
   /** Full label set after the change. Undefined when we don't know it. */
   labelsCurrent?: string[];
-  /** Label names this change removed / added (from the journal events). Set by resolveChanges. */
+  /**
+   * Label KEYS this change removed / added (from the journal events). Set by resolveChanges. All label arrays on this
+   * type hold keys: the association type id (direction from -> to) as a string, "unlabeled", or "type N" (unresolved).
+   */
   removedLabels?: string[];
   addedLabels?: string[];
+  /** key -> label name, for logs and the app-event mode. */
+  labelNames?: Record<string, string>;
+  /** STAMP_MIRROR only: key (from -> to) -> the same label's key in the to -> from direction. */
+  mirrorLabelKeys?: Record<string, string>;
   associationCategory: string;
   occurredAt: string;
   sourceOffsets: string[];

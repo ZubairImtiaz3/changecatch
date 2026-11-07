@@ -148,7 +148,8 @@ const logRows = (r: SimResult, a: Action) =>
   r.store.db
     .prepare('SELECT change_id, change_type, labels_current, superseded_by FROM change_log WHERE object_id = ? AND occurred_at = ? ORDER BY created_at, change_id')
     .all(String(a.dealId), atIso(a)) as { change_id: string; change_type: string; labels_current: string; superseded_by: string | null }[];
-const finalLabels = (a: Action) => (a.kind === 'unlink' ? '(none)' : `0-1:${NAME[a.label]}`);
+// Option values key labels by type id (`0-1:<typeId>`); NAME documents which label each id is.
+const finalLabels = (a: Action) => (a.kind === 'unlink' ? 'none' : `0-1:${a.label}`);
 const finalType = (a: Action) => (a.kind === 'unlink' ? 'REMOVED' : 'ADDED');
 
 /** Checks every invariant for one action. Returns how many workflow triggers it caused. */
@@ -166,10 +167,10 @@ function check(r: SimResult, a: Action, delivery: 'immediate' | 'deferred'): num
   assert.equal(rows.at(-1)?.change_type, finalType(a), `last change_log type: ${what}`);
   assert.equal(rows.at(-1)?.labels_current, finalLabels(a), `last change_log labels_current: ${what}`);
   // A REMOVED never says "(unknown)": an unlinked pair has no labels.
-  for (const u of trig) if (u.properties.changecatch_change_type === 'REMOVED') assert.equal(u.properties.changecatch_labels_current, '(none)', what);
+  for (const u of trig) if (u.properties.changecatch_change_type === 'REMOVED') assert.equal(u.properties.changecatch_labels_current, 'none', what);
   // Amend stamps only touch the label properties: never a new change id (no extra enrollment), never the type.
   for (const u of amendsFor(r, a)) {
-    assert.deepEqual(Object.keys(u.properties).sort(), ['changecatch_label_after', 'changecatch_label_before', 'changecatch_labels_current'], what);
+    assert.deepEqual(Object.keys(u.properties).sort(), ['changecatch_labels_after', 'changecatch_labels_before', 'changecatch_labels_current'], what);
     assert.equal(u.amendOf, trig.at(-1)?.properties.changecatch_last_change_id, `amend targets the stamped change: ${what}`);
   }
   // Exactly ONE trigger, except a label-first split whose label half was ALREADY STAMPED before the structural half
@@ -216,7 +217,7 @@ test('real case deal 6212410158: unlink, REMOVED 3 first, label half 7.7 s later
   assert.equal(check(r, a, 'immediate'), 1);
   assert.deepEqual(
     logRows(r, a).map((x) => [x.change_type, x.labels_current]),
-    [['REMOVED', '(none)']],
+    [['REMOVED', 'none']],
   );
   r.store.close();
 });

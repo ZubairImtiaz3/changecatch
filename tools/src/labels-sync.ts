@@ -1,4 +1,4 @@
-// Sync the options of the 3 label properties (changecatch_label_before / _after / _labels_current) with the portal's
+// Sync the options of the ChangeCatch dropdowns (changecatch_labels_before / _after / _current, change type, other object type) with the portal's
 // association labels. Also migrates them from the old free-text type to multiple checkboxes if needed.
 // Usage (from tools/):
 //   pnpm exec tsx src/labels-sync.ts --portal <portalId> --objects 0-1,0-3,2-xxx           (dry run: read only)

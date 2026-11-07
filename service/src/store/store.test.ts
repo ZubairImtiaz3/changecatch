@@ -281,3 +281,23 @@ test('portals: uninstall keeps only id + time, row deleted after 30 days; instal
   assert.equal(p.getRefreshToken(1), 'rt-1b');
   p.close();
 });
+
+test('migration 8: name-based label memory is cleared (labels are type-id keys now); other data kept', () => {
+  const db = new DatabaseSync(':memory:');
+  runMigrations(db, 'store', STORE_MIGRATIONS.filter((m) => m.version <= 7));
+  db.exec(`
+    INSERT INTO association_labels VALUES ('111|0-3|1|0-1|2', '["Influencer"]', 1);
+    INSERT INTO emitted_actions VALUES ('a', 'r', 111, 'c1', 'ADDED', '0-1', NULL, '["Influencer"]', '[]', '["Influencer"]', 1, 1);
+    INSERT INTO worker_state VALUES ('labels_synced:111|0-3|0-1', '[101]');
+    INSERT INTO worker_state VALUES ('labels_synced:mirror:111|0-3|0-1', '[101]');
+    INSERT INTO worker_state VALUES ('other_key', 'keep');
+    INSERT INTO seen_events VALUES ('k1', 1);`);
+  assert.deepEqual(runMigrations(db, 'store', STORE_MIGRATIONS), [8]);
+  const count = (sql: string) => (db.prepare(sql).get() as { n: number }).n;
+  assert.equal(count('SELECT COUNT(*) AS n FROM association_labels'), 0);
+  assert.equal(count('SELECT COUNT(*) AS n FROM emitted_actions'), 0);
+  assert.equal(count("SELECT COUNT(*) AS n FROM worker_state WHERE key LIKE 'labels_synced:%'"), 0, 'every pair re-syncs its dropdowns once');
+  assert.equal((db.prepare("SELECT value FROM worker_state WHERE key = 'other_key'").get() as { value: string }).value, 'keep');
+  assert.equal(count('SELECT COUNT(*) AS n FROM seen_events'), 1, 'unrelated tables untouched');
+  db.close();
+});

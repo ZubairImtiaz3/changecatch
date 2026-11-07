@@ -303,7 +303,7 @@ CREATE TABLE IF NOT EXISTS portal_settings (
   associated_object_type_id TEXT NOT NULL,
   PRIMARY KEY (portal_id, object_type_id, associated_object_type_id)
 );
--- Last known label names per pair of records (learned from events we have seen).
+-- Last known label set per pair of records (label keys = association type ids; learned from events we have seen).
 CREATE TABLE IF NOT EXISTS association_labels (
   pair_key TEXT PRIMARY KEY,
   labels_json TEXT NOT NULL,
@@ -422,8 +422,8 @@ CREATE TABLE IF NOT EXISTS emitted_actions (
   other_type_id TEXT NOT NULL,       -- object type of the OTHER record (prefix of the label option values)
   labels_before_json TEXT,           -- full label set before; NULL = unknown
   labels_after_json TEXT,            -- full label set after; NULL = unknown
-  removed_json TEXT NOT NULL,        -- label names this change removed
-  added_json TEXT NOT NULL,          -- label names this change added
+  removed_json TEXT NOT NULL,        -- label keys (type ids) this change removed
+  added_json TEXT NOT NULL,          -- label keys (type ids) this change added
   occurred_at_ms INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
   PRIMARY KEY (action_key, record_key)
@@ -486,6 +486,19 @@ export const STORE_MIGRATIONS: Migration[] = [
     version: 7,
     name: 'change_log.superseded_by (late-split corrections)',
     up: (db) => addColumnIfMissing(db, 'change_log', 'superseded_by', 'TEXT'),
+  },
+  {
+    // Naming review 2026-11-07: labels are now carried as association type ids, not names. The two tables that store
+    // label sets in the old (name) form are short-lived memory, so they are cleared instead of converted: known label
+    // sets are re-learned from the next ADDED event, and late-half memory has a minutes-long TTL. The labels_synced
+    // markers are cleared so every pair's dropdowns are synced once more (new option values + other_object_type).
+    version: 8,
+    name: 'label keys: clear name-based association_labels, emitted_actions, labels_synced markers',
+    up: (db) => {
+      db.exec('DELETE FROM association_labels');
+      db.exec('DELETE FROM emitted_actions');
+      db.exec("DELETE FROM worker_state WHERE key LIKE 'labels_synced:%'");
+    },
   },
 ];
 

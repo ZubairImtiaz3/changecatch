@@ -68,7 +68,7 @@ Deal ↔ Contact, Deal ↔ Company, Company ↔ Contact. These are the standard 
 1. Exchange the code. Save the encrypted refresh token, scopes, `installed_at` (clears `uninstalled_at`).
 2. Prime the access-token cache with the token from the exchange.
 3. Provision: pairs = stored pairs, or the defaults → create the ChangeCatch properties on every object type in them (both sides) → reconcile subscriptions → set `provisioned_at`.
-   - Setup creates **7** properties (decision D5 in [architecture.md](architecture.md)), in the `changecatch` property group: `changecatch_last_change_id`, `changecatch_change_type`, `changecatch_other_object_type`, `changecatch_other_record_id`, `changecatch_label_before`, `changecatch_label_after`, `changecatch_labels_current`.
+   - Setup creates **7** properties (decision D5 in [architecture.md](architecture.md)), in the `changecatch` property group: `changecatch_last_change_id`, `changecatch_change_type`, `changecatch_other_object_type`, `changecatch_other_record_id`, `changecatch_labels_before`, `changecatch_labels_after`, `changecatch_labels_current`.
 4. If step 3 fails, the token is still saved and `last_provision_error` is set. The settings page shows it; **Save** retries.
 
 **Settings save**
@@ -81,10 +81,10 @@ Deal ↔ Contact, Deal ↔ Company, Company ↔ Contact. These are the standard 
 1. `DELETE /webhooks-journal/subscriptions/2026-09/portals/{portalId}`.
 2. Mark uninstalled, wipe the refresh token and watched pairs, forget the cached access token.
 3. Delete **every worker row** of the portal: `portal_settings`, `label_cache`, `label_cache_fetches`, `label_holds`, `association_labels`, `metrics`, `stamp_queue`, `stamp_last`, `parked_entries`, pending pairs, the portal's markers in `worker_state`, and **`change_log` too** (deleted at once, not kept until the 30-day prune). The worker-owned tables are purged as well: `stamp_dead_letter`, `lifecycle_retry`, `portal_pause`.
-4. What stays: the `portals` row (portal id, granted scopes, install/uninstall times, stamp spacing; no token), so a late or repeated uninstall event can be recognised, and `seen_events` (journal identity keys only, no names), which expire after 4 days.
+4. What stays: a tombstone `portals` row with only the portal id and uninstall time (token, scopes, install time, errors and spacing are wiped; `PortalStore.markUninstalled`), so a late or repeated uninstall event can be recognised. `pruneUninstalled` deletes it after 30 days. Also and `seen_events` (journal identity keys only, no names), which expire after 4 days.
 5. Ignored if the uninstall happened **before** the latest install (quick uninstall + reinstall). A repeat is a no-op (the purge runs again, harmlessly).
 6. Later runs don't re-create rows: the portal has no watched pairs, so its events are dropped and get no metrics row.
-7. The ChangeCatch properties stay in the customer's portal (we have no token any more).
+7. The ChangeCatch properties and their values stay in the customer's portal. HubSpot never removes app-created properties on uninstall, and we have no token any more. This is the documented norm (HubSpot's setup-guide template: "Existing data will remain on your HubSpot records"); the user guide tells admins how to archive them. Deleting customer data automatically is deliberately not done.
 8. If a step fails, the local data is purged at once (privacy). Only the HubSpot side (subscription delete, token wipe) waits for a retry (`lifecycle_retry`, see "Worker wiring"). The shared journal offset is never held.
 
 **Retention while installed:** `association_labels` (known label sets per record pair) is pruned after 90 days without change; `change_log` after 30 days; `seen_events` after 4 days; `stamp_last` after 1 day.
@@ -125,7 +125,7 @@ Goal: Enterprise portals get custom objects without a manual "enable" step. Two 
 | Customer tokens | `portals` table (encrypted), via `PortalTokenProvider` | `workerTokenProvider` (`service/src/worker/tokens.ts`). There is no `.env` token fallback. Uninstalled or never installed → `NoPortalTokenError` (permanent; nothing is held). A rejected refresh token (`invalid_grant` / `BAD_REFRESH_TOKEN`) → the portal is **paused**: its queue is kept and probed hourly; a reinstall lifts the pause; after `PORTAL_PAUSE_MAX_MS` (7 days) the uninstall routine purges it. |
 | Watched pairs | `portal_settings` (written by the installer and settings page, read by `Store.getWatchedPairs`) | Same table and schema in both stores. The worker's check is direction-insensitive. |
 | Stamp spacing | `portals.stamp_spacing_seconds` (settings POST) | Used by the stamp queue. `STAMP_SPACING_MS` (default 3 s) only for portals without a `portals` row. |
-| Label options | `syncLabelOptions` | `onUnknownLabel(portal, from, to)` → sync the 3 label properties on `from` (and `to` when `STAMP_MIRROR=1`) **before** stamping. Failure → label hold. Option values and stamped values come from the same functions (`${otherObjectTypeId}:${label}`, `(none)`, `(unknown)`, `;`-joined); `service/src/worker/hooks.test.ts` checks every stamped value is an option. |
+| Label options | `syncLabelOptions` | `onUnknownLabel(portal, from, to)` → sync the 3 label properties on `from` (and `to` when `STAMP_MIRROR=1`) **before** stamping. Failure → label hold. Option values and stamped values come from the same functions (`${otherObjectTypeId}:${associationTypeId}`, `none`, `unknown`, `;`-joined; see [decisions.md](decisions.md) D7); `service/src/worker/hooks.test.ts` checks every stamped value is an option. |
 | Lifecycle | journal `app_lifecycle_event` → `handleLifecycleEvent` | Runs inside the journal run. A failure is recorded on the portal, saved to `lifecycle_retry`, and retried with back-off (`LIFECYCLE_RETRY_BASE_MS` → `LIFECYCLE_RETRY_MAX_MS`) outside the journal path. The offset moves on. An `[ALERT]` is logged after 10 failed attempts. |
 
 Both processes open the same SQLite file. Each connection sets `busy_timeout` **before** switching to WAL.

@@ -47,7 +47,7 @@ import { createHash } from 'node:crypto';
 import type { EmittedAction, Store } from '../store/db.js';
 import type { LabelCache } from './labels.js';
 import { DEFAULT_PAIRING_CONFIG, pairKey } from './pairing.js';
-import { DEFAULT_RESOLVE_CONFIG, labelNamesOf, uniqSorted, type ResolveConfig } from './resolve.js';
+import { DEFAULT_RESOLVE_CONFIG, labelKeysOf, mirrorKeysOf, uniqSorted, type ResolveConfig } from './resolve.js';
 import {
   changeIdFor,
   recordKey,
@@ -200,7 +200,7 @@ export async function absorbLateHalves(paired: PairedChange[], deps: AbsorbDeps)
       res.normal.push(p);
       continue;
     }
-    const { removed: lateRem, added: lateAdd } = await labelNamesOf(p, labels, deps.resolve ?? DEFAULT_RESOLVE_CONFIG);
+    const { removed: lateRem, added: lateAdd, names: lateNames } = await labelKeysOf(p, labels, deps.resolve ?? DEFAULT_RESOLVE_CONFIG);
     const E = rows[0];
     const plan = planLateHalf(E, p.structuralNet, lateRem, lateAdd);
     const what = `portal ${p.portalId} ${p.fromObjectTypeId}/${p.fromObjectId} -> ${p.toObjectTypeId}/${p.toObjectId} @ ${p.occurredAt}`;
@@ -227,11 +227,16 @@ export async function absorbLateHalves(paired: PairedChange[], deps: AbsorbDeps)
       labelsCurrent: plan.current,
       removedLabels: plan.removed,
       addedLabels: plan.added,
+      labelNames: lateNames,
       associationCategory: p.associationCategory,
       occurredAt: new Date(E.occurredAtMs).toISOString(),
       sourceOffsets: p.sourceOffsets,
       sourceKeys: p.sourceKeys,
     };
+    if ((deps.resolve ?? DEFAULT_RESOLVE_CONFIG).mirror) {
+      const keys = uniqSorted([...(plan.before ?? []), ...(plan.after ?? []), ...(plan.current ?? [])]);
+      v.mirrorLabelKeys = await mirrorKeysOf(p, keys, lateNames, labels);
+    }
     if (plan.type === 'REMOVED') res.stateUpdates.set(pk, null);
     else if (plan.current) res.stateUpdates.set(pk, plan.current);
 

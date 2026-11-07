@@ -160,6 +160,7 @@ export class Hs {
    * deal -> (contact -> label names on that link; null labels dropped). Follows per-deal paging.
    * Deals with no associations come back as errors in a 207, so a missing deal = empty map.
    */
+  /** deal -> contact -> label keys (deal -> contact type ids of the labeled association types). */
   async linksOf(dealIds: string[]): Promise<Map<string, Map<string, string[]>>> {
     const out = new Map<string, Map<string, string[]>>(dealIds.map((d) => [d, new Map()]));
     type Res = {
@@ -179,8 +180,9 @@ export class Hs {
           const m = out.get(String(res.from.id)) ?? new Map<string, string[]>();
           out.set(String(res.from.id), m);
           for (const t of res.to) {
-            const names = t.associationTypes.map((a) => a.label).filter((l): l is string => !!l && l.trim() !== '');
-            m.set(String(t.toObjectId), [...new Set([...(m.get(String(t.toObjectId)) ?? []), ...names])]);
+            // Label KEYS (type id strings) of the labeled types, the same form the stamp pipeline uses (label-options.ts).
+            const keys = t.associationTypes.filter((a) => !!a.label && a.label.trim() !== '').map((a) => String(a.typeId));
+            m.set(String(t.toObjectId), [...new Set([...(m.get(String(t.toObjectId)) ?? []), ...keys])]);
           }
           const a = res.paging?.next?.after;
           if (a) next.push({ id: String(res.from.id), after: a });

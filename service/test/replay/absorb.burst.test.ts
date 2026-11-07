@@ -124,8 +124,8 @@ const rowsFor = (s: Sim, deal: number, contact: number) =>
 const shape = (rs: Row[]) => rs.map((r) => `${r.change_type} ${r.label_before} -> ${r.label_after} [${r.labels_current}]`);
 const triggers = (s: Sim, deal: number) => s.sent.filter((u) => u.amendOf === undefined && u.objectId === String(deal));
 
-const INF = '0-1:Influencer';
-const DM = '0-1:Decision maker';
+const INF = '0-1:249'; // Influencer (option value = type id)
+const DM = '0-1:247'; // Decision maker
 
 // ---------------------------------------------------------------- bug 1: split label swap, different occurredAt
 
@@ -146,12 +146,12 @@ for (const [name, contact, first, second] of [
       e(deal, contact, REM, 247, 50_000, 51_500),
     ]);
     assert.deepEqual(shape(rowsFor(s, deal, contact)), [
-      `ADDED (none) -> ${INF} [${INF}]`,
+      `ADDED none -> ${INF} [${INF}]`,
       `LABEL_CHANGED ${INF} -> ${DM} [${DM}]`,
-      `REMOVED ${DM} -> (none) [(none)]`,
+      `REMOVED ${DM} -> none [none]`,
     ]);
     assert.equal(triggers(s, deal).length, 3, 'one workflow trigger per user action');
-    assert.equal(s.props.get(`${PORTAL}|${DEAL}|${deal}`)!.changecatch_labels_current, '(none)');
+    assert.equal(s.props.get(`${PORTAL}|${DEAL}|${deal}`)!.changecatch_labels_current, 'none');
     s.store.close();
   });
 }
@@ -165,7 +165,7 @@ test('a relabel is never merged with a link/unlink that has a different occurred
     e(deal, contact, ADD, 249, 0, 1_500),
     e(deal, contact, ADD, 247, 1_000, 12_000),
   ]);
-  assert.deepEqual(shape(rowsFor(s, deal, contact)), [`ADDED (none) -> ${INF} [${INF}]`, `LABEL_CHANGED ${INF} -> ${DM};${INF} [${DM};${INF}]`]);
+  assert.deepEqual(shape(rowsFor(s, deal, contact)), [`ADDED none -> ${INF} [${INF}]`, `LABEL_CHANGED ${INF} -> ${DM};${INF} [${DM};${INF}]`]);
   s.store.close();
 });
 
@@ -184,7 +184,7 @@ test('04:30 spread deal 6610028205: REMOVED 249, REMOVED 3 later (both @ 37.631)
   // The stamped LABEL_CHANGED stays as it was (a workflow may have run on it), marked superseded by the new REMOVED.
   assert.deepEqual(
     shape(rows).sort(),
-    [`ADDED (none) -> ${INF} [${INF}]`, `LABEL_CHANGED ${INF} -> (none) [(none)]`, `REMOVED ${INF} -> (none) [(none)]`].sort(),
+    [`ADDED none -> ${INF} [${INF}]`, `LABEL_CHANGED ${INF} -> none [none]`, `REMOVED ${INF} -> none [none]`].sort(),
   );
   const lc = rows.find((r) => r.change_type === 'LABEL_CHANGED')!;
   const removed = rows.find((r) => r.change_type === 'REMOVED')!;
@@ -200,7 +200,7 @@ test('04:30 spread deal 6610028205: REMOVED 249, REMOVED 3 later (both @ 37.631)
   assert.equal(s.sent.filter((u) => u.amendOf !== undefined).length, 0);
   const p = s.props.get(`${PORTAL}|${DEAL}|${deal}`)!;
   assert.equal(p.changecatch_change_type, 'REMOVED');
-  assert.equal(p.changecatch_labels_current, '(none)');
+  assert.equal(p.changecatch_labels_current, 'none');
   assert.equal(p.changecatch_last_change_id, removed.change_id);
   s.store.close();
 });
@@ -220,7 +220,7 @@ test('label-first unlink split whose label half is still QUEUED -> converted in 
     ],
     { coalesce: false },
   );
-  assert.deepEqual(shape(rowsFor(s, deal, contact)), [`ADDED (none) -> ${INF} [${INF}]`, `REMOVED ${INF} -> (none) [(none)]`]);
+  assert.deepEqual(shape(rowsFor(s, deal, contact)), [`ADDED none -> ${INF} [${INF}]`, `REMOVED ${INF} -> none [none]`]);
   assert.equal(Number((s.store.db.prepare('SELECT COUNT(*) AS n FROM change_log WHERE superseded_by IS NOT NULL').get() as { n: number }).n), 0);
   s.store.close();
 });
@@ -263,14 +263,14 @@ test('04:30 burst deal 5000000001: 300 links, 50 split relabels, 31 label-first 
   for (const c of contacts) {
     const r = shape(rowsFor(s, deal, c));
     const expected = rel.includes(c)
-      ? [`ADDED (none) -> ${INF} [${INF}]`, `LABEL_CHANGED ${INF} -> ${DM} [${DM}]`, `REMOVED ${DM} -> (none) [(none)]`]
-      : [`ADDED (none) -> ${INF} [${INF}]`, `REMOVED ${INF} -> (none) [(none)]`];
+      ? [`ADDED none -> ${INF} [${INF}]`, `LABEL_CHANGED ${INF} -> ${DM} [${DM}]`, `REMOVED ${DM} -> none [none]`]
+      : [`ADDED none -> ${INF} [${INF}]`, `REMOVED ${INF} -> none [none]`];
     assert.deepEqual(r, expected, `contact ${c}`);
   }
   // Final stamp = the last change, with the right labels.
   const p = s.props.get(`${PORTAL}|${DEAL}|${deal}`)!;
   assert.equal(p.changecatch_change_type, 'REMOVED');
-  assert.equal(p.changecatch_labels_current, '(none)');
+  assert.equal(p.changecatch_labels_current, 'none');
   const lastRow = s.store.db
     .prepare("SELECT change_id FROM change_log WHERE object_id = ? AND change_type = 'REMOVED' ORDER BY occurred_at DESC, change_id DESC LIMIT 1")
     .get(String(deal)) as { change_id: string };
@@ -307,7 +307,7 @@ test('stamp queue: drain order = slot-planner order, so a record with many queue
   const base = { portalId: PORTAL, objectTypeId: DEAL, objectId: '5000000001' };
   const normal = (id: string, at: number): StampUpdate => ({ ...base, occurredAtMs: at, properties: { changecatch_last_change_id: id } });
   const amend = (of: string, at: number): StampUpdate => ({
-    ...base, occurredAtMs: at, amendOf: of, stampId: `${of}~amend-x`, properties: { changecatch_labels_current: '0-1:Influencer' },
+    ...base, occurredAtMs: at, amendOf: of, stampId: `${of}~amend-x`, properties: { changecatch_labels_current: INF },
   });
   const occ = T0 - 13_000;
   // The real shape: the record's one queued change "...-fc1f73d382" was created first; then amend stamps with the SAME

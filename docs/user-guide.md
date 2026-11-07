@@ -92,11 +92,11 @@ All 7 properties are in the **"ChangeCatch"** property group. ChangeCatch fills 
 | Property (label in HubSpot) | Internal name | Type | Example values | What it means |
 |---|---|---|---|---|
 | **ChangeCatch: last change ID** | `changecatch_last_change_id` | Single-line text | `1793323347484-a3c78c57bc` | Gets a **new value on every change**. This is your **workflow trigger**. The value itself means nothing to you. |
-| **ChangeCatch: change type** | `changecatch_change_type` | Dropdown | `ADDED`, `REMOVED`, `LABEL_CHANGED` | What kind of change it was. |
-| **ChangeCatch: other object type** | `changecatch_other_object_type` | Single-line text | `Contact`, `Company`, `Deal`, `Ticket`, or a custom object's ID like `2-12345678` | The type of record on the other side of the link. |
+| **ChangeCatch: change type** | `changecatch_change_type` | Dropdown | `Added`, `Removed`, `Label changed` | What kind of change it was. |
+| **ChangeCatch: other object type** | `changecatch_other_object_type` | Dropdown | `Contact`, `Company`, `Deal`, `Ticket`, or your custom object's name | The type of record on the other side of the link. |
 | **ChangeCatch: other record ID** | `changecatch_other_record_id` | Single-line text | `51234567890` | The record ID on the other side of the link. |
-| **ChangeCatch: labels before** | `changecatch_label_before` | Multiple checkboxes | `Influencer (Contact)`, `(none)` | The labels **before** the change. |
-| **ChangeCatch: labels after** | `changecatch_label_after` | Multiple checkboxes | `Decision maker (Contact)`, `(none)` | The labels **after** the change. |
+| **ChangeCatch: labels before** | `changecatch_labels_before` | Multiple checkboxes | `Influencer (Contact)`, `(none)` | The labels **before** the change. |
+| **ChangeCatch: labels after** | `changecatch_labels_after` | Multiple checkboxes | `Decision maker (Contact)`, `(none)` | The labels **after** the change. |
 | **ChangeCatch: current labels** | `changecatch_labels_current` | Multiple checkboxes | `Decision maker (Contact)`, `Billing contact (Contact)` | All labels on that link right now. `(none)` after a removal. |
 
 ### How the label options look
@@ -113,15 +113,15 @@ Two special options:
 - **`(none)`**: there were no labels (for example, "labels before" on a brand-new link).
 - **`(unknown)`**: ChangeCatch couldn't tell. This mostly happens for links that existed **before** you installed ChangeCatch.
 
-ChangeCatch adds options automatically when you create a new association label. You never need to type label names.
+ChangeCatch adds options automatically when you create a new association label. You never need to type label names. If you **rename** a label in HubSpot, ChangeCatch updates the option's name and your workflow filters keep working.
 
 ### What each change type fills in
 
 | Change type | Labels before | Labels after | Current labels |
 |---|---|---|---|
-| `ADDED` (new link) | `(none)` | The new link's labels | Same as labels after |
-| `REMOVED` (link deleted) | The labels it had | `(none)` | `(none)` |
-| `LABEL_CHANGED` (link stays, labels change) | Old labels | New labels | All labels now |
+| `Added` (new link) | `(none)` | The new link's labels | Same as labels after |
+| `Removed` (link deleted) | The labels it had | `(none)` | `(none)` |
+| `Label changed` (link stays, labels change) | Old labels | New labels | All labels now |
 
 > For a link that existed **before** ChangeCatch was installed, a label change shows only the **removed** label in "labels before" and only the **added** label in "labels after". "Current labels" may say `(unknown)`. The recipes below are written so they work in both cases.
 
@@ -135,7 +135,7 @@ ChangeCatch adds options automatically when you create a new association label. 
 2. Choose the object that gets the ChangeCatch update (see "Which record gets updated?"). Example: **Deal-based**.
 3. Click **Set up triggers** > **When an event occurs** > **Property value changed**.
 4. Pick the property **ChangeCatch: last change ID**. Set the condition to **is known**.
-5. Add your ChangeCatch conditions as **filters on this trigger** (the enrollment criteria). For example: "ChangeCatch: change type **is any of** LABEL_CHANGED".
+5. Add your ChangeCatch conditions as **filters on this trigger** (the enrollment criteria). For example: "ChangeCatch: change type **is any of** Label changed".
 6. Turn **re-enrollment ON** for this trigger. Without it, each record runs through the workflow only once.
 7. Add your actions, then **Review and publish**.
 
@@ -156,7 +156,7 @@ Object: **Deal**. Pair watched: **Deal ↔ Contact**.
 1. Create a **Deal-based** workflow.
 2. Trigger: **Property value changed** > **ChangeCatch: last change ID** **is known**. Re-enrollment **ON**.
 3. Add these filters to the trigger (all must be true):
-   1. **ChangeCatch: change type** is any of `ADDED`, `LABEL_CHANGED`
+   1. **ChangeCatch: change type** is any of `Added`, `Label changed`
    2. **ChangeCatch: labels after** contains any of `Decision maker (Contact)`
    3. **ChangeCatch: labels before** doesn't contain any of `Decision maker (Contact)`
 4. Action: **Send internal notification** (or **Send in-app notification**) to **Deal owner**.
@@ -174,7 +174,7 @@ Object: **Deal**. Pair watched: **Deal ↔ Company**.
 1. Create a **Deal-based** workflow.
 2. Trigger: **ChangeCatch: last change ID** is known. Re-enrollment **ON**.
 3. Filters on the trigger:
-   1. **ChangeCatch: change type** is any of `REMOVED`
+   1. **ChangeCatch: change type** is any of `Removed`
    2. **ChangeCatch: other object type** is equal to any of `Company`
 4. Action: **Create task**.
    - Title: "Company removed from {Deal name}: check if this is correct"
@@ -190,7 +190,7 @@ Object: your **custom object** (for example "Subscription"). Pair watched: for e
 
 1. Create a workflow based on your **custom object**.
 2. Trigger: **ChangeCatch: last change ID** is known. Re-enrollment **ON**.
-3. Filter on the trigger: **ChangeCatch: change type** is any of `ADDED`.
+3. Filter on the trigger: **ChangeCatch: change type** is any of `Added`.
 4. Action: **Edit record**. Set your own property (for example "Last linked on") to **the date the action runs**.
 5. Optional: add a second action **Edit record** > "Status" = "Needs review".
 6. Publish.
@@ -206,7 +206,7 @@ Object: **Deal**. Pair watched: **Deal ↔ Contact**. Goal: someone removes "Bil
 1. Create a **Deal-based** workflow.
 2. Trigger: **ChangeCatch: last change ID** is known. Re-enrollment **ON**.
 3. Filters on the trigger:
-   1. **ChangeCatch: change type** is any of `LABEL_CHANGED`, `REMOVED`
+   1. **ChangeCatch: change type** is any of `Label changed`, `Removed`
    2. **ChangeCatch: labels before** contains any of `Billing contact (Contact)`
    3. **ChangeCatch: labels after** doesn't contain any of `Billing contact (Contact)`
 4. Action: **Send internal notification** to the **Deal owner** (or a finance team member): "Billing contact removed on {Deal name}. Contact record ID: {ChangeCatch: other record ID}. Please assign a new one."
@@ -228,8 +228,8 @@ ChangeCatch tells you **that** something changed. For a **total**, you have two 
 **Option 2: Keep your own counter with two workflows.**
 
 1. Create a number property, for example "Linked contacts (ChangeCatch)".
-2. Workflow 1 (Deal-based): trigger **ChangeCatch: last change ID** is known, re-enrollment **ON**, filters **change type** is any of `ADDED` and **other object type** is equal to any of `Contact`. Action: **Edit record** > increase "Linked contacts (ChangeCatch)" by 1.
-3. Workflow 2: same, but **change type** is any of `REMOVED`. Action: decrease the counter by 1.
+2. Workflow 1 (Deal-based): trigger **ChangeCatch: last change ID** is known, re-enrollment **ON**, filters **change type** is any of `Added` and **other object type** is equal to any of `Contact`. Action: **Edit record** > increase "Linked contacts (ChangeCatch)" by 1.
+3. Workflow 2: same, but **change type** is any of `Removed`. Action: decrease the counter by 1.
 4. This counter only counts changes made **after** install. Set the starting value once by hand, or use Option 1.
 
 ---
@@ -287,11 +287,16 @@ Yes. ChangeCatch picks up association changes no matter how they were made. Chan
 
 No. ChangeCatch only **reads** association changes and label names, and only **writes** its own 7 ChangeCatch properties. It never adds, removes or relabels associations.
 
-### What happens if I uninstall ChangeCatch?
+### How do I disconnect or uninstall ChangeCatch?
+
+To stop watching some objects, remove their pairs on the ChangeCatch settings page and click **Save**. To remove ChangeCatch completely, uninstall it: in HubSpot, go to **Settings** > **Integrations** > **Connected Apps**, find ChangeCatch, click **Actions** > **Uninstall**, and confirm. HubSpot's steps: [Uninstall an app](https://knowledge.hubspot.com/integrations/connect-apps-to-hubspot).
+
+### What happens to my data when I uninstall?
 
 - ChangeCatch **stops** updating records right away, so workflows that use it stop enrolling.
-- The **ChangeCatch properties and their last values stay** in your account. HubSpot doesn't delete them. You can archive them yourself in **Settings** > **Properties** (filter by the "ChangeCatch" group). Turn off any workflows that use them first.
-- If you reinstall later, ChangeCatch reuses the existing properties.
+- **In your HubSpot account:** the ChangeCatch properties and their last values stay on your records. HubSpot doesn't delete properties when an app is uninstalled. To remove them, first turn off or edit any workflows, lists and reports that use them, then archive them in **Settings** > **Properties** (filter by the "ChangeCatch" group). HubSpot keeps archived properties for 90 days before deleting them for good.
+- **On ChangeCatch's side:** we delete your stored data (access token, settings, and the change history we keep for processing) as soon as we receive HubSpot's uninstall event. We keep only your account ID and the uninstall date for 30 days, so a delayed event from HubSpot isn't mistaken for a new install.
+- If you reinstall later, ChangeCatch reuses the ChangeCatch properties that still exist.
 
 ### I need help
 

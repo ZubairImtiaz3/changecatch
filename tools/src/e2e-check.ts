@@ -229,16 +229,16 @@ async function preChecks(db: DatabaseSync | null): Promise<boolean> {
 
 interface Expect {
   changeType: 'ADDED' | 'LABEL_CHANGED' | 'REMOVED';
-  beforeHas?: string; // option value that must be in changecatch_label_before
-  afterHas?: string; // option value that must be in changecatch_label_after
+  beforeHas?: string; // option value that must be in changecatch_labels_before
+  afterHas?: string; // option value that must be in changecatch_labels_after
 }
 
 function matches(p: Props, contactId: string, e: Expect, baselineChangeId: string | null): string | null {
   if (!p[STAMP_PROPS.changeId] || p[STAMP_PROPS.changeId] === baselineChangeId) return 'no new change id yet';
   if (p[STAMP_PROPS.otherRecordId] !== contactId) return `other_record_id ${p[STAMP_PROPS.otherRecordId]} != ${contactId}`;
   if (p[STAMP_PROPS.changeType] !== e.changeType) return `change_type ${p[STAMP_PROPS.changeType]} != ${e.changeType}`;
-  if (e.beforeHas && !splitValues(p[STAMP_PROPS.labelBefore]).includes(e.beforeHas)) return `label_before "${p[STAMP_PROPS.labelBefore]}" lacks ${e.beforeHas}`;
-  if (e.afterHas && !splitValues(p[STAMP_PROPS.labelAfter]).includes(e.afterHas)) return `label_after "${p[STAMP_PROPS.labelAfter]}" lacks ${e.afterHas}`;
+  if (e.beforeHas && !splitValues(p[STAMP_PROPS.labelBefore]).includes(e.beforeHas)) return `labels_before "${p[STAMP_PROPS.labelBefore]}" lacks ${e.beforeHas}`;
+  if (e.afterHas && !splitValues(p[STAMP_PROPS.labelAfter]).includes(e.afterHas)) return `labels_after "${p[STAMP_PROPS.labelAfter]}" lacks ${e.afterHas}`;
   return null;
 }
 
@@ -316,8 +316,8 @@ ChangeCatch end-to-end check, portal ${PORTAL_ID}, Deal ${DEAL_ID}. The worker m
 Pre-checks (read-only): journal subscription Deal<->Contact, watched pair in ${DB_PATH}, worker /health on :${HEALTH_PORT},
   deal readable with the portal OAuth token.
 Then, with the service key, on a contact NOT linked to the deal (C):
-  1  link Deal-C WITH label "${LABEL_A}"   -> expect ADDED, label_after has 0-1:${LABEL_A}
-  2  PUT "${LABEL_B}", archive "${LABEL_A}" -> expect LABEL_CHANGED, before 0-1:${LABEL_A}, after 0-1:${LABEL_B}
+  1  link Deal-C WITH label "${LABEL_A}"   -> expect ADDED, labels_after has "${LABEL_A}"
+  2  PUT "${LABEL_B}", archive "${LABEL_A}" -> expect LABEL_CHANGED, before "${LABEL_A}", after "${LABEL_B}"
   3  remove the whole association                   -> expect REMOVED
 After each step: poll the deal every ${POLL_MS / 1000}s for up to ${timeoutSec}s, then check the change_log row. ${gapSec}s gap between steps.
 Cleanup: the association is removed at the end even on failure. No records created or deleted.`;
@@ -368,8 +368,9 @@ async function main() {
   out.labels = { first: inf, second: dm };
   console.log(`\nContact C=${C}; ${LABEL_A}=${inf.typeId}, ${LABEL_B}=${dm.typeId}`);
 
-  const INF = labelOptionValue(CONTACT, LABEL_A);
-  const DM = labelOptionValue(CONTACT, LABEL_B);
+  // Option values are keyed by the deal -> contact type id (label-options.ts).
+  const INF = labelOptionValue(CONTACT, inf.typeId);
+  const DM = labelOptionValue(CONTACT, dm.typeId);
   try {
     const s1 = await runStep(db, `1 ADDED (${LABEL_A})`, C, () => putLabels(DEAL_ID, C, [inf]), { changeType: 'ADDED', afterHas: INF });
     if (s1) {

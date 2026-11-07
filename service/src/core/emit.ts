@@ -11,7 +11,13 @@ export interface EmitConfig {
 export const DEFAULT_EMIT_CONFIG: EmitConfig = { emitOnToRecord: false };
 
 // Empty lists are left out of the event instead of sent as "" (how HubSpot treats "" is unconfirmed).
-const joinLabels = (l?: string[]) => (l === undefined || l.length === 0 ? undefined : l.join(', '));
+// Label arrays hold keys (type ids); app events carry the names (NormalizedChange.labelNames). The structural
+// "unlabeled" key is not a label and is dropped.
+const joinLabels = (l: string[] | undefined, names: Record<string, string> = {}) => {
+  // Sorted by name (keys sort by type id), so "Decision maker, Influencer" reads the same as before.
+  const out = (l ?? []).filter((k) => k !== 'unlabeled').map((k) => names[k] ?? k).sort();
+  return l === undefined || out.length === 0 ? undefined : out.join(', ');
+};
 
 function occurrenceId(change: NormalizedChange, targetType: string, targetId: string): string {
   const h = createHash('sha256');
@@ -28,9 +34,9 @@ function build(change: NormalizedChange, target: [string, string], other: [strin
     association_category: change.associationCategory,
     occurred_at: change.occurredAt,
   };
-  const before = joinLabels(change.labelBefore);
-  const after = joinLabels(change.labelAfter);
-  const current = joinLabels(change.labelsCurrent);
+  const before = joinLabels(change.labelBefore, change.labelNames);
+  const after = joinLabels(change.labelAfter, change.labelNames);
+  const current = joinLabels(change.labelsCurrent, change.labelNames);
   if (before !== undefined) properties.label_before = before;
   if (after !== undefined) properties.label_after = after;
   if (current !== undefined) properties.labels_current = current;

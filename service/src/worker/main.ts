@@ -33,6 +33,7 @@
 
 import type { Server } from 'node:http';
 import { resolve } from 'node:path';
+import { DEFAULT_RESOLVE_CONFIG } from '../core/resolve.js';
 import { pathToFileURL } from 'node:url';
 import { dbPath } from '../lib/env.js';
 import { StoreLabelCache, type LabelCache } from '../core/labels.js';
@@ -453,6 +454,8 @@ export function createWorkerFromEnv(opts: WorkerFromEnvOptions = {}): {
     // Spacing is done by the StampQueue (per portal); STAMP_MIRROR=1 also stamps the other record.
     runConfig: {
       stamp: { ...DEFAULT_STAMP_CONFIG, mirrorOnOtherRecord: mirror },
+      // Mirror stamps need each label translated to the other direction's type id (resolve.ts mirrorKeysOf).
+      resolve: { ...DEFAULT_RESOLVE_CONFIG, mirror },
       pairing: pairingConfigFromEnv(env),
       ...(numEnv(env.PARK_MAX_PER_PORTAL) !== undefined ? { maxParkedPerPortal: numEnv(env.PARK_MAX_PER_PORTAL) } : {}),
     },

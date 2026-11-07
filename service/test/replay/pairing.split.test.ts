@@ -167,8 +167,8 @@ for (const order of ['structural first', 'label first'] as const) {
   test(`runOnce: link-with-label then a split unlink (${order}) -> exactly ADDED then ONE REMOVED "(none)"`, async () => {
     const { stamps, store } = await e2e(order);
     assert.deepEqual(stamps, [
-      ['ADDED', '0-1:Billing contact'],
-      ['REMOVED', '(none)'],
+      ['ADDED', '0-1:251'], // Billing contact = type 251
+      ['REMOVED', 'none'],
     ]);
     assert.equal(store.loadPending().length, 0);
   });

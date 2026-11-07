@@ -30,9 +30,11 @@ function change(o: Partial<NormalizedChange> = {}): NormalizedChange {
     fromObjectId: '5',
     toObjectTypeId: CONTACT,
     toObjectId: '7',
-    labelBefore: ['Influencer'],
-    labelAfter: ['Decision maker'],
-    labelsCurrent: ['Decision maker'],
+    // Label keys = association type ids (deal -> contact): 101 Influencer, 102 Decision maker.
+    labelBefore: ['101'],
+    labelAfter: ['102'],
+    labelsCurrent: ['102'],
+    labelNames: { '101': 'Influencer', '102': 'Decision maker' },
     associationCategory: UD,
     occurredAt: new Date(T0).toISOString(),
     sourceOffsets: ['f1'],
@@ -68,40 +70,52 @@ test('changeIdFor: deterministic, time-prefixed, differs per target and per chan
   assert.notEqual(id, changeIdFor(change({ portalId: 222 }), DEAL, '5'));
 });
 
-test('toChangeRecords: LABEL_CHANGED onto the from record, other side named', () => {
+test('toChangeRecords: LABEL_CHANGED onto the from record; other object type = its type id', () => {
   const [r, ...rest] = toChangeRecords(change());
   assert.equal(rest.length, 0, 'no mirror by default');
   assert.equal(r.objectTypeId, DEAL);
   assert.equal(r.objectId, '5');
-  assert.equal(r.otherObjectType, 'Contact');
+  assert.equal(r.otherObjectType, CONTACT, 'changecatch_other_object_type stores the stable type id (option value)');
   assert.equal(r.otherRecordId, '7');
-  // Option values of the multi-checkbox label properties: `${otherObjectTypeId}:${label}`.
-  assert.equal(r.labelBefore, '0-1:Influencer');
-  assert.equal(r.labelAfter, '0-1:Decision maker');
-  assert.equal(r.labelsCurrent, '0-1:Decision maker');
+  // Option values of the multi-checkbox label properties: `${otherObjectTypeId}:${associationTypeId}`.
+  assert.equal(r.labelBefore, '0-1:101');
+  assert.equal(r.labelAfter, '0-1:102');
+  assert.equal(r.labelsCurrent, '0-1:102');
 });
 
 test('toChangeRecords: mirror swaps sides; custom object type id written as-is', () => {
   const recs = toChangeRecords(change({ fromObjectTypeId: SUB, fromObjectId: '9' }), { mirrorOnOtherRecord: true });
   assert.equal(recs.length, 2);
-  assert.equal(recs[0].otherObjectType, 'Contact');
+  assert.equal(recs[0].otherObjectType, CONTACT);
   assert.deepEqual([recs[1].objectTypeId, recs[1].objectId, recs[1].otherObjectType, recs[1].otherRecordId], [CONTACT, '7', SUB, '9']);
   assert.notEqual(recs[0].changeId, recs[1].changeId);
 });
 
-test('toChangeRecords: ADDED has (none) before; REMOVED has (none) after and current', () => {
-  const [a] = toChangeRecords(change({ changeType: 'ADDED', labelBefore: undefined, labelAfter: ['X'], labelsCurrent: ['X'] }));
-  assert.deepEqual([a.labelBefore, a.labelAfter, a.labelsCurrent], [NONE, '0-1:X', '0-1:X']);
-  const [r] = toChangeRecords(change({ changeType: 'REMOVED', labelBefore: ['X', 'Y'], labelAfter: undefined, labelsCurrent: [] }));
-  assert.deepEqual([r.labelBefore, r.labelAfter, r.labelsCurrent], ['0-1:X;0-1:Y', NONE, NONE]);
-  const [u] = toChangeRecords(change({ labelBefore: undefined, labelAfter: ['Y'], labelsCurrent: undefined }));
-  assert.deepEqual([u.labelBefore, u.labelAfter, u.labelsCurrent], [UNKNOWN, '0-1:Y', UNKNOWN], 'unknown state is not faked as (none)');
+test('toChangeRecords: ADDED has none before; REMOVED has none after and current', () => {
+  const [a] = toChangeRecords(change({ changeType: 'ADDED', labelBefore: undefined, labelAfter: ['201'], labelsCurrent: ['201'] }));
+  assert.deepEqual([a.labelBefore, a.labelAfter, a.labelsCurrent], [NONE, '0-1:201', '0-1:201']);
+  const [r] = toChangeRecords(change({ changeType: 'REMOVED', labelBefore: ['201', '202'], labelAfter: undefined, labelsCurrent: [] }));
+  assert.deepEqual([r.labelBefore, r.labelAfter, r.labelsCurrent], ['0-1:201;0-1:202', NONE, NONE]);
+  const [u] = toChangeRecords(change({ labelBefore: undefined, labelAfter: ['202'], labelsCurrent: undefined }));
+  assert.deepEqual([u.labelBefore, u.labelAfter, u.labelsCurrent], [UNKNOWN, '0-1:202', UNKNOWN], 'unknown state is not faked as none');
+  const [s] = toChangeRecords(change({ changeType: 'ADDED', labelBefore: undefined, labelAfter: ['unlabeled'], labelsCurrent: ['unlabeled'] }));
+  assert.deepEqual([s.labelAfter, s.labelsCurrent], [NONE, NONE], 'the structural link is not a label');
 });
 
-test('toChangeRecords: mirror record gets values keyed by the other side', () => {
-  const [, m] = toChangeRecords(change(), { mirrorOnOtherRecord: true });
+test('toChangeRecords: mirror record uses the to -> from type ids (mirrorLabelKeys), keyed by the other side', () => {
+  // contact -> deal ids for the same labels: 111 Influencer, 112 Decision maker.
+  const [, m] = toChangeRecords(change({ mirrorLabelKeys: { '101': '111', '102': '112' } }), { mirrorOnOtherRecord: true });
   assert.equal(m.objectTypeId, CONTACT);
-  assert.equal(m.labelAfter, '0-3:Decision maker');
+  assert.equal(m.otherObjectType, DEAL);
+  assert.deepEqual([m.labelBefore, m.labelAfter, m.labelsCurrent], ['0-3:111', '0-3:112', '0-3:112']);
+});
+
+test('toChangeRecords: a mirror label with no translation (paired label) is "unknown", never the wrong direction id', () => {
+  const [f, m] = toChangeRecords(change({ mirrorLabelKeys: { '101': '111' } }), { mirrorOnOtherRecord: true });
+  assert.deepEqual([f.labelBefore, f.labelAfter], ['0-1:101', '0-1:102'], 'the from record is unaffected');
+  assert.deepEqual([m.labelBefore, m.labelAfter, m.labelsCurrent], ['0-3:111', UNKNOWN, UNKNOWN]);
+  const [, none] = toChangeRecords(change(), { mirrorOnOtherRecord: true });
+  assert.deepEqual([none.labelBefore, none.labelAfter], [UNKNOWN, UNKNOWN], 'no translations at all -> unknown');
 });
 
 test('toStampUpdate: all 7 properties, every value a non-empty string', () => {
@@ -268,7 +282,7 @@ test('store: saveChanges is idempotent, getChange is scoped by portal, prune aft
   store.saveChanges([r], T0);
   store.saveChanges([{ ...r, labelAfter: 'changed' }], T0 + 1);
   const got = store.getChange(111, r.changeId);
-  assert.equal(got?.labelAfter, '0-1:Decision maker', 'first write wins');
+  assert.equal(got?.labelAfter, '0-1:102', 'first write wins');
   assert.equal(got?.createdAt, T0);
   assert.equal(store.getChange(222, r.changeId), undefined, 'other portal cannot read it');
   assert.equal(store.pruneChangeLog(T0 + 29 * 86_400_000), 0);
@@ -328,8 +342,9 @@ test('runOnce (stamp): label swap stamps the deal, change_log saved before stamp
   const last = ups[1];
   assert.equal(last.objectTypeId, DEAL);
   assert.equal(last.properties.changecatch_change_type, 'LABEL_CHANGED');
-  assert.equal(last.properties.changecatch_label_before, '0-1:Influencer');
-  assert.equal(last.properties.changecatch_label_after, '0-1:Decision maker');
+  assert.equal(last.properties.changecatch_labels_before, '0-1:101');
+  assert.equal(last.properties.changecatch_labels_after, '0-1:102');
+  assert.equal(last.properties.changecatch_other_object_type, CONTACT);
   const logged = s.store.getChange(111, last.properties.changecatch_last_change_id!);
   assert.equal(logged?.otherRecordId, '2');
   assert.equal(s.store.getOffset(), 'f3');

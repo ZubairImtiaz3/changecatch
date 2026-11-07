@@ -26,13 +26,17 @@ import type { ChangeType, NormalizedChange } from './types.js';
 
 export { NONE, UNKNOWN } from './label-options.js';
 
+/**
+ * Internal property names. FROZEN once customers install (HubSpot can't rename a property, and workflows reference
+ * them). Naming review 2026-11-07: `changecatch_` prefix + snake_case; label properties all plural ("labels_").
+ */
 export const STAMP_PROPS = {
   changeId: 'changecatch_last_change_id',
   changeType: 'changecatch_change_type',
   otherObjectType: 'changecatch_other_object_type',
   otherRecordId: 'changecatch_other_record_id',
-  labelBefore: 'changecatch_label_before',
-  labelAfter: 'changecatch_label_after',
+  labelBefore: 'changecatch_labels_before',
+  labelAfter: 'changecatch_labels_after',
   labelsCurrent: 'changecatch_labels_current',
 } as const;
 
@@ -62,7 +66,7 @@ export interface StampConfig {
   mirrorOnOtherRecord: boolean;
   /** Minimum gap between two stamps on the same record, so workflow enrollments don't merge. */
   minSpacingMs: number;
-  /** Display names for object type ids in changecatch_other_object_type. Unknown ids are written as-is. */
+  /** Display names for object type ids (logs only; changecatch_other_object_type stores the type id itself). */
   objectTypeNames: Record<string, string>;
 }
 
@@ -87,12 +91,12 @@ export interface ChangeRecord {
   objectTypeId: string;
   objectId: string;
   changeType: ChangeType;
-  /** Display name (e.g. "Contact") or the raw object type id for custom objects. */
+  /** The other record's object type id (e.g. "0-1", "2-123"): the option value of changecatch_other_object_type. */
   otherObjectType: string;
   otherRecordId: string;
   /**
-   * Already formatted as multi-checkbox option values (see label-options.ts): e.g. "0-1:Decision maker;0-1:Influencer",
-   * "(none)" or "(unknown)". The prefix is the OTHER record's object type id.
+   * Already formatted as multi-checkbox option values (see label-options.ts): e.g. "0-1:279;0-1:281", "none" or
+   * "unknown". The prefix is the OTHER record's object type id, the number the label's association type id.
    */
   labelBefore: string;
   labelAfter: string;
@@ -154,11 +158,15 @@ function buildRecord(
   change: NormalizedChange,
   target: [string, string],
   other: [string, string],
-  config: StampConfig,
+  mirrored: boolean,
 ): ChangeRecord {
   // ADDED: nothing before. REMOVED: nothing after and nothing current. Otherwise undefined = unknown.
   // Values are option values of the multi-checkbox label properties, keyed by the other record's object type.
-  const fmt = (labels: string[] | undefined, whenUndefined: string = UNKNOWN) => formatLabelValues(labels, other[0], whenUndefined);
+  // Label keys are type ids in the from -> to direction; the mirror record needs the to -> from ids (mirrorLabelKeys).
+  // A key with no translation becomes "type ?" -> "unknown" (never a wrong label).
+  const keys = (labels: string[] | undefined) =>
+    labels === undefined || !mirrored ? labels : labels.map((k) => (/^\d+$/.test(k) ? (change.mirrorLabelKeys?.[k] ?? 'type ?') : k));
+  const fmt = (labels: string[] | undefined, whenUndefined: string = UNKNOWN) => formatLabelValues(keys(labels), other[0], whenUndefined);
   const before = change.changeType === 'ADDED' ? fmt(change.labelBefore, NONE) : fmt(change.labelBefore);
   const after = change.changeType === 'REMOVED' ? fmt(change.labelAfter, NONE) : fmt(change.labelAfter);
   const current = change.changeType === 'REMOVED' ? NONE : fmt(change.labelsCurrent);
@@ -168,7 +176,7 @@ function buildRecord(
     objectTypeId: target[0],
     objectId: target[1],
     changeType: change.changeType,
-    otherObjectType: config.objectTypeNames[other[0]] ?? other[0],
+    otherObjectType: other[0],
     otherRecordId: other[1],
     labelBefore: before,
     labelAfter: after,
@@ -183,8 +191,8 @@ export function toChangeRecords(change: NormalizedChange, config: Partial<StampC
   const cfg: StampConfig = { ...DEFAULT_STAMP_CONFIG, ...config };
   const from: [string, string] = [change.fromObjectTypeId, String(change.fromObjectId)];
   const to: [string, string] = [change.toObjectTypeId, String(change.toObjectId)];
-  const out = [buildRecord(change, from, to, cfg)];
-  if (cfg.mirrorOnOtherRecord) out.push(buildRecord(change, to, from, cfg));
+  const out = [buildRecord(change, from, to, false)];
+  if (cfg.mirrorOnOtherRecord) out.push(buildRecord(change, to, from, true));
   return out;
 }
 

@@ -82,7 +82,7 @@ Rotate: put the new key **first** in `TOKEN_ENC_KEYS` (keep the old one after it
 | `PAIRING_PUBLISH_SLACK_MS` | W | `4000` | Extra wait for HubSpot's publish delay. A held cluster is released at newest `occurredAt` + window + this. |
 | `PAIRING_MAX_HOLD_MS` | W | `60000` | Safety cap on holding an unpaired cluster. |
 | `PAIRING_SPLIT_HOLD_MS` | W | `4000` | A cluster that may be half of a split action is held until this long after its file's publish time. `0` = off. Late halves are still handled by late-half absorption. |
-| `LABEL_MAX_HOLD_MS` | W | `1800000` | Give up holding or parking an unresolvable label after this; the change is stamped with `(unknown)`. |
+| `LABEL_MAX_HOLD_MS` | W | `1800000` | Give up holding or parking an unresolvable label after this; the change is stamped with `unknown` (shown as "(unknown)"). |
 | `PARK_MAX_PER_PORTAL` | W | `20000` | Max parked entries per account. Past it the newest are dropped with an alert. |
 
 ## 7. Worker: stamping

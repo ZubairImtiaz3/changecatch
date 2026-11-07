@@ -158,10 +158,10 @@ This is a per-record scan, the thing the design avoids for normal running. That'
 
 | | **Silent refresh** (recommended default) | **Synthetic replay** (opt-in) |
 |---|---|---|
-| What it writes | `changecatch_labels_current` (and `changecatch_label_after`) on affected records. **Not** `changecatch_last_change_id`. | Full stamps with a new `changecatch_last_change_id`, `changecatch_change_type` = REMOVED/LABEL_CHANGED. The real change time is unknown (the scan time is used in `change_log`). |
+| What it writes | `changecatch_labels_current` (and `changecatch_labels_after`) on affected records. **Not** `changecatch_last_change_id`. | Full stamps with a new `changecatch_last_change_id`, `changecatch_change_type` = REMOVED/LABEL_CHANGED. The real change time is unknown (the scan time is used in `change_log`). |
 | Workflows | Customer workflows trigger on `changecatch_last_change_id`, so **none fire**. Exception: a customer who built a workflow on "labels current changed" would see it fire. Say this in the setup docs. | They fire, so the business process "catches up" (for example a task gets created for the new Decision maker). |
 | False triggers | None from the main trigger | None for high-confidence classes. **Never** replay the "unknown" class (ADDED vs. pre-existing). |
-| Wrong data | `changecatch_label_before` is not touched, so it can be stale until the next real change | `occurred_at` is not the real time. Two changes in the gap collapse into one (we only see the end state). A link added **and** removed inside the gap is invisible either way. |
+| Wrong data | `changecatch_labels_before` is not touched, so it can be stale until the next real change | `occurred_at` is not the real time. Two changes in the gap collapse into one (we only see the end state). A link added **and** removed inside the gap is invisible either way. |
 | Cost | 1 batch update per 100 records | Same, plus workflow enrollments on the customer's side |
 | Order | Any | Must respect per-record spacing; put it through `stamp_queue` like live stamps |
 

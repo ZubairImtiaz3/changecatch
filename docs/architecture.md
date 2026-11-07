@@ -83,9 +83,9 @@ An amend corrects `change_log` and the queued stamp. If the record already shows
 ### 2.5 Label resolution
 
 - `associationTypeId` → label name, cached per account and object pair (`label_cache`). An unknown type ID triggers a refresh from the associations labels endpoint.
-- The three label properties are multiple-checkbox properties. When a new label appears, its options are synced onto the properties before the stamp is written, so every stamped value is a valid option. Values look like `0-1:Decision maker` (displayed as "Decision maker (Contact)"), plus the special values `(none)` and `(unknown)`.
+- The three label properties are multiple-checkbox properties. When a new label appears, its options are synced onto the properties before the stamp is written, so every stamped value is a valid option. Values look like `0-1:279` (the other object type + the label's association type id; displayed as "Decision maker (Contact)"), plus `none` and `unknown` (displayed as "(none)" / "(unknown)"). A label renamed in HubSpot keeps its value; only the display text is updated (D7).
 - `association_labels` keeps the last known label set per record pair (pruned after 90 days unchanged), which gives "labels before" and "current labels".
-- If an account's label lookup keeps failing, that account's entries are **parked** (`parked_entries`, capped by `PARK_MAX_PER_PORTAL`) and retried each run. The shared offset moves on for every other account. After `LABEL_MAX_HOLD_MS` (30 min) the change is stamped with `(unknown)`.
+- If an account's label lookup keeps failing, that account's entries are **parked** (`parked_entries`, capped by `PARK_MAX_PER_PORTAL`) and retried each run. The shared offset moves on for every other account. After `LABEL_MAX_HOLD_MS` (30 min) the change is stamped with `unknown`.
 
 ### 2.6 change_log
 
@@ -257,11 +257,11 @@ All in the "ChangeCatch" property group on each watched object type:
 | Property | Type | Meaning |
 |---|---|---|
 | `changecatch_last_change_id` | text | New on every change. **The workflow trigger.** |
-| `changecatch_change_type` | dropdown | `ADDED`, `REMOVED`, `LABEL_CHANGED` |
-| `changecatch_other_object_type` | text | Object type on the other side |
+| `changecatch_change_type` | dropdown | `ADDED`, `REMOVED`, `LABEL_CHANGED` (shown as Added, Removed, Label changed) |
+| `changecatch_other_object_type` | dropdown | Object type id on the other side (`0-1`, `2-…`), shown by name |
 | `changecatch_other_record_id` | text | ID of the other record |
-| `changecatch_label_before` | multiple checkboxes | Labels before the change |
-| `changecatch_label_after` | multiple checkboxes | Labels after the change |
+| `changecatch_labels_before` | multiple checkboxes | Labels before the change |
+| `changecatch_labels_after` | multiple checkboxes | Labels after the change |
 | `changecatch_labels_current` | multiple checkboxes | All labels on that association now |
 
 A change timestamp and a burst count were left out: HubSpot's property history already shows when the trigger changed, and the coalesced count lives in logs and metrics. The three label properties are multiple-checkbox properties (values `;`-joined) whose options are synced from the account's label definitions, because free-text equality fails with multiple labels and admins should pick labels, not type them.

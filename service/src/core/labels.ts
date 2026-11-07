@@ -14,6 +14,12 @@ export interface LabelLookup {
 export interface LabelCache {
   /** Returns undefined only if the type id is still unknown after a refresh. */
   get(portalId: number, fromObjectTypeId: string, toObjectTypeId: string, associationTypeId: number): Promise<LabelLookup | undefined>;
+  /**
+   * The type id of the label named `label` in the direction from -> to (refreshing once if not cached). Used only to
+   * translate a label to the other direction for mirror stamps (type ids are per direction). undefined = no unique match
+   * (e.g. a paired label like "Manager"/"Employee", whose two sides have different names).
+   */
+  findByName?(portalId: number, fromObjectTypeId: string, toObjectTypeId: string, label: string): Promise<number | undefined>;
 }
 
 export interface LabelCacheConfig {
@@ -27,6 +33,9 @@ export const DEFAULT_LABEL_CACHE_CONFIG: LabelCacheConfig = {
   ttlMs: 24 * 60 * 60 * 1000,
   minRefetchMs: 60_000,
 };
+
+/** Label names compared for the mirror translation: trimmed, inner whitespace collapsed (case kept). */
+export const normLabelName = (s: string) => s.trim().replace(/\s+/g, ' ');
 
 export class StoreLabelCache implements LabelCache {
   private inflight = new Map<string, Promise<void>>();
@@ -49,6 +58,20 @@ export class StoreLabelCache implements LabelCache {
 
     const fresh = this.store.getLabel(portalId, fromType, toType, typeId);
     return fresh && { label: fresh.label, category: fresh.category };
+  }
+
+  async findByName(portalId: number, fromType: string, toType: string, label: string): Promise<number | undefined> {
+    const want = normLabelName(label);
+    const match = () => {
+      const hits = this.store.listLabels(portalId, fromType, toType).filter((d) => d.label !== null && normLabelName(d.label) === want);
+      return hits.length === 1 ? hits[0].associationTypeId : undefined;
+    };
+    const hit = match();
+    if (hit !== undefined) return hit;
+    const lastFetch = this.store.getLabelsFetchedAt(portalId, fromType, toType);
+    if (lastFetch !== null && this.now() - lastFetch < this.config.minRefetchMs) return undefined;
+    await this.refresh(portalId, fromType, toType);
+    return match();
   }
 
   /** One fetch per pair at a time, even with concurrent callers. */

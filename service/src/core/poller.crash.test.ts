@@ -138,8 +138,8 @@ for (const second of ['none', 'in-send', 'after-send', 'after-commit'] as const)
       assert.deepEqual(
         rows.map((r) => [r.change_type, r.label_before, r.label_after, r.labels_current]),
         [
-          ['ADDED', '(none)', '0-1:Influencer', '0-1:Influencer'],
-          ['LABEL_CHANGED', '0-1:Influencer', '0-1:Decision maker', '0-1:Decision maker'],
+          ['ADDED', 'none', '0-1:101', '0-1:101'],
+          ['LABEL_CHANGED', '0-1:101', '0-1:102', '0-1:102'],
         ],
         'exactly one change for the held pair, with the right labels',
       );
@@ -179,8 +179,8 @@ test(
     assert.deepEqual(
       changeRows(p.store).map((r) => [r.change_type, r.label_before, r.labels_current]),
       [
-        ['ADDED', '(none)', '0-1:Influencer'],
-        ['REMOVED', '0-1:Influencer', '(none)'],
+        ['ADDED', 'none', '0-1:101'],
+        ['REMOVED', '0-1:101', 'none'],
       ],
     );
     p.store.close();

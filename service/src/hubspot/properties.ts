@@ -39,6 +39,7 @@
 
 import {
   buildLabelOptions,
+  buildObjectTypeOptions,
   FIXED_OPTIONS,
   MAX_OPTIONS,
   mergeOptions,
@@ -98,16 +99,34 @@ export const LABEL_PROPERTY_NAMES: string[] = [STAMP_PROPS.labelBefore, STAMP_PR
 const LABEL_HELP = 'Pick labels from the list. "Billing contact (Contact)" = the "Billing contact" label toward a contact.';
 
 /**
- * The 7 ChangeCatch properties. Same set on every object type. Earlier builds created 9;
- * changecatch_last_change_at and changecatch_changes_since_last_stamp are no longer created. Copies that already exist
- * in installed portals are left alone (never deleted).
+ * Naming (review 2026-11-07, docs/decisions.md): internal names `changecatch_` + snake_case and option VALUES are frozen
+ * once customers install; labels ("ChangeCatch: ..." in sentence case) and option labels can change any time.
+ * change_type values stay ADDED / REMOVED / LABEL_CHANGED; only their display labels are human-readable.
+ */
+export const CHANGE_TYPE_OPTIONS: PropertyOption[] = [
+  { label: 'Added', value: 'ADDED', displayOrder: 0, hidden: false },
+  { label: 'Removed', value: 'REMOVED', displayOrder: 1, hidden: false },
+  { label: 'Label changed', value: 'LABEL_CHANGED', displayOrder: 2, hidden: false },
+];
+
+/** Standard objects always offered in changecatch_other_object_type; custom objects are added by the option sync. */
+export const STANDARD_OTHER_TYPES = ['0-1', '0-2', '0-3', '0-5'];
+
+/** Properties whose options the sync keeps up to date (label + type dropdowns). */
+export const SYNCED_ENUM_PROPERTY_NAMES: string[] = [STAMP_PROPS.changeType, STAMP_PROPS.otherObjectType, ...LABEL_PROPERTY_NAMES];
+
+/**
+ * The 7 ChangeCatch properties. Same set on every object type. Earlier builds created other names
+ * (changecatch_last_change_at, changecatch_changes_since_last_stamp, changecatch_label_before/_after). Copies that
+ * already exist in installed portals are left alone (never deleted).
  */
 export const CHANGECATCH_PROPERTIES: PropertyDefinition[] = [
   def(STAMP_PROPS.changeId, 'ChangeCatch: last change ID',
     'Set by ChangeCatch. Gets a new value on every association change. Use "Property value changed" on this property as the workflow trigger.', 'string', 1),
-  def(STAMP_PROPS.changeType, 'ChangeCatch: change type', 'Set by ChangeCatch. ADDED, REMOVED or LABEL_CHANGED.', 'enumeration', 2,
-    ['ADDED', 'REMOVED', 'LABEL_CHANGED']),
-  def(STAMP_PROPS.otherObjectType, 'ChangeCatch: other object type', 'Set by ChangeCatch. The type of the record on the other side of the association.', 'string', 3),
+  def(STAMP_PROPS.changeType, 'ChangeCatch: change type', 'Set by ChangeCatch. Added, Removed or Label changed.', 'enumeration', 2,
+    CHANGE_TYPE_OPTIONS),
+  def(STAMP_PROPS.otherObjectType, 'ChangeCatch: other object type', 'Set by ChangeCatch. The type of the record on the other side of the association.', 'enumeration', 3,
+    buildObjectTypeOptions(STANDARD_OTHER_TYPES, STANDARD_OBJECT_NAMES)),
   def(STAMP_PROPS.otherRecordId, 'ChangeCatch: other record ID', 'Set by ChangeCatch. The ID of the record on the other side of the association.', 'string', 4),
   def(STAMP_PROPS.labelBefore, 'ChangeCatch: labels before',
     `Set by ChangeCatch. Labels before the change. "(none)" if there were none, "(unknown)" if ChangeCatch could not tell. ${LABEL_HELP}`,
@@ -266,9 +285,9 @@ export async function ensureChangeCatchProperties(token: string, objectType: str
   const toCreate: PropertyDefinition[] = [];
   for (const d of CHANGECATCH_PROPERTIES) {
     const hit = existing.get(d.name);
-    if (hit && LABEL_PROPERTY_NAMES.includes(d.name)) {
-      // Old free-text version (or wrong fieldType): migrate in place. Label options are added by syncLabelOptions.
-      const r = await upsertLabelProperty(token, objectType, d, FIXED_OPTIONS, hit, opts.dryRun);
+    if (hit && SYNCED_ENUM_PROPERTY_NAMES.includes(d.name)) {
+      // Old free-text version (or wrong fieldType): migrate in place. More options are added by syncLabelOptions.
+      const r = await upsertLabelProperty(token, objectType, d, d.options ?? FIXED_OPTIONS, hit, opts.dryRun);
       if (r.status === 'error' && r.detail?.includes(' 403')) report.missingScope = schemaWriteScopeFor(objectType);
       report.properties.push({ name: d.name, status: r.status, ...(r.detail ? { detail: r.detail } : {}) });
       continue;
@@ -314,10 +333,11 @@ export interface LabelPropertyResult {
 }
 
 /**
- * Bring one label property to enumeration + checkbox with at least `desired` options.
+ * Bring one dropdown property (label checkboxes, change type, other object type) to d.type + d.fieldType with at least
+ * `desired` options.
  *  - missing                      -> create (POST) with `desired`
  *  - string / other fieldType     -> migrate in place (PATCH type + fieldType + options). Old free-text values become invalid.
- *  - enumeration + checkbox       -> PATCH options only if some are missing (existing options are always kept)
+ *  - right type                   -> PATCH options only if some are missing / hidden / renamed (existing ones are kept)
  * dryRun = report only.
  */
 export async function upsertLabelProperty(
@@ -341,7 +361,7 @@ export async function upsertLabelProperty(
     }
   }
 
-  const isTarget = hit.type === 'enumeration' && hit.fieldType === 'checkbox';
+  const isTarget = hit.type === d.type && hit.fieldType === d.fieldType;
   // A text property has no options. An enumeration with another fieldType keeps its options.
   const merged = mergeOptions(hit.type === 'enumeration' ? (hit.options ?? []) : [], desired);
   if (merged.options.length > MAX_OPTIONS)
@@ -349,7 +369,7 @@ export async function upsertLabelProperty(
   if (isTarget && !merged.changed) return { name: d.name, status: 'exists', added: [] };
 
   const migrate = !isTarget;
-  const detail = migrate ? `existing ${hit.type}/${hit.fieldType ?? '?'} -> enumeration/checkbox` : undefined;
+  const detail = migrate ? `existing ${hit.type}/${hit.fieldType ?? '?'} -> ${d.type}/${d.fieldType}` : undefined;
   if (dryRun) return { name: d.name, status: migrate ? 'would-migrate' : 'would-update', added: merged.added, ...(detail ? { detail } : {}) };
 
   const body = migrate
@@ -404,9 +424,11 @@ export interface LabelSyncOptions {
 const syncInflight = new Map<string, Promise<LabelSyncReport>>();
 
 /**
- * Make the 3 label properties on `objectTypeId` hold an option for every label toward every watched other type.
- * Reads labels in BOTH directions (typeIds and paired label names are per direction, and a mirror stamp uses the
- * other direction's names). Idempotent and additive: only PATCHes when an option is missing. Never removes options.
+ * Make the dropdowns on `objectTypeId` hold every value a stamp can write: the 3 label properties get an option for
+ * every label toward every watched other type (type ids in the direction objectTypeId -> other; a mirror stamp
+ * translates its labels to this direction, see resolve.ts mirrorKeysOf), changecatch_other_object_type gets every
+ * other type, and changecatch_change_type its 3 values. Idempotent and additive: only PATCHes when an option is missing,
+ * hidden or renamed (a label renamed in HubSpot keeps its value; only the display text changes). Never removes options.
  * Concurrent calls for the same portal + object type share one run.
  * Call it on install / settings change, and from the worker's onUnknownLabel hook BEFORE stamping a new label
  * (a value that is not an option makes HubSpot reject the record update).
@@ -440,19 +462,23 @@ async function runLabelSync(
 
   const sources: LabelSource[] = [];
   for (const other of others) {
-    const labels: LabelSource['labels'] = [];
-    for (const [from, to] of [[objectTypeId, other], [other, objectTypeId]]) {
-      try {
-        // Cached per (portal, from, to): a sync for both sides of a pair reads each direction once.
-        const { results } = await getLabelsCached(token, portalId, from, to);
-        labels.push(...results.map((r) => ({ label: r.label, category: r.category })));
-      } catch (e) {
-        report.labelErrors.push({ from, to, error: e instanceof Error ? e.message : String(e) });
-      }
+    try {
+      // Cached per (portal, from, to). Only this direction: option values use its type ids.
+      const { results } = await getLabelsCached(token, portalId, objectTypeId, other);
+      sources.push({
+        otherObjectTypeId: other,
+        otherObjectName: names[other] ?? other,
+        labels: results.map((r) => ({ typeId: r.typeId, label: r.label, category: r.category })),
+      });
+    } catch (e) {
+      report.labelErrors.push({ from: objectTypeId, to: other, error: e instanceof Error ? e.message : String(e) });
     }
-    sources.push({ otherObjectTypeId: other, otherObjectName: names[other] ?? other, labels });
   }
   report.options = buildLabelOptions(sources);
+  const desiredFor: Record<string, PropertyOption[]> = {
+    [STAMP_PROPS.changeType]: CHANGE_TYPE_OPTIONS,
+    [STAMP_PROPS.otherObjectType]: buildObjectTypeOptions([...STANDARD_OTHER_TYPES, ...others], names),
+  };
 
   let existing: Map<string, ExistingProperty>;
   try {
@@ -461,8 +487,9 @@ async function runLabelSync(
     report.error = e instanceof Error ? e.message : String(e);
     return report;
   }
-  for (const d of CHANGECATCH_PROPERTIES.filter((x) => LABEL_PROPERTY_NAMES.includes(x.name))) {
-    report.properties.push(await upsertLabelProperty(token, objectTypeId, d, report.options, existing.get(d.name), !!opts.dryRun));
+  for (const d of CHANGECATCH_PROPERTIES.filter((x) => SYNCED_ENUM_PROPERTY_NAMES.includes(x.name))) {
+    const desired = desiredFor[d.name] ?? report.options;
+    report.properties.push(await upsertLabelProperty(token, objectTypeId, d, desired, existing.get(d.name), !!opts.dryRun));
   }
   return report;
 }

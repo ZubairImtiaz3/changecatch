@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { LabelCache } from '../core/labels.js';
+import { normLabelName, type LabelCache } from '../core/labels.js';
 import { splitValues } from '../core/label-options.js';
 import type { JournalReadResult } from '../core/poller.js';
 import { resolveChanges } from '../core/resolve.js';
@@ -61,6 +61,7 @@ const DEFS: Record<string, { typeId: number; label: string | null; category: str
 /** Stub fetch: label definitions, property reads (label props exist with only the fixed options), PATCH capture. */
 function stubHubSpot() {
   const patched = new Map<string, Set<string>>(); // objectType -> option values of changecatch_labels_current
+  const typePatched = new Map<string, Set<string>>(); // objectType -> option values of changecatch_other_object_type
   const real = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
     const url = new URL(String(input));
@@ -71,29 +72,40 @@ function stubHubSpot() {
     m = url.pathname.match(/^\/crm\/properties\/2026-09\/([^/]+)(?:\/([^/]+))?$/);
     if (m && (init?.method ?? 'GET') === 'GET') {
       const fixed = [
-        { label: '(none)', value: '(none)', displayOrder: 0, hidden: false },
-        { label: '(unknown)', value: '(unknown)', displayOrder: 1, hidden: false },
+        { label: '(none)', value: 'none', displayOrder: 0, hidden: false },
+        { label: '(unknown)', value: 'unknown', displayOrder: 1, hidden: false },
       ];
+      // Every synced dropdown exists already (as after install), with only its starting options.
       return json({
-        results: ['changecatch_label_before', 'changecatch_label_after', 'changecatch_labels_current'].map((name) => ({
-          name, type: 'enumeration', fieldType: 'checkbox', groupName: 'changecatch', options: fixed,
-        })),
+        results: [
+          ...['changecatch_labels_before', 'changecatch_labels_after', 'changecatch_labels_current'].map((name) => ({
+            name, type: 'enumeration', fieldType: 'checkbox', groupName: 'changecatch', options: fixed,
+          })),
+          { name: 'changecatch_change_type', type: 'enumeration', fieldType: 'select', groupName: 'changecatch', options: [] },
+          { name: 'changecatch_other_object_type', type: 'enumeration', fieldType: 'select', groupName: 'changecatch', options: [] },
+        ],
       });
     }
     if (m && init?.method === 'PATCH') {
       const body = JSON.parse(String(init.body));
-      if (m[2] === 'changecatch_labels_current') patched.set(decodeURIComponent(m[1]), new Set(body.options.map((o: { value: string }) => o.value)));
+      const values = new Set<string>(body.options.map((o: { value: string }) => o.value));
+      if (m[2] === 'changecatch_labels_current') patched.set(decodeURIComponent(m[1]), values);
+      if (m[2] === 'changecatch_other_object_type') typePatched.set(decodeURIComponent(m[1]), values);
       return json({});
     }
     return new Response('unexpected ' + url.pathname, { status: 500 });
   }) as typeof fetch;
-  return { patched, restore: () => (globalThis.fetch = real) };
+  return { patched, typePatched, restore: () => (globalThis.fetch = real) };
 }
 
 const fakeLabels: LabelCache = {
   async get(_p, from, to, typeId) {
     const d = DEFS[`${from}>${to}`]?.find((x) => x.typeId === typeId);
     return d && { label: d.label, category: d.category };
+  },
+  async findByName(_p, from, to, label) {
+    const hits = (DEFS[`${from}>${to}`] ?? []).filter((x) => x.label !== null && normLabelName(x.label) === normLabelName(label));
+    return hits.length === 1 ? hits[0].typeId : undefined;
   },
 };
 
@@ -124,14 +136,18 @@ test('label options: every stamped label value (both records, mirror on) is an o
       paired([SUB, '5'], [CONTACT, '6'], 'LABEL_CHANGED', [], [41]),
     ];
     const state = new Map<string, string[]>();
-    const { changes: normalized } = await resolveChanges(changes, fakeLabels, { getAssociationLabels: (k) => state.get(k) });
+    const { changes: normalized } = await resolveChanges(changes, fakeLabels, { getAssociationLabels: (k) => state.get(k) }, {
+      unlabeledName: 'unlabeled',
+      mirror: true,
+    });
     const updates: StampUpdate[] = normalized.flatMap((c) => toChangeRecords(c, { mirrorOnOtherRecord: true })).map(toStampUpdate);
     assert.equal(updates.length, changes.length * 2);
     let checked = 0;
     for (const u of updates) {
       const options = hs.patched.get(u.objectTypeId);
       assert.ok(options, `options synced on ${u.objectTypeId}`);
-      for (const prop of ['changecatch_label_before', 'changecatch_label_after', 'changecatch_labels_current'] as const) {
+      assert.ok(hs.typePatched.get(u.objectTypeId)?.has(u.properties.changecatch_other_object_type!), `other object type is an option on ${u.objectTypeId}`);
+      for (const prop of ['changecatch_labels_before', 'changecatch_labels_after', 'changecatch_labels_current'] as const) {
         const raw = u.properties[prop] ?? '';
         assert.ok(!/;\s|\s;/.test(raw), `no spaces around ";" in ${raw}`);
         for (const v of splitValues(raw)) {
@@ -141,10 +157,16 @@ test('label options: every stamped label value (both records, mirror on) is an o
       }
     }
     assert.ok(checked > 20);
-    // Spot checks on the exact format.
-    assert.ok(hs.patched.get(DEAL)!.has('0-1:Billing, contact'));
-    assert.ok(hs.patched.get(CONTACT)!.has('0-3:Influencer lead'));
-    assert.ok(hs.patched.get(CONTACT)!.has(`${SUB}:Owner`));
+    // Spot checks on the exact format: `${otherTypeId}:${typeId}`, own direction only.
+    assert.ok(hs.patched.get(DEAL)!.has('0-1:102'), 'deal -> contact "Billing; contact"');
+    assert.ok(hs.patched.get(CONTACT)!.has('0-3:203'), 'contact -> deal "Influencer lead" (the contact\'s own direction)');
+    assert.ok(hs.patched.get(CONTACT)!.has(`${SUB}:43`), 'contact -> subscription "Owner"');
+    assert.ok(!hs.patched.get(CONTACT)!.has('0-3:103'), 'the other direction\'s id is never an option');
+    // The mirror stamp on the contact carries the contact -> deal ids, translated by name.
+    const mirror = updates.find((u) => u.objectTypeId === CONTACT && u.properties.changecatch_change_type === 'ADDED' && u.properties.changecatch_other_object_type === DEAL)!;
+    assert.equal(mirror.properties.changecatch_labels_current, '0-3:201;0-3:202;0-3:203;unknown', 'Primary (5) has no contact -> deal twin: unknown');
+    assert.deepEqual([...hs.typePatched.get(DEAL)!].sort(), ['0-1', '0-2', '0-3', '0-5'].sort());
+    assert.ok(hs.typePatched.get(CONTACT)!.has(SUB), 'custom other type added by the sync');
   } finally {
     hs.restore();
   }
@@ -176,8 +198,8 @@ test('onUnknownLabel hook: syncs the stamped side (and the other side when mirro
   await mirrored(111, DEAL, CONTACT);
   assert.deepEqual(calls.map((c) => c.t), [DEAL, CONTACT]);
 
-  respond = (t) => okReport(t, { properties: [{ name: 'changecatch_label_after', status: 'error', added: [], detail: '403' }] });
-  await assert.rejects(async () => mirrored(111, DEAL, CONTACT), /changecatch_label_after: 403/);
+  respond = (t) => okReport(t, { properties: [{ name: 'changecatch_labels_after', status: 'error', added: [], detail: '403' }] });
+  await assert.rejects(async () => mirrored(111, DEAL, CONTACT), /changecatch_labels_after: 403/);
 
   // A label read failure on THIS pair holds; on another pair it doesn't.
   respond = (t) => okReport(t, { labelErrors: [{ from: CONTACT, to: DEAL, error: '502' }] });
@@ -240,7 +262,7 @@ test('lifecycle: APP_UNINSTALL from the journal is handled before the offset is 
       store.setState(`labels_synced:${p}|0-3|0-1`, '[101]');
       store.setState(`labels_synced:mirror:${p}|0-3|0-1`, '[101]');
       store.saveChanges([{ changeId: `c${p}`, portalId: p, objectTypeId: DEAL, objectId: '1', changeType: 'ADDED', otherObjectType: 'Contact',
-        otherRecordId: '2', labelBefore: '(none)', labelAfter: '(none)', labelsCurrent: '(none)', associationCategory: HD, occurredAt: new Date(T0).toISOString() }], clock.t);
+        otherRecordId: '2', labelBefore: 'none', labelAfter: 'none', labelsCurrent: 'none', associationCategory: HD, occurredAt: new Date(T0).toISOString() }], clock.t);
       store.replaceParked([...store.loadParked().map((x) => x.entry), { event: ev({ portalId: p }), fileOffset: 'f0', key: `park${p}`, occurredAtMs: T0 }], clock.t);
     };
     seedPortal(111);

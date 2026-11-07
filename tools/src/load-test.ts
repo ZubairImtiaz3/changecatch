@@ -124,7 +124,8 @@ interface Ctx {
   kpis: ScenarioKpi[];
 }
 
-const optVal = (l: Label) => labelOptionValue(CONTACT, l.label ?? '');
+/** Option value for a deal -> contact label: keyed by its type id (label-options.ts). */
+const optVal = (l: Label) => labelOptionValue(CONTACT, l.typeId);
 
 function check(ctx: Ctx, scenario: string, name: string, pass: boolean | null, detail: string) {
   const c: Check = { scenario, check: name, pass, detail };
@@ -589,7 +590,7 @@ function churnScenario(pairs: Pair[]): Scenario {
       const cycle = [L.inf, L.dm, L.bc];
       const allowed = new Set(cycle.map(optVal));
       const finalLabel = cycle[FLIPS % 3];
-      const expectedFinal = formatLabelValues([finalLabel.label ?? ''], CONTACT);
+      const expectedFinal = formatLabelValues([String(finalLabel.typeId)], CONTACT);
       const deals = pairs.map((p) => p.dealId);
       const t0 = Date.now();
       const since = t0 - 5_000;
